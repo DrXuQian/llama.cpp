@@ -358,6 +358,26 @@ static void ggml_cuda_op_gated_delta_net_impl(
             // reason a model silently stays on the inline path, and it is invisible without this: set
             // GGML_PPU_GDN_DEBUG=1 to be told which shape to add to ppu_so/gdn/build.sh.
             static const bool dbg = getenv("GGML_PPU_GDN_DEBUG") != nullptr;
+            if (dbg) {
+                // n_seqs is the number that decides everything: llama.cpp's split_equal hands recurrent models
+                // n_seq_tokens = n_ubatch / n_seqs, because every sequence in a ubatch must advance its recurrent
+                // state by the same number of tokens. T=16 with n_seqs=128 is one 2048-token ubatch (correct, and
+                // chunked is useless there -- FLA's chunk is 64 tokens). T=16 with n_seqs=1 would mean something
+                // upstream is slicing the ubatch, which would be the real bug.
+                static int call = 0;
+                fprintf(stderr,
+                    "[ppu-gdn] #%d  T=%d n_seqs=%d (T*n_seqs=%d)  H=%d HV=%d S=%d | "
+                    "q.ne=[%d,%d,%d,%d] v.ne=[%d,%d,%d,%d] v_contig=%d | "
+                    "common_ok=%d chunk_on=%d T>=128=%d chunk_avail=%d recur_avail=%d -> %s\n",
+                    call++, (int) n_tokens, (int) n_seqs, (int) (n_tokens*n_seqs),
+                    (int) neqk1, (int) H, (int) S_v,
+                    (int) src_q->ne[0], (int) src_q->ne[1], (int) src_q->ne[2], (int) src_q->ne[3],
+                    (int) src_v->ne[0], (int) src_v->ne[1], (int) src_v->ne[2], (int) src_v->ne[3],
+                    (int) ggml_is_contiguous(src_v),
+                    (int) common_ok, (int) chunk_on, (int) (n_tokens >= 128),
+                    (int) ggml_ppu_so_gdn_chunked_available(), (int) ggml_ppu_so_gdn_available(),
+                    want_chunked ? "CHUNKED" : (want_recur ? "recurrent" : "inline"));
+            }
 
             // ggml's state is [v][k]; the chunked entry wants [k][v], so transpose h0 in and ht out. The recurrent
             // kernel is AOT'd with STATE_V_FIRST=1 and needs no transpose.
