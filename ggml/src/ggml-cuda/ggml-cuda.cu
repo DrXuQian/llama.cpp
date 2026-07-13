@@ -29,7 +29,6 @@
 #include "ggml-cuda/getrows.cuh"
 #include "ggml-cuda/im2col.cuh"
 #include "ggml-cuda/mmf.cuh"
-#include "ggml-cuda/mmid.cuh"
 #include "ggml-cuda/mmq.cuh"
 #include "ggml-cuda/mmvf.cuh"
 #include "ggml-cuda/mmvq.cuh"
@@ -1773,85 +1772,102 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
 }
 
 #ifdef GGML_PPU_SO
-// Grid for both kernels below: (row-within-expert, expert). A block whose row index is past its expert's real row
-// count exits immediately -- that is how the fixed max_m capacity is skipped without ever reading a count on the host.
 #define PPU_MOE_BLOCK_DIM 256
 
-// src1 (F32, ragged) -> A (bf16, [n_experts, max_m, K]). expert e's real rows are the compact rows
-// [expert_bounds[e], expert_bounds[e+1]) produced by mm_ids_helper; row i of expert e lands at A[e*max_m + i].
-static __global__ void ppu_moe_gather_f32_to_bf16(
-        const float * __restrict__ src1, nv_bfloat16 * __restrict__ A,
-        const int32_t * __restrict__ ids_src1, const int32_t * __restrict__ expert_bounds,
-        const int64_t K, const int64_t src1_row_stride, const int64_t max_m) {
-    const int64_t i  = blockIdx.x;
-    const int64_t e  = blockIdx.y;
-    const int32_t lo = expert_bounds[e];
-    if (i >= expert_bounds[e + 1] - lo) {
-        return;
-    }
-    const float * s = src1 + (int64_t) ids_src1[lo + i] * src1_row_stride;
-    nv_bfloat16 * d = A + (e*max_m + i) * K;
-    for (int64_t k = threadIdx.x; k < K; k += PPU_MOE_BLOCK_DIM) {
-        d[k] = __float2bfloat16(s[k]);
+// ------------------------------------------------------------------------------------------------------------
+// Device-side token sort: histogram -> exclusive scan -> atomic scatter. Same shape as vLLM's moe_align_block_size
+// (minus its block padding, which a NoPad kernel does not need).
+//
+// Not ggml's own ggml_cuda_launch_mm_ids_helper: that one runs ONE WARP PER EXPERT and has each warp rescan the
+// entire ids tensor, so its work is O(n_experts * n_tokens * n_expert_used) and its time grows linearly with
+// n_tokens. Measured on a 5090 (128 experts, top-8): 10.2us at 512 tokens but 36.9us at 2048, vs 9.4us / 12.2us for
+// the counting sort -- 3.0x, and 3.9x at 4096 tokens / 256 experts. It also stages 4 bytes per token in shared
+// memory and hard-ASSERTs that it fits (mmid.cu:132), which caps the ubatch.
+//
+// The atomic scatter makes the order of rows WITHIN an expert nondeterministic. That is fine: compact row r's
+// output depends only on compact row r's input (it is A[r] x B[expert(r)]^T), and the scatter maps it back to a
+// fixed dst slot, so dst is bit-identical run to run.
+//
+// Everything the two GEMM layouts need falls out of these three kernels, indexed by the (token, slot) pair
+// i = it*n_expert_used + iex:
+//   a_row[i]      where that pair's activation row goes in A   (dense: bounds[e]+local;  masked: e*max_m+local)
+//   m_indices[c]  expert owning compact row c                  (dense only)
+//   masked_m[e]   expert e's real row count                    (masked only)
+// The other two mappings are pure functions of i and need no memory at all:
+//   src1 row = (i/n_expert_used)*sis1 + (i%n_expert_used) % nchannels_y
+//   dst slot = i
+// ------------------------------------------------------------------------------------------------------------
+
+static __global__ void ppu_moe_hist(const int32_t * __restrict__ ids, int32_t * __restrict__ counts,
+        const int total_rows, const int n_expert_used, const int si1) {
+    const int i = blockIdx.x*PPU_MOE_BLOCK_DIM + threadIdx.x;
+    if (i < total_rows) {
+        atomicAdd(&counts[ids[(i/n_expert_used)*si1 + i%n_expert_used]], 1);
     }
 }
 
-// out (bf16, [n_experts, max_m, N]) -> dst (F32). Inverse of the gather; the capacity rows are never touched.
-static __global__ void ppu_moe_scatter_bf16_to_f32(
-        const nv_bfloat16 * __restrict__ out, float * __restrict__ dst,
-        const int32_t * __restrict__ ids_dst, const int32_t * __restrict__ expert_bounds,
-        const int64_t N, const int64_t dst_row_stride, const int64_t max_m) {
-    const int64_t i  = blockIdx.x;
-    const int64_t e  = blockIdx.y;
-    const int32_t lo = expert_bounds[e];
-    if (i >= expert_bounds[e + 1] - lo) {
-        return;
+// One block. n_experts <= blockDim.x (we launch the next power of two, capped at 1024).
+static __global__ void ppu_moe_scan(const int32_t * __restrict__ counts, int32_t * __restrict__ bounds,
+        int32_t * __restrict__ fill, int32_t * __restrict__ masked_m, const int n_experts) {
+    extern __shared__ int32_t sm[];
+    const int e = threadIdx.x;
+    sm[e] = e < n_experts ? counts[e] : 0;
+    __syncthreads();
+    for (int d = 1; d < blockDim.x; d <<= 1) {                 // Hillis-Steele inclusive scan
+        const int32_t v = e >= d ? sm[e - d] : 0;
+        __syncthreads();
+        sm[e] += v;
+        __syncthreads();
     }
-    const nv_bfloat16 * s = out + (e*max_m + i) * N;
-    float * d = dst + (int64_t) ids_dst[lo + i] * dst_row_stride;
-    for (int64_t j = threadIdx.x; j < N; j += PPU_MOE_BLOCK_DIM) {
-        d[j] = __bfloat162float(s[j]);
-    }
-}
-
-// masked_m[e] = expert e's real row count, straight off mm_ids_helper's bounds.
-static __global__ void ppu_moe_bounds_to_masked_m(
-        const int32_t * __restrict__ expert_bounds, int32_t * __restrict__ masked_m, const int n_experts) {
-    const int e = blockIdx.x*blockDim.x + threadIdx.x;
     if (e < n_experts) {
-        masked_m[e] = expert_bounds[e + 1] - expert_bounds[e];
+        bounds[e] = sm[e] - counts[e];                          // exclusive prefix sum
+        fill[e]   = 0;                                          // per-expert running slot counter for the scatter
+        if (masked_m) {
+            masked_m[e] = counts[e];
+        }
+    }
+    if (e == n_experts - 1) {
+        bounds[n_experts] = sm[e];
     }
 }
 
-// m_indices[r] = the expert owning compact row r, for the dense (no-padding) contiguous layout. One block per
-// expert, each filling its own [expert_bounds[e], expert_bounds[e+1]) slice.
-static __global__ void ppu_moe_bounds_to_m_indices(
-        const int32_t * __restrict__ expert_bounds, int32_t * __restrict__ m_indices) {
-    const int e = blockIdx.x;
-    for (int r = expert_bounds[e] + threadIdx.x; r < expert_bounds[e + 1]; r += PPU_MOE_BLOCK_DIM) {
-        m_indices[r] = e;
+// max_m == 0 selects the dense layout (a_row = bounds[e] + local, and m_indices is filled);
+// max_m >  0 selects the masked layout (a_row = e*max_m + local, m_indices unused).
+static __global__ void ppu_moe_scatter_ids(const int32_t * __restrict__ ids, const int32_t * __restrict__ bounds,
+        int32_t * __restrict__ fill, int32_t * __restrict__ a_row, int32_t * __restrict__ m_indices,
+        const int total_rows, const int n_expert_used, const int si1, const int max_m) {
+    const int i = blockIdx.x*PPU_MOE_BLOCK_DIM + threadIdx.x;
+    if (i >= total_rows) {
+        return;
+    }
+    const int e     = ids[(i/n_expert_used)*si1 + i%n_expert_used];
+    const int local = atomicAdd(&fill[e], 1);
+    const int c     = max_m > 0 ? e*max_m + local : bounds[e] + local;
+    a_row[i] = c;
+    if (m_indices) {
+        m_indices[c] = e;
     }
 }
 
-// src1 (F32, ragged) -> A (bf16, [total_rows, K]) for the dense contiguous layout: compact row r comes straight from
-// mm_ids_helper's ids_src1[r], no per-expert capacity and no padding.
-static __global__ void ppu_moe_gather_f32_to_bf16_dense(
-        const float * __restrict__ src1, nv_bfloat16 * __restrict__ A,
-        const int32_t * __restrict__ ids_src1, const int64_t K, const int64_t src1_row_stride) {
-    const int64_t r = blockIdx.x;
-    const float * s = src1 + (int64_t) ids_src1[r] * src1_row_stride;
-    nv_bfloat16 * d = A + r * K;
+// src1 (F32) -> A (bf16). One block per (token, slot) pair; only real rows are written, so the masked layout's
+// capacity rows stay uninitialized -- garbage in compact row c only ever reaches out row c, which we never read.
+static __global__ void ppu_moe_gather(const float * __restrict__ src1, nv_bfloat16 * __restrict__ A,
+        const int32_t * __restrict__ a_row, const int64_t K, const int64_t src1_row_stride,
+        const int n_expert_used, const int sis1, const int nchannels_y) {
+    const int64_t i = blockIdx.x;
+    const float * s = src1 + ((i/n_expert_used)*sis1 + (i%n_expert_used) % nchannels_y) * src1_row_stride;
+    nv_bfloat16 * d = A + (int64_t) a_row[i] * K;
     for (int64_t k = threadIdx.x; k < K; k += PPU_MOE_BLOCK_DIM) {
         d[k] = __float2bfloat16(s[k]);
     }
 }
 
-static __global__ void ppu_moe_scatter_bf16_to_f32_dense(
-        const nv_bfloat16 * __restrict__ out, float * __restrict__ dst,
-        const int32_t * __restrict__ ids_dst, const int64_t N, const int64_t dst_row_stride) {
-    const int64_t r = blockIdx.x;
-    const nv_bfloat16 * s = out + r * N;
-    float * d = dst + (int64_t) ids_dst[r] * dst_row_stride;
+// out (bf16) -> dst (F32). The dst slot of pair i is just i.
+static __global__ void ppu_moe_scatter(const nv_bfloat16 * __restrict__ out, float * __restrict__ dst,
+        const int32_t * __restrict__ a_row, const int64_t N, const int64_t dst_row_stride) {
+    const int64_t i = blockIdx.x;
+    const nv_bfloat16 * s = out + (int64_t) a_row[i] * N;
+    float * d = dst + i * dst_row_stride;
     for (int64_t j = threadIdx.x; j < N; j += PPU_MOE_BLOCK_DIM) {
         d[j] = __bfloat162float(s[j]);
     }
@@ -1859,10 +1875,8 @@ static __global__ void ppu_moe_scatter_bf16_to_f32_dense(
 
 // Route a bf16-weight MoE mul_mat_id through the external grouped-GEMM .so (libppu_moe.so).
 //
-// Nothing here touches the host. The row permutation comes from ggml's own ggml_cuda_launch_mm_ids_helper -- the
-// same device kernel mmq/mmf use -- which emits ids_src1 / ids_dst / expert_bounds; m_indices and masked_m are
-// trivial functions of the bounds. So there is no D2H, no H2D and no cudaStreamSynchronize, and the path stays
-// CUDA-graph capturable, unlike ggml's own sorted-cuBLAS fallback below which sorts on the CPU.
+// Nothing here touches the host: no D2H, no H2D, no cudaStreamSynchronize. The path is CUDA-graph capturable,
+// unlike ggml's own sorted-cuBLAS fallback below, which sorts on the CPU.
 //
 // Two layouts, picked by WHICH SYMBOL THE .so EXPORTS (presence is the capability query):
 //
@@ -1880,15 +1894,13 @@ static __global__ void ppu_moe_scatter_bf16_to_f32_dense(
 //           m_indices=-1 on the tail, blocks skipped via is_computation_valid -- but the bf16 kernel never calls it;
 //           sm90_fp8_gemm_1d2d.cuh:274 is the only call site in the repo.) Masked's scheduler instead walks the
 //           groups off its device-resident masked_m and enqueues exactly ceil(masked_m[e]/BLOCK_M) blocks per expert,
-//           so max_m need only be an UPPER BOUND -- and a host-known one exists: mm_ids_helper emits at most one
-//           compact row per (token, expert), so no expert can hold more than n_tokens rows. Still zero-sync, but it
-//           pays n_experts/n_expert_used (16x on a 128-expert top-8 model) in scratch and ceil(rows/64)*64 in flops.
+//           so max_m need only be an UPPER BOUND -- and a host-known one exists: an expert holds at most one row per
+//           token. Still zero-sync, but it pays n_experts/n_expert_used (16x on a 128-expert top-8 model) in scratch
+//           and ceil(rows/64)*64 in flops.
 //
 // For masked, max_m must be a multiple of BLOCK_M (64 or 128): it is the row pitch between experts
 // (scheduler/gemm.cuh:164 forms the global row as expert*max_m + m_block_idx*BLOCK_M), so a non-multiple would let
 // an expert's last row-block TMA-store over the next expert's real output rows. We round to 128, a safe superset.
-// Rows [masked_m[e], max_m) of A are left UNINITIALIZED on purpose: garbage in compact row r only ever reaches out
-// row r, and the scatter never reads those rows back.
 //
 // Returns false (fall through to the inline path) if unsupported or if the .so has no kernel for this shape.
 static bool ggml_cuda_mul_mat_id_ppu_so(ggml_backend_cuda_context & ctx,
@@ -1917,9 +1929,11 @@ static bool ggml_cuda_mul_mat_id_ppu_so(ggml_backend_cuda_context & ctx,
     if (src1->ne[0] != K || dst->ne[0] != N || total_rows == 0) {
         return false;
     }
+    if (n_experts > 1024) {
+        return false;                              // ppu_moe_scan is a single block
+    }
 
-    // Masked pays a capacity buffer; dense pays nothing. An expert holds at most one row per token (mm_ids_helper
-    // keeps a single slot per (token, expert)), so n_tokens is a hard upper bound -- known without reading the data.
+    // An expert holds at most one row per token, so n_tokens bounds masked_m -- known without reading the data.
     const int64_t max_m    = use_dense ? 0 : GGML_PAD(n_tokens, 128);
     const int64_t buf_rows = use_dense ? total_rows : n_experts * max_m;
 
@@ -1928,76 +1942,60 @@ static bool ggml_cuda_mul_mat_id_ppu_so(ggml_backend_cuda_context & ctx,
         return false;                              // >1 GiB of scratch just for the capacity: not worth it
     }
 
-    // mm_ids_helper stages one 4-byte entry per token in shared memory and hard-ASSERTS that it fits
-    // (mmid.cu:132) -- it does not fall back. Check first, so an oversized ubatch degrades to the inline path
-    // instead of aborting the process. Its other two asserts are bit-width limits on its packed store.
-    const size_t smpbo = ggml_cuda_info().devices[ggml_cuda_get_device()].smpbo;
-    if (n_tokens*sizeof(int32_t) > smpbo || n_tokens >= (1 << 22) || n_expert_used >= (1 << 10)) {
-        return false;
-    }
-
     cudaStream_t stream = ctx.stream();
 
-    // --- device-side permutation: ggml's own mul_mat_id helper (the one mmq/mmf use) ---
-    ggml_cuda_pool_alloc<int32_t> ids_src1 (ctx.pool(), total_rows);
-    ggml_cuda_pool_alloc<int32_t> ids_dst  (ctx.pool(), total_rows);
-    ggml_cuda_pool_alloc<int32_t> bounds   (ctx.pool(), n_experts + 1);
-    ggml_cuda_pool_alloc<int32_t> layout   (ctx.pool(), use_dense ? total_rows : n_experts);  // m_indices | masked_m
-
-    const int si1  = (int) (ids->nb[1] / sizeof(int32_t));
-    const int sis1 = (int) (src1->nb[2] / src1->nb[1]);
+    // src1 is indexed the same way ggml's own mul_mat_id paths index it: row = it*sis1 + iex % nchannels_y.
+    // NOTE nchannels_y is src1->ne[1] RAW. mmf.cu has a local of that name which it overwrites with ids->ne[0] when
+    // ne11 == 1 (the normal MoE case) -- but it passes the raw ne11 to its helper (mmf.cu:87). Using the overwritten
+    // value would make this read row it+iex instead of row it: silently wrong, no error.
+    const int si1         = (int) (ids->nb[1] / sizeof(int32_t));
+    const int sis1        = (int) (src1->nb[2] / src1->nb[1]);
+    const int nchannels_y = (int) src1->ne[1];
     GGML_ASSERT(sis1 > 0);
 
-    ggml_cuda_launch_mm_ids_helper((const int32_t *) ids->data, ids_src1.ptr, ids_dst.ptr, bounds.ptr,
-        (int) n_experts, (int) n_tokens, (int) n_expert_used, (int) src1->ne[1], si1, sis1, stream);
-    CUDA_CHECK(cudaGetLastError());
+    ggml_cuda_pool_alloc<int32_t> counts   (ctx.pool(), n_experts);
+    ggml_cuda_pool_alloc<int32_t> bounds   (ctx.pool(), n_experts + 1);
+    ggml_cuda_pool_alloc<int32_t> fill     (ctx.pool(), n_experts);
+    ggml_cuda_pool_alloc<int32_t> layout   (ctx.pool(), use_dense ? buf_rows : n_experts); // m_indices | masked_m
+    ggml_cuda_pool_alloc<int32_t> a_row    (ctx.pool(), total_rows);
 
-    ggml_cuda_pool_alloc<char> A_bf16 (ctx.pool(), buf_rows*K*ts);
-    ggml_cuda_pool_alloc<char> out_bf16(ctx.pool(), buf_rows*N*ts);
-    int rc;
-
-    if (use_dense) {
-        ppu_moe_bounds_to_m_indices<<<n_experts, PPU_MOE_BLOCK_DIM, 0, stream>>>(bounds.ptr, layout.ptr);
-        CUDA_CHECK(cudaGetLastError());
-
-        ppu_moe_gather_f32_to_bf16_dense<<<total_rows, PPU_MOE_BLOCK_DIM, 0, stream>>>(
-            (const float *) src1->data, (nv_bfloat16 *) A_bf16.ptr, ids_src1.ptr,
-            K, src1->nb[1]/sizeof(float));
-        CUDA_CHECK(cudaGetLastError());
-
-        rc = ggml_ppu_so_moe_grouped_gemm_bf16_nopad(
-            A_bf16.ptr, src0->data, out_bf16.ptr, layout.ptr,
-            (int) total_rows, (int) N, (int) K, (int) n_experts, (int) (total_rows / n_experts), stream);
-        if (rc != 0) {
-            return false;
-        }
-
-        ppu_moe_scatter_bf16_to_f32_dense<<<total_rows, PPU_MOE_BLOCK_DIM, 0, stream>>>(
-            (const nv_bfloat16 *) out_bf16.ptr, (float *) dst->data, ids_dst.ptr,
-            N, dst->nb[1]/sizeof(float));
-        CUDA_CHECK(cudaGetLastError());
-        return true;
+    int scan_threads = 1;
+    while (scan_threads < n_experts) {
+        scan_threads <<= 1;
     }
 
-    ppu_moe_bounds_to_masked_m<<<(n_experts + 255)/256, 256, 0, stream>>>(bounds.ptr, layout.ptr, (int) n_experts);
+    const int64_t nb_rows = (total_rows + PPU_MOE_BLOCK_DIM - 1) / PPU_MOE_BLOCK_DIM;
+    CUDA_CHECK(cudaMemsetAsync(counts.ptr, 0, n_experts*sizeof(int32_t), stream));
+    ppu_moe_hist<<<nb_rows, PPU_MOE_BLOCK_DIM, 0, stream>>>(
+        (const int32_t *) ids->data, counts.ptr, (int) total_rows, (int) n_expert_used, si1);
+    ppu_moe_scan<<<1, scan_threads, scan_threads*sizeof(int32_t), stream>>>(
+        counts.ptr, bounds.ptr, fill.ptr, use_dense ? nullptr : layout.ptr, (int) n_experts);
+    ppu_moe_scatter_ids<<<nb_rows, PPU_MOE_BLOCK_DIM, 0, stream>>>(
+        (const int32_t *) ids->data, bounds.ptr, fill.ptr, a_row.ptr, use_dense ? layout.ptr : nullptr,
+        (int) total_rows, (int) n_expert_used, si1, (int) max_m);
     CUDA_CHECK(cudaGetLastError());
 
-    const dim3 grid(max_m, n_experts, 1);
-    ppu_moe_gather_f32_to_bf16<<<grid, PPU_MOE_BLOCK_DIM, 0, stream>>>(
-        (const float *) src1->data, (nv_bfloat16 *) A_bf16.ptr, ids_src1.ptr, bounds.ptr,
-        K, src1->nb[1]/sizeof(float), max_m);
+    ggml_cuda_pool_alloc<char> A_bf16  (ctx.pool(), buf_rows*K*ts);
+    ggml_cuda_pool_alloc<char> out_bf16(ctx.pool(), buf_rows*N*ts);
+
+    ppu_moe_gather<<<total_rows, PPU_MOE_BLOCK_DIM, 0, stream>>>(
+        (const float *) src1->data, (nv_bfloat16 *) A_bf16.ptr, a_row.ptr,
+        K, src1->nb[1]/sizeof(float), (int) n_expert_used, sis1, nchannels_y);
     CUDA_CHECK(cudaGetLastError());
 
-    rc = ggml_ppu_so_moe_grouped_gemm_bf16_masked(
-        A_bf16.ptr, src0->data, out_bf16.ptr, layout.ptr,
-        (int) max_m, (int) N, (int) K, (int) n_experts, (int) (total_rows / n_experts), stream);
+    const int rc = use_dense
+        ? ggml_ppu_so_moe_grouped_gemm_bf16_nopad(
+              A_bf16.ptr, src0->data, out_bf16.ptr, layout.ptr,
+              (int) total_rows, (int) N, (int) K, (int) n_experts, (int) (total_rows / n_experts), stream)
+        : ggml_ppu_so_moe_grouped_gemm_bf16_masked(
+              A_bf16.ptr, src0->data, out_bf16.ptr, layout.ptr,
+              (int) max_m, (int) N, (int) K, (int) n_experts, (int) (total_rows / n_experts), stream);
     if (rc != 0) {
         return false;                              // .so has no kernel for this shape/arch -> inline fallback
     }
 
-    ppu_moe_scatter_bf16_to_f32<<<grid, PPU_MOE_BLOCK_DIM, 0, stream>>>(
-        (const nv_bfloat16 *) out_bf16.ptr, (float *) dst->data, ids_dst.ptr, bounds.ptr,
-        N, dst->nb[1]/sizeof(float), max_m);
+    ppu_moe_scatter<<<total_rows, PPU_MOE_BLOCK_DIM, 0, stream>>>(
+        (const nv_bfloat16 *) out_bf16.ptr, (float *) dst->data, a_row.ptr, N, dst->nb[1]/sizeof(float));
     CUDA_CHECK(cudaGetLastError());
     return true;
 }

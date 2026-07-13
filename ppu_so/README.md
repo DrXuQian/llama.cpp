@@ -52,11 +52,30 @@ GGML_PPU_MOE_SO=$PWD/ppu_so/build/libppu_moe.so ./build/bin/test-backend-ops -o 
 
 ## The permutation is built on the device — no D2H, no H2D, no sync
 
-The hook calls ggml's own `ggml_cuda_launch_mm_ids_helper` (`mmid.cuh` — the same device kernel `mmq`/`mmf` use) to
-get `ids_src1` / `ids_dst` / `expert_bounds`, then derives `m_indices` (or `masked_m`) from the bounds with a
-one-line kernel. Gather and scatter are two small kernels. **Nothing crosses to the host**, so unlike ggml's own
-sorted-cuBLAS fallback — which does a D2H, an `O(n_experts × n_tokens × n_expert_used)` CPU loop, a
-`cudaStreamSynchronize` and three H2Ds per MoE layer — this path stays CUDA-graph capturable.
+The hook sorts the tokens by expert on the GPU: **histogram → exclusive scan → atomic scatter**, the same shape as
+vLLM's `moe_align_block_size` minus its block padding (a NoPad kernel needs none). Gather and scatter are one kernel
+each. **Nothing crosses to the host**, so unlike ggml's own sorted-cuBLAS fallback — which does a D2H, an
+`O(n_experts × n_tokens × n_expert_used)` CPU loop, a `cudaStreamSynchronize` and three H2Ds per MoE layer — this
+path stays CUDA-graph capturable.
+
+It deliberately does **not** use ggml's `ggml_cuda_launch_mm_ids_helper`, even though that is also a device-side
+sort. That kernel runs **one warp per expert** and has each warp rescan the *entire* `ids` tensor, so its work is
+`O(n_experts × n_tokens × n_expert_used)` — the same complexity as the CPU loop, just spread over `n_experts` warps —
+and its time grows linearly with `n_tokens`. Measured on a 5090, 128 experts / top-8:
+
+| | 512 tokens | 2048 tokens | 4096 tokens (256 experts) |
+|---|---|---|---|
+| `mm_ids_helper` | 10.2 µs | 36.9 µs | 71.7 µs |
+| counting sort | 9.4 µs | 12.2 µs | 18.4 µs |
+| | 1.09× | **3.03×** | **3.89×** |
+
+(The ~10 µs floor is launch overhead, which CUDA-graph capture removes; the real gap is wider.) `mm_ids_helper` also
+stages 4 bytes per token in shared memory and hard-`GGML_ASSERT`s that it fits (`mmid.cu:132`), which caps the ubatch.
+**Replacing it inside ggml's own `mmq`/`mmf` would speed up the native MoE paths too — that is upstreamable.**
+
+The atomic scatter makes the order of rows *within* an expert nondeterministic. That is harmless: compact row `r`'s
+output depends only on compact row `r`'s input, and the scatter maps it back to a fixed `dst` slot, so `dst` is
+bit-identical run to run.
 
 That is only possible because **no host value depends on the routing**. Whether a layout can guarantee that comes down
 to one thing: *where the kernel's scheduler gets its block count from.*
