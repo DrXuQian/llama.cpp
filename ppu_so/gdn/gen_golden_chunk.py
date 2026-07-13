@@ -1,6 +1,6 @@
 # Golden for FLA chunked gated delta rule (prefill). Dumps inputs + ALL intermediates, so the C++/AOT
 # orchestration can be validated stage-by-stage. chunk_size=64 (fused kkt+solve path).
-import os, sys
+import os, sys, sys
 import torch
 FLA = os.environ.get("FLA_ROOT")
 sys.path.insert(0, FLA)
@@ -18,7 +18,11 @@ def dump(nm, t):
 
 torch.manual_seed(0)
 dev="cuda"
-B,T,H,HV,K,V = 1, 256, 4, 4, 128, 128   # T multiple of chunk 64; non-GVA first
+# Shape from argv: "H,HV,S" (default is the old non-GVA case). GVA (H != HV) exercises the kernels' i_h // (HV//H)
+# indexing, which is a genuinely different code path -- and it is what real models use (Qwen3.5: 16,32,128).
+_spec = sys.argv[1] if len(sys.argv) > 1 else "4,4,128"
+_H, _HV, _S = (int(x) for x in _spec.split(","))
+B,T,H,HV,K,V = 1, 256, _H, _HV, _S, _S   # T multiple of chunk 64
 BT=64
 scale = 1.0/(K**0.5)
 q = torch.randn(B,T,H,K, device=dev, dtype=torch.float32)

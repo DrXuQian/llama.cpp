@@ -2,6 +2,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <math.h>
+#include <string.h>
 int ppu_gdn_recurrent(const float*,const float*,const float*,const float*,const float*,const float*,float*,float*,int,int,int,int,int,float,void*);
 static float* rd(const char*p,long*n){FILE*f=fopen(p,"rb");if(!f){printf("no %s\n",p);exit(1);}fseek(f,0,SEEK_END);*n=ftell(f)/4;fseek(f,0,SEEK_SET);float*h=malloc(*n*4);fread(h,4,*n,f);fclose(f);return h;}
 static float* up(float*h,long n){void*d;cudaMalloc(&d,n*4);cudaMemcpy(d,h,n*4,cudaMemcpyHostToDevice);return d;}
@@ -18,7 +19,17 @@ int main(){
   sprintf(p,"golden/h0.bin");  float*h0=rd(p,&nh0);
   sprintf(p,"golden/o.bin");   float*oref=rd(p,&no);
   sprintf(p,"golden/ht.bin");  float*htref=rd(p,&nht);
+  // Shape comes from the golden's config, NOT hardcoded: a .so is compiled per (H,HV,S), so a hardcoded shape here
+  // just makes ppu_gdn_recurrent return "unsupported" against any .so built for a different one.
   int B=1,T=8,H=2,HV=4,S=128; float scale=0.08838834764831843f;
+  { FILE*cf=fopen("golden/config.txt","rb"); char ln[160];
+    if(cf){ while(fgets(ln,sizeof ln,cf)){
+        char*e=strchr(ln,'='); if(!e) continue; *e=0;
+        if(!strcmp(ln,"B"))B=atoi(e+1); else if(!strcmp(ln,"T"))T=atoi(e+1);
+        else if(!strcmp(ln,"H"))H=atoi(e+1); else if(!strcmp(ln,"HV"))HV=atoi(e+1);
+        else if(!strcmp(ln,"K"))S=atoi(e+1); else if(!strcmp(ln,"scale"))scale=(float)atof(e+1);
+      } fclose(cf); }
+    printf("shape B=%d T=%d H=%d HV=%d S=%d  %s\n",B,T,H,HV,S,H==HV?"(non-GVA)":"(GVA)"); }
   float*dq=up(q,nq),*dk=up(k,nk),*dv=up(v,nv),*dg=up(g,ng),*db=up(b,nb),*dh0=up(h0,nh0);
   float*d_o;cudaMalloc(&d_o,no*4);float*d_ht;cudaMalloc(&d_ht,nht*4);
   cudaMemset(d_o,0,no*4);cudaMemset(d_ht,0,nht*4);

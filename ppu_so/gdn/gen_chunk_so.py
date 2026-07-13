@@ -61,7 +61,9 @@ def compile_config(H, HV, S):
     K_["kkt"] = c; sync("kkt")
     c = unwrap(recompute_w_u_fwd_kernel)[(triton.cdiv(T,BT), B*HV)](k, v, beta, w, u, A, g, None, None, T, H, HV, K, V, BT, BK, BV, True, False)
     K_["wu"] = c; sync("wu")
-    # STATE_V_FIRST=True for ggml [v][k] layout
+    # STATE_V_FIRST=False here: the chunked kernel keeps FLA's [k][v] state and gated_delta_net.cu transposes
+    # ggml's [v][k] on the way in and out. (The RECURRENT kernel is the opposite -- AOT'd STATE_V_FIRST=1, no
+    # transpose. Mixing these up is not an error, just ~100% wrong numbers.)
     c = unwrap(chunk_gated_delta_rule_fwd_kernel_h_blockdim64)[(triton.cdiv(V,BVh), B*HV)](k, u, w, vnew, g, None, h, h0, ht, None, None, T, H, HV, K, V, BT, BVh, True, False, True, True, True, False, False, num_warps=4, num_stages=1)
     K_["h"] = c; sync("h")
     # NOTE: chunk_fwd_kernel_o's grid is 3-D -- (i_v, i_t, i_bh) = program_id(0,1,2). Launching it 2-D lets i_t range

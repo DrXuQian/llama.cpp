@@ -11,7 +11,8 @@ HERE_="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 : "${FLA_ROOT:=$HERE_/../../thirdparty/flash-linear-attention}"   # submodule by default
 [ -d "$FLA_ROOT/fla" ] || { echo "FLA not found at $FLA_ROOT -- run: git submodule update --init thirdparty/flash-linear-attention"; exit 1; }
 : "${CUDA_HOME:=/usr/local/cuda}"
-SHAPES=("$@"); [ ${#SHAPES[@]} -eq 0 ] && SHAPES=("32,32,128" "16,16,64" "4,4,64" "4,8,64" "32,32,64" "2,4,128")
+SHAPES=("$@"); [ ${#SHAPES[@]} -eq 0 ] && SHAPES=("16,32,128" "32,32,128" "16,16,64" "4,4,64" "4,8,64" "32,32,64" "2,4,128")
+# 16,32,128 is Qwen3.5-MoE (linear_num_key_heads=16, linear_num_value_heads=32, linear_key_head_dim=128) -- GVA.
 
 echo "[gdn] AOT recurrent kernels: ${SHAPES[*]}"
 rm -rf "$HERE/aot"; FLA_ROOT="$FLA_ROOT" python3 "$HERE/aot_recurrent.py" "${SHAPES[@]}"

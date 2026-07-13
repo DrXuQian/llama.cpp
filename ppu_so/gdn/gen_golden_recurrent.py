@@ -1,7 +1,7 @@
 # Golden generator for FLA fused_recurrent_gated_delta_rule (decode path).
 # Dumps inputs + outputs + the pinned kernel config to ppu_so/gdn/golden/, so the C++/AOT
 # implementation can be validated bit-for-bit against FLA's own kernel.
-import os, sys, struct
+import os, sys, sys, struct
 import torch
 
 FLA = os.environ.get("FLA_ROOT", "/tmp/claude-0/-root/b4d24e49-75af-4442-836b-b20da6e6712c/scratchpad/fla_probe")
@@ -19,8 +19,12 @@ def dump(name, t):
 torch.manual_seed(0)
 dev = "cuda"
 # small but non-trivial: exercise the recurrence over T>1, GVA (HV>H)
-B, T, H, HV, K, V = 1, 8, 2, 4, 128, 128
+# Shape from argv: "H,HV,S" (default keeps the original GVA case).
+_spec = sys.argv[1] if len(sys.argv) > 1 else "2,4,128"
+_H, _HV, _S = (int(x) for x in _spec.split(","))
+B, T, H, HV, K, V = 1, 8, _H, _HV, _S, _S
 scale = 1.0 / (K ** 0.5)
+STATE_V_FIRST = os.environ.get("STATE_V_FIRST", "1") == "1"
 
 q  = torch.randn(B, T, H,  K, device=dev, dtype=torch.float32)
 k  = torch.randn(B, T, H,  K, device=dev, dtype=torch.float32)
@@ -35,7 +39,10 @@ o, ht = fused_recurrent_gated_delta_rule_fwd(
     A_log=None, dt_bias=None, scale=scale,
     initial_state=h0, output_final_state=True,
     use_qk_l2norm_in_kernel=False, use_beta_sigmoid_in_kernel=False,
-    allow_neg_eigval=False, state_v_first=False, cu_seqlens=None,
+    # STATE_V_FIRST must match how aot_recurrent.py compiled the kernel. ggml's recurrent state is [v][k] and the
+    # hook passes it through UNTRANSPOSED (unlike the chunked arm, which does transpose), so the AOT'd kernel is the
+    # v-first one and the golden must be too. Getting this backwards is not an error -- just ~100% wrong numbers.
+    allow_neg_eigval=False, state_v_first=STATE_V_FIRST, cu_seqlens=None,
 )
 
 for nm, t in [("q",q),("k",k),("v",v),("g",g),("beta",beta),("h0",h0),("o",o),("ht",ht)]:
