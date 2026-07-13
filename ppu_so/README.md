@@ -55,7 +55,14 @@ GGML_PPU_GDN_CHUNKED=1 \
 ```
 
 `libppu_gdn.so` is compiled **per (H, HV, S) shape** — the Triton kernels specialise on them. A shape that was not
-compiled in returns non-zero and llama.cpp falls back inline.
+compiled in returns non-zero and llama.cpp falls back inline, **silently**. That is the single most common reason the
+`.so` looks like it is doing nothing. Set `GGML_PPU_GDN_DEBUG=1` and it will tell you exactly which shape to add:
+
+```
+[ppu-gdn] recurrent declined rc=1 for H=16 HV=32 S=128 (T=1) -- add "16,32,128" to ppu_so/gdn/build.sh
+```
+
+The default shape list does **not** include Qwen3-Next's `16,32,128`.
 
 ## The C ABI
 

@@ -322,54 +322,77 @@ static void ggml_cuda_op_gated_delta_net_impl(
 
 
 #ifdef GGML_PPU_SO
-    // Try the external FLA recurrent gated-delta-net .so (libppu_gdn.so). Engages only where ggml's math+layout map
-    // 1:1 to FLA (verified): non-KDA scalar gate, K_snapshot==1 (final state only), all tensors F32 and contiguous,
-    // and a matching (H,HV,S) AOT specialization exists. Anything else -> fall through to the inline kernels.
-    // Chunked prefill path (FLA WY tensor-core chain) -- OPT-IN via GGML_PPU_GDN_CHUNKED, and only for real prefills
-    // (T >= 2 chunks). Needs L2-normalized k to be numerically stable, so it is NOT enabled by default (random/test
-    // inputs would diverge); real GDN models L2-norm k upstream. ggml state is [v][k]; the .so wants [k][v], so we
-    // transpose h0 in and ht out. g (src_g) is the RAW per-token gate; the chain cumsums it internally.
+    // Try the external FLA gated-delta-net .so (libppu_gdn.so). Engages only where ggml's math + layout map 1:1 to
+    // FLA (verified): non-KDA scalar gate, K_snapshot == 1 (final state only), all tensors F32, and a matching
+    // (H, HV, S) specialization compiled into the .so. Anything else -> fall through to the inline kernels below.
+    //
+    // g (src_g) is the RAW per-token gate; both entries cumsum it internally.
     {
-        static const bool chunk_on = getenv("GGML_PPU_GDN_CHUNKED") != nullptr;
-        if (chunk_on && !kda && !keep_rs && (int) n_tokens >= 128 &&
+        const bool common_ok = !kda && !keep_rs &&
             src_q->type == GGML_TYPE_F32 && src_k->type == GGML_TYPE_F32 && src_v->type == GGML_TYPE_F32 &&
-            ggml_is_contiguous(src_q) && ggml_is_contiguous(src_k) && ggml_is_contiguous(src_v) &&
+            ggml_is_contiguous(src_q) && ggml_is_contiguous(src_k) &&
             ggml_is_contiguous(src_g) && ggml_is_contiguous(src_beta) && ggml_is_contiguous(src_state) &&
-            ggml_is_contiguous(dst) && ggml_ppu_so_gdn_chunked_available()) {
-            const int nblk = (int) (n_seqs * H);           // H here == HV (v heads)
-            ggml_cuda_pool_alloc<float> h0t(ctx.pool(), (size_t) nblk * S_v * S_v);
-            ggml_cuda_pool_alloc<float> htt(ctx.pool(), (size_t) nblk * S_v * S_v);
-            ppu_gdn_state_transpose<<<nblk, 256, 0, stream>>>(s_d, h0t.ptr, (int) S_v);   // [v][k] -> [k][v]
-            const int rc = ggml_ppu_so_gdn_chunked(
-                q_d, k_d, v_d, g_d, b_d, h0t.ptr, dst_d, htt.ptr,
-                (int) n_seqs, (int) n_tokens, (int) neqk1, (int) H, (int) S_v, scale, stream);
-            if (rc == 0) {
-                ppu_gdn_state_transpose<<<nblk, 256, 0, stream>>>(htt.ptr, state_d, (int) S_v);  // [k][v] -> [v][k]
-                return;
-            }
-        }
-    }
+            ggml_is_contiguous(dst) && src_v->nb[0] == sizeof(float);
 
-    if (!kda && !keep_rs && ggml_ppu_so_gdn_available() &&
-        src_q->type == GGML_TYPE_F32 && src_k->type == GGML_TYPE_F32 && src_v->type == GGML_TYPE_F32 &&
-        ggml_is_contiguous(src_q) && ggml_is_contiguous(src_k) &&
-        ggml_is_contiguous(src_g) && ggml_is_contiguous(src_beta) && ggml_is_contiguous(src_state) &&
-        ggml_is_contiguous(dst) && src_v->nb[0] == sizeof(float)) {
-        // v may be a non-contiguous view (head/token strided) -- copy to a contiguous [n_seqs,T,HV,S] buffer.
-        const float * v_use = v_d;
-        ggml_cuda_pool_alloc<float> v_contig(ctx.pool());
-        if (!ggml_is_contiguous(src_v)) {
-            v_contig.alloc((size_t) n_seqs * n_tokens * H * S_v);
-            const int nrow = (int) (n_seqs * n_tokens * H);
-            ppu_gdn_make_contig<<<nrow, 128, 0, stream>>>(v_d, v_contig.ptr, (int) S_v,
-                sv1, sv2, sv3, (int) H, (int) n_tokens);
-            v_use = v_contig.ptr;
-        }
-        const int rc = ggml_ppu_so_gdn_recurrent(
-            q_d, k_d, v_use, g_d, b_d, s_d, dst_d, state_d,
-            (int) n_seqs, (int) n_tokens, (int) neqk1 /*H*/, (int) H /*HV*/, (int) S_v, scale, stream);
-        if (rc == 0) {
-            return;
+        // Chunked prefill (FLA's WY tensor-core chain) is OPT-IN: it needs L2-normalized k to stay numerically
+        // stable, which real GDN models do upstream but random test inputs do not. Real prefills only (>= 2 chunks).
+        static const bool chunk_on = getenv("GGML_PPU_GDN_CHUNKED") != nullptr;
+        const bool want_chunked = chunk_on && (int) n_tokens >= 128 && ggml_ppu_so_gdn_chunked_available();
+        const bool want_recur   = ggml_ppu_so_gdn_available();
+
+        if (common_ok && (want_chunked || want_recur)) {
+            // v is routinely a non-contiguous view (head/token strided) on real models; both entries need it packed.
+            // NOTE this copy used to live only in the recurrent arm, which silently made the chunked arm
+            // unreachable on every model that hands us a strided v -- its gate demanded ggml_is_contiguous(src_v).
+            const float * v_use = v_d;
+            ggml_cuda_pool_alloc<float> v_contig(ctx.pool());
+            if (!ggml_is_contiguous(src_v)) {
+                v_contig.alloc((size_t) n_seqs * n_tokens * H * S_v);
+                const int nrow = (int) (n_seqs * n_tokens * H);
+                ppu_gdn_make_contig<<<nrow, 128, 0, stream>>>(v_d, v_contig.ptr, (int) S_v,
+                    sv1, sv2, sv3, (int) H, (int) n_tokens);
+                v_use = v_contig.ptr;
+            }
+
+            // Both entries return non-zero when the (H, HV, S) shape was not compiled into the .so. That is the usual
+            // reason a model silently stays on the inline path, and it is invisible without this: set
+            // GGML_PPU_GDN_DEBUG=1 to be told which shape to add to ppu_so/gdn/build.sh.
+            static const bool dbg = getenv("GGML_PPU_GDN_DEBUG") != nullptr;
+
+            // ggml's state is [v][k]; the chunked entry wants [k][v], so transpose h0 in and ht out. The recurrent
+            // kernel is AOT'd with STATE_V_FIRST=1 and needs no transpose.
+            if (want_chunked) {
+                const int nblk = (int) (n_seqs * H);           // H here == HV (v heads)
+                ggml_cuda_pool_alloc<float> h0t(ctx.pool(), (size_t) nblk * S_v * S_v);
+                ggml_cuda_pool_alloc<float> htt(ctx.pool(), (size_t) nblk * S_v * S_v);
+                ppu_gdn_state_transpose<<<nblk, 256, 0, stream>>>(s_d, h0t.ptr, (int) S_v);   // [v][k] -> [k][v]
+                const int rc = ggml_ppu_so_gdn_chunked(
+                    q_d, k_d, v_use, g_d, b_d, h0t.ptr, dst_d, htt.ptr,
+                    (int) n_seqs, (int) n_tokens, (int) neqk1, (int) H, (int) S_v, scale, stream);
+                if (rc == 0) {
+                    ppu_gdn_state_transpose<<<nblk, 256, 0, stream>>>(htt.ptr, state_d, (int) S_v);  // [k][v]->[v][k]
+                    return;
+                }
+                if (dbg) {
+                    fprintf(stderr, "[ppu-gdn] chunked declined rc=%d for H=%d HV=%d S=%d (T=%d) -- add \"%d,%d,%d\" "
+                                    "to ppu_so/gdn/build.sh\n",
+                            rc, (int) neqk1, (int) H, (int) S_v, (int) n_tokens, (int) neqk1, (int) H, (int) S_v);
+                }
+            }
+
+            if (want_recur) {
+                const int rc = ggml_ppu_so_gdn_recurrent(
+                    q_d, k_d, v_use, g_d, b_d, s_d, dst_d, state_d,
+                    (int) n_seqs, (int) n_tokens, (int) neqk1 /*H*/, (int) H /*HV*/, (int) S_v, scale, stream);
+                if (rc == 0) {
+                    return;
+                }
+                if (dbg) {
+                    fprintf(stderr, "[ppu-gdn] recurrent declined rc=%d for H=%d HV=%d S=%d (T=%d) -- add \"%d,%d,%d\" "
+                                    "to ppu_so/gdn/build.sh\n",
+                            rc, (int) neqk1, (int) H, (int) S_v, (int) n_tokens, (int) neqk1, (int) H, (int) S_v);
+                }
+            }
         }
     }
 #endif // GGML_PPU_SO
