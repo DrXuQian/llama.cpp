@@ -155,6 +155,14 @@ if (CUDAToolkit_FOUND)
         add_compile_definitions(GGML_CUDA_NO_PEER_COPY)
     endif()
 
+    # External kernel .so support: dlopen libppu_gdn.so at runtime (built out of tree from the
+    # thirdparty/flash-linear-attention submodule). llama.cpp itself pulls in NO torch/triton/python dependency --
+    # only the thin C ABI (ppu-gdn-so.h) + the dlopen loader (ppu-so.cu). Default OFF -> fully inert.
+    if (GGML_PPU_SO)
+        add_compile_definitions(GGML_PPU_SO)
+        target_link_libraries(ggml-cuda PRIVATE ${CMAKE_DL_LIBS})
+    endif()
+
     if (GGML_STATIC)
         if (WIN32)
             # As of 12.3.1 CUDA Toolkit for Windows does not offer a static cublas library
