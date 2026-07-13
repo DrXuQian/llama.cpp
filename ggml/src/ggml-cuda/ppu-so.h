@@ -21,6 +21,12 @@ extern "C" {
 // ---- MoE grouped-GEMM (mirrors ppu-moe-so.h; see it for the layout contracts) ----
 // Which layout the hook uses is decided by WHICH SYMBOL THE .so EXPORTS. Preference: nopad > masked.
 
+// Decode: batched GEMV over the same dense layout as NoPad. Only exported by a .so that really has a GEMV kernel.
+bool ggml_ppu_so_moe_gemv_available(void);
+int  ggml_ppu_so_moe_gemv_bf16(
+    const void * A, const void * B, void * out, const int * m_indices,
+    int total_rows, int N, int K, int n_experts, int expected_m, void * stream);
+
 // NoPad: dense A = [total_rows, K], no padding at all. Only exported by a kernel that truly honours it.
 bool ggml_ppu_so_moe_nopad_available(void);
 int  ggml_ppu_so_moe_grouped_gemm_bf16_nopad(

@@ -9,8 +9,16 @@
 extern "C" {
 #endif
 
-// The hook picks its layout by WHICH SYMBOL THE .so EXPORTS -- presence is the capability query. Preference order:
-// nopad > masked. A .so that can only do padded contiguous exports neither, and the hook falls back to inline ggml.
+// The hook dispatches on two axes:
+//
+//   REGIME   decode (few tokens)  -> ppu_moe_gemv_bf16          memory-bound: a GEMV
+//            prefill (many)       -> ppu_moe_grouped_gemm_*     compute-bound: a tile GEMM
+//            The split is n_tokens < GGML_PPU_MOE_MIN_TOKENS (default 128).
+//
+//   LAYOUT   which grouped-GEMM entry, decided by WHICH SYMBOL THE .so EXPORTS -- presence is the capability query.
+//            Preference: nopad > masked.
+//
+// A .so that exports none of these gets no hook at all: llama.cpp falls back to its inline ggml kernels.
 
 // ---- NoPad: DENSE contiguous (preferred) ----
 // A = [total_rows, K] bf16, expert-grouped and expert-ordered, with NO padding of any kind.
@@ -25,6 +33,24 @@ extern "C" {
 // ONLY export this symbol if you really honour that. Public DeepGEMM does NOT: its bf16 grouped kernel is
 // `bf16_grouped_deep_gemm_contiguous`, which demands ppu_moe_row_alignment()-row segments.
 int ppu_moe_grouped_gemm_bf16_nopad(
+    const void * A, const void * B, void * out, const int * m_indices,
+    int total_rows, int N, int K, int n_experts, int expected_m, void * stream);
+
+// ---- DECODE: batched GEMV (same dense layout as nopad; a different KERNEL, not a different layout) ----
+// A = [total_rows, K] bf16, out = [total_rows, N] bf16, m_indices[r] = the expert owning compact row r,
+// B = [n_experts, N, K] bf16 -- the FULL weight tensor, NOT gathered. total_rows = n_tokens * n_expert_used, so in
+// decode it is just n_expert_used.
+//
+// Why a separate entry and not just the grouped GEMM with a small m: a grouped GEMM is a tile-based COMPUTE kernel.
+// MoE decode is memory-bound weight streaming -- one token leaves 1-2 rows per expert, and even a NoPad kernel pays
+// a whole BLOCK_M-row tile (and a wgmma/TMA pipeline tuned for M>>1) to produce them. The right kernel is a GEMV.
+//
+// Public DeepGEMM has no such kernel for bf16/sm90. Its einsum::bmk_bnk_mn indexes B by the SAME batch dim as A, so
+// it would need the selected experts' weights materialised as a contiguous [total_rows, N, K] -- a copy that doubles
+// the weight traffic it was meant to save. Its einsum::bhr_hdr_bhd shares B across the batch but indexes it by head,
+// which for MoE means computing every expert for every token. So the public .so does NOT export this symbol, and the
+// hook falls back to ggml's own decode kernels (mmvf/mmf), which is the right answer there anyway.
+int ppu_moe_gemv_bf16(
     const void * A, const void * B, void * out, const int * m_indices,
     int total_rows, int N, int K, int n_experts, int expected_m, void * stream);
 

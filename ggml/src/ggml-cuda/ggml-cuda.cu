@@ -1905,10 +1905,27 @@ static __global__ void ppu_moe_scatter(const nv_bfloat16 * __restrict__ out, flo
 // Returns false (fall through to the inline path) if unsupported or if the .so has no kernel for this shape.
 static bool ggml_cuda_mul_mat_id_ppu_so(ggml_backend_cuda_context & ctx,
         const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst) {
-    const bool use_dense = ggml_ppu_so_moe_nopad_available();
-    if (!use_dense && !ggml_ppu_so_moe_masked_available()) {
+    // REGIME. A grouped GEMM is a tile-based compute kernel; MoE decode is memory-bound weight streaming. One token
+    // over top-k experts leaves 1-2 rows per expert, and even a NoPad kernel pays a whole BLOCK_M-row tile (and a
+    // wgmma/TMA pipeline tuned for M >> 1) to produce them. Decode wants a GEMV, so it gets a different ENTRY --
+    // not a different layout, and not "the grouped GEMM with a small m".
+    //
+    // This is checked HERE rather than by where the hook sits in the dispatch, because ggml's mmvq/mmf decline for
+    // reasons of their own (src0->ne[1] % rows_per_block, K % (warp_size*2), ...) and a decode that slipped past
+    // them would otherwise land in the grouped GEMM and be silently slow.
+    static const int min_tokens = getenv("GGML_PPU_MOE_MIN_TOKENS")
+        ? atoi(getenv("GGML_PPU_MOE_MIN_TOKENS")) : 128;
+    const bool decode = src1->ne[2] < min_tokens;
+
+    // Which entry, by what the .so exports. A .so with no GEMV kernel simply does not export ppu_moe_gemv_bf16, and
+    // decode then falls through to ggml's own mmvf/mmf -- the right answer there anyway.
+    const bool use_gemv   =  decode && ggml_ppu_so_moe_gemv_available();
+    const bool use_nopad  = !decode && ggml_ppu_so_moe_nopad_available();
+    const bool use_masked = !decode && !use_nopad && ggml_ppu_so_moe_masked_available();
+    if (!use_gemv && !use_nopad && !use_masked) {
         return false;
     }
+    const bool use_dense = use_gemv || use_nopad;   // both take m_indices over a compact, unpadded A
     // DeepGEMM entry is bf16 A x bf16 B -> bf16 out. Require bf16 expert weights, F32 activations/out.
     if (src0->type != GGML_TYPE_BF16 || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
         return false;
@@ -1983,13 +2000,17 @@ static bool ggml_cuda_mul_mat_id_ppu_so(ggml_backend_cuda_context & ctx,
         K, src1->nb[1]/sizeof(float), (int) n_expert_used, sis1, nchannels_y);
     CUDA_CHECK(cudaGetLastError());
 
-    const int rc = use_dense
-        ? ggml_ppu_so_moe_grouped_gemm_bf16_nopad(
-              A_bf16.ptr, src0->data, out_bf16.ptr, layout.ptr,
-              (int) total_rows, (int) N, (int) K, (int) n_experts, (int) (total_rows / n_experts), stream)
-        : ggml_ppu_so_moe_grouped_gemm_bf16_masked(
-              A_bf16.ptr, src0->data, out_bf16.ptr, layout.ptr,
-              (int) max_m, (int) N, (int) K, (int) n_experts, (int) (total_rows / n_experts), stream);
+    const int expected_m = (int) (total_rows / n_experts);
+    const int rc =
+        use_gemv  ? ggml_ppu_so_moe_gemv_bf16(
+                        A_bf16.ptr, src0->data, out_bf16.ptr, layout.ptr,
+                        (int) total_rows, (int) N, (int) K, (int) n_experts, expected_m, stream)
+      : use_nopad ? ggml_ppu_so_moe_grouped_gemm_bf16_nopad(
+                        A_bf16.ptr, src0->data, out_bf16.ptr, layout.ptr,
+                        (int) total_rows, (int) N, (int) K, (int) n_experts, expected_m, stream)
+      :             ggml_ppu_so_moe_grouped_gemm_bf16_masked(
+                        A_bf16.ptr, src0->data, out_bf16.ptr, layout.ptr,
+                        (int) max_m, (int) N, (int) K, (int) n_experts, expected_m, stream);
     if (rc != 0) {
         return false;                              // .so has no kernel for this shape/arch -> inline fallback
     }
@@ -2013,6 +2034,29 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     GGML_TENSOR_BINARY_OP_LOCALS
 
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+
+#ifdef GGML_PPU_SO
+    // Try the external MoE grouped-GEMM .so (libppu_moe.so, wraps DeepGEMM) for bf16-weight MoE.
+    //
+    // PREFILL ONLY. A grouped GEMM is a tile-based compute kernel; MoE decode is memory-bound weight streaming, and
+    // handing it a GEMM would be the wrong tool by an order of magnitude -- one token spread over top-k experts
+    // leaves a couple of rows per expert, and even a NoPad kernel still pays a whole BLOCK_M-row tile for them. So
+    // the hook refuses small token counts OUTRIGHT rather than relying on ggml's mmvq/mmf dispatch below to catch
+    // them first: mmf declines for reasons of its own (src0->ne[1] % rows_per_block, K % (warp_size*2), ...) and a
+    // decode that slipped past it would land here and be silently slow.
+    //
+    // Above that line the hook takes precedence over mmq/mmf, which is why it sits BEFORE them. (It used to sit
+    // after, back when it sorted the tokens on the host: swapping mmf's sync-free device kernel for one that drained
+    // the pipeline was a loss no GEMM could pay back. The permutation is on the device now, so that no longer holds
+    // -- and leaving the hook below mmf would hand it gate/up on every typical MoE prefill, since mmf accepts a bf16
+    // mul_mat_id whenever src0->ne[1] <= 1024 && n_tokens <= 512.)
+    //
+    // GGML_PPU_MOE_MIN_TOKENS overrides the threshold; the crossover is hardware-specific and wants measuring on the
+    // target, against mmf on one side and the external kernel on the other.
+    if (ggml_cuda_mul_mat_id_ppu_so(ctx, src0, src1, ids, dst)) {
+        return;
+    }
+#endif // GGML_PPU_SO
 
     // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
     if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
@@ -2042,22 +2086,6 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
             return;
         }
     }
-
-#ifdef GGML_PPU_SO
-    // Try the external MoE grouped-GEMM .so (libppu_moe.so, wraps DeepGEMM) for bf16-weight MoE.
-    //
-    // Deliberately placed HERE, below mmvq/mmq/mmf and above the sorted-cuBLAS fallback -- NOT at the top of the
-    // function. Everything above takes `ids` on the device and needs no host round-trip; only the fallback below
-    // does the D2H + hard stream sync, and so does our hook. Hooking earlier would swap a sync-free device path
-    // (mmf handles bf16 mul_mat_id whenever src0->ne[1] <= 1024 && n_tokens <= 512, i.e. gate/up on a typical MoE
-    // prefill) for one that drains the pipeline -- strictly worse, whatever the GEMM underneath is worth.
-    //
-    // So the .so only competes where ggml itself already gave up on staying on-device: large-batch float MoE, i.e.
-    // the batched-cuBLAS regime. That is exactly where a grouped GEMM should win.
-    if (ggml_cuda_mul_mat_id_ppu_so(ctx, src0, src1, ids, dst)) {
-        return;
-    }
-#endif // GGML_PPU_SO
 
     // note: this path should not be reached when recording CUDA graphs, because it requires stream synchronization
     // TODO: add asserts to verify this. should work with CUDA, HIP, etc.

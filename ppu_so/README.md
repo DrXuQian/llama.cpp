@@ -92,12 +92,36 @@ value, i.e. a mandatory D2H. Masked (and psum) walk their device-resident layout
 a memory extent and an **upper bound suffices**. That is the whole trick, and it is what lets vLLM and the PPU stack
 run this path with no host round-trip.
 
-Which layout the hook uses is decided by **which symbol the `.so` exports** — presence is the capability query:
+## Dispatch: regime first, then layout
 
-| exported symbol | layout | host-known row count | pad flops | scratch |
-|---|---|---|---|---|
-| `ppu_moe_grouped_gemm_bf16_nopad` | dense contiguous | `total_rows = n_tokens × n_expert_used` (an identity) | none | `total_rows × K` |
-| `ppu_moe_grouped_gemm_bf16_masked` | masked | `max_m = align(n_tokens, 128)` (an upper bound) | `ceil(rows/64)*64` per expert | `n_experts × max_m × K` |
+**Decode and prefill are different kernels, not the same kernel at different sizes.** A grouped GEMM is a tile-based
+compute kernel; MoE decode is memory-bound weight streaming. One token over top-k experts leaves 1–2 rows per expert,
+and even a NoPad kernel pays a whole `BLOCK_M`-row tile — plus a wgmma/TMA pipeline tuned for `M >> 1` — to produce
+them. So decode gets a **separate entry**, `ppu_moe_gemv_bf16`, over the same dense layout.
+
+The regime split is checked **inside the hook** (`n_tokens < GGML_PPU_MOE_MIN_TOKENS`, default 128), not implied by
+where the hook sits in ggml's dispatch chain: `mmvq`/`mmf` decline for reasons of their own
+(`src0->ne[1] % rows_per_block`, `K % (warp_size*2)`, …) and a decode that slipped past them would otherwise land in
+the grouped GEMM and be silently slow.
+
+Which *entry* within a regime is then decided by **which symbol the `.so` exports** — presence is the capability query:
+
+| regime | exported symbol | layout | host-known row count | pad flops | scratch |
+|---|---|---|---|---|---|
+| decode | `ppu_moe_gemv_bf16` | dense | `total_rows` | n/a (GEMV) | `total_rows × K` |
+| prefill | `ppu_moe_grouped_gemm_bf16_nopad` | dense contiguous | `total_rows = n_tokens × n_expert_used` (an identity) | none | `total_rows × K` |
+| prefill | `ppu_moe_grouped_gemm_bf16_masked` | masked | `max_m = align(n_tokens, 128)` (an upper bound) | `ceil(rows/64)*64` per expert | `n_experts × max_m × K` |
+
+**Public DeepGEMM has no bf16/sm90 MoE GEMV**, so the `.so` built here does not export `ppu_moe_gemv_bf16` and decode
+falls through to ggml's own `mmvf`/`mmf` — the right answer there anyway. Neither of DeepGEMM's batched entries fits:
+
+* `einsum::bmk_bnk_mn(a[s,m,k], b[s,n,k], d[s,m,n])` indexes **B by the same batch dim as A**, so the selected
+  experts' weights would have to be materialised as a contiguous `[total_rows, N, K]` — a copy that *doubles* the
+  weight traffic the GEMV was meant to save.
+* `einsum::bhr_hdr_bhd(A[b,h,r], B[h,d,r], D[b,h,d])` shares B across the batch but indexes it by *head*. Forcing
+  `h = n_experts` computes **every** expert for **every** token — 16× the weight reads at top-8/128.
+
+A PPU `.so` with a real batched-GEMV kernel should export `ppu_moe_gemv_bf16` and the hook picks it up automatically.
 
 The PPU kernel team's DeepGemm has a genuine NoPad kernel — `bf16_grouped_deep_gemm_NoPad`, reached via
 `deep_gemm.m_grouped_gemm_bf16_bf16_bf16_nt_nopad(x, y, out, m_indices)`, which runs a device-side
