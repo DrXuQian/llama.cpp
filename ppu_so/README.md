@@ -50,6 +50,22 @@ GGML_PPU_MOE_SO=$PWD/ppu_so/build/libppu_moe.so ./build/bin/test-backend-ops -o 
 
 `GGML_PPU_MOE_SO` is optional — without it the loader just `dlopen("libppu_moe.so")` off the normal search path.
 
+## The permutation is built on the device — no D2H, no H2D, no sync
+
+The hook calls ggml's own `ggml_cuda_launch_mm_ids_helper` (`mmid.cuh` — the same device kernel `mmq`/`mmf` use) to
+get `ids_src1` / `ids_dst` / `expert_bounds`, then derives `m_indices` (or `masked_m`) from the bounds with a
+one-line kernel. Gather and scatter are two small kernels. **Nothing crosses to the host**, so unlike ggml's own
+sorted-cuBLAS fallback — which does a D2H, an `O(n_experts × n_tokens × n_expert_used)` CPU loop, a
+`cudaStreamSynchronize` and three H2Ds per MoE layer — this path stays CUDA-graph capturable.
+
+That is only possible because **no host value depends on the routing**. Which layout makes that true depends on the
+kernel, and `ppu_moe_row_alignment()` is the capability query that decides:
+
+| `row_alignment()` | layout | host-known row count | pad flops | scratch |
+|---|---|---|---|---|
+| `1` (PPU `bf16_grouped_deep_gemm_NoPad`) | dense contiguous | `total_rows = n_tokens × n_expert_used` (an identity) | none | `total_rows × K` |
+| `128` (public DeepGEMM) | masked | `max_m = align(n_tokens, 128)` (an upper bound) | `ceil(rows/64)*64` per expert | `n_experts × max_m × K` |
+
 ## The C ABI — two layouts
 
 ```c
@@ -76,19 +92,28 @@ int ppu_moe_grouped_gemm_bf16_nopad(
 The hook in `ggml-cuda.cu` builds the `(token, slot) -> expert` permutation on the host, gathers the F32
 activations into `A` as bf16, runs one grouped GEMM, and scatters the result back.
 
-### Why masked and not contiguous
+### Why the public build needs masked, and the PPU build does not
 
-The contiguous layout pins `BLOCK_M` to the 128-row alignment, so an expert holding 32 rows still costs a full
-128-row wgmma. That is exactly llama.cpp's regime: a few hundred tokens spread over 100+ experts leaves ~32 rows
-per expert, i.e. **4× wasted FLOPs**.
+Public DeepGEMM's bf16 contiguous kernel pins `BLOCK_M` to its 128-row alignment (`heuristics/sm90.hpp:33`), so every
+expert's segment must be padded to 128 — and **the padded total is data-dependent**, which is exactly the host value
+we are trying not to need. Its fp8 kernel dodges this the way vLLM does: launch with a host-known upper-bound `m`,
+mark the tail `m_indices = -1`, and let the kernel skip those blocks. But that skip does not exist for bf16 —
+`is_computation_valid` has exactly one call site in the whole repo, `sm90_fp8_gemm_1d2d.cuh:274`. A bf16 contiguous
+kernel would compute the tail against expert 0 and throw it away.
 
-Masked's scheduler builds its block queue straight from `masked_m` — group `g` contributes exactly
-`ceil(masked_m[g] / BLOCK_M)` row-blocks (`scheduler/gemm.cuh:207`) — and its `BLOCK_M` candidates are `{64, 128}`.
-The same expert now costs 64 rows. `masked_m` needs no alignment whatsoever; upstream's own test drives it with 20
-rows per group.
+So on public DeepGEMM we use **masked** instead. Its scheduler enqueues exactly `ceil(masked_m[e] / BLOCK_M)`
+row-blocks per expert (`scheduler/gemm.cuh:207`), so unused capacity costs *zero* flops — which means `max_m` only
+has to be an **upper bound**, and a host-known one exists: `mm_ids_helper` emits at most one compact row per
+(token, expert), so no expert can hold more than `n_tokens` rows. Zero sync, at the cost of an
+`n_experts / n_expert_used` (16× on a 128-expert top-8 model) scratch buffer.
 
-Contiguous is still the better shape under heavy routing imbalance, where masked's `n_experts * max_m` buffer blows
-up. The hook falls back to the inline ggml path when that buffer would exceed `8 * total_rows`.
+The PPU kernel team's `bf16_grouped_deep_gemm_NoPad` needs none of this: it takes each expert's rows as they are, so
+the row count it needs is just `total_rows = n_tokens × n_expert_used` — an identity. Dense layout, zero padding,
+zero wasted flops, compact scratch. That is the path the hook takes whenever `ppu_moe_row_alignment()` returns 1.
+
+**The gap worth reporting upstream:** DeepGEMM's bf16 grouped kernel should call `is_computation_valid` like its fp8
+sibling does. It looks like an omission, not a design choice, and it would let the public build use the same dense
+contiguous shape.
 
 ## Which calls are routed — and where the hook sits
 
@@ -152,10 +177,10 @@ Every kernel library we want to consume through this seam needs one.)*
 
 ### 2. Both layouts have a 128-row alignment trap, in different places
 
-**Contiguous:** the kernel assigns whole `BLOCK_M=128` row-blocks to one expert and reads the expert id from each
-block's *first* row. If expert *e*'s segment doesn't start on a 128-row boundary, a block straddles two experts and
-multiplies rows by the wrong weight matrix — **no error, just wrong output**. Every expert's segment must be padded
-up to `ppu_moe_row_alignment()`.
+**Contiguous (only when `row_alignment() > 1`):** the kernel assigns whole `BLOCK_M=128` row-blocks to one expert and
+reads the expert id from each block's *first* row. If expert *e*'s segment doesn't start on a 128-row boundary, a
+block straddles two experts and multiplies rows by the wrong weight matrix — **no error, just wrong output**. A kernel
+that reports `row_alignment() == 1` has no such constraint, which is the whole point of the NoPad variant.
 
 **Masked:** `masked_m` needs no alignment — but **`max_m` does**. It is the row *pitch* between groups: the kernel
 computes a global row as `group_idx * max_m + m_block_idx * BLOCK_M` (`scheduler/gemm.cuh:164`). If `max_m` weren't
@@ -183,10 +208,8 @@ disk-cached, so this only bites on the first call.
   return `rc=3` and llama.cpp falls back inline. Run `./build/test_moe 8 100 512 256` and
   `test-backend-ops -o MUL_MAT_ID` on an sm90 box before trusting it. The contiguous path *was* validated on H800
   (`MUL_MAT_ID 790/790`).
-* **The permutation is built on the host**, which costs a `cudaMemcpy` D2H + a hard `cudaStreamSynchronize` per MoE
-  layer and keeps the whole path out of CUDA graphs. ggml's own inline `mul_mat_id` has exactly the same problem
-  (it even says so in a comment above its sort). Moving the histogram + prefix sum + scatter onto the device would
-  leave only a `n_experts`-int D2H — `max_m` has to be a host value because it sizes the buffers and goes into the
-  TMA descriptor. This is worth fixing for the inline path too, i.e. it is upstreamable.
+* **The dense/NoPad arm has never been exercised**, because no `.so` here reports `row_alignment() == 1` — public
+  DeepGEMM reports 128. It is written against the PPU kernel team's `bf16_grouped_deep_gemm_NoPad`; confirm its exact
+  entry signature with them before trusting it.
 * **MoE decode must not be routed here.** DeepGEMM is a prefill kernel; with one token per expert even masked's
   64-row `BLOCK_M` is a 64× waste.

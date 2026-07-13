@@ -29,6 +29,7 @@
 #include "ggml-cuda/getrows.cuh"
 #include "ggml-cuda/im2col.cuh"
 #include "ggml-cuda/mmf.cuh"
+#include "ggml-cuda/mmid.cuh"
 #include "ggml-cuda/mmq.cuh"
 #include "ggml-cuda/mmvf.cuh"
 #include "ggml-cuda/mmvq.cuh"
@@ -1772,44 +1773,126 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
 }
 
 #ifdef GGML_PPU_SO
-// Gather the rows a MoE mul_mat_id needs into the compact per-expert layout the external grouped GEMM wants,
-// converting F32 -> bf16 on the way. One block per row; row i of the gather list reads src row src_rows[i] and
-// writes compact row dst_rows[i]. Unlike get_rows_cuda this is a true scatter (dst row != i), which lets us touch
-// ONLY the real rows: the masked layout permits the pad rows to stay uninitialized (see below).
+// Grid for both kernels below: (row-within-expert, expert). A block whose row index is past its expert's real row
+// count exits immediately -- that is how the fixed max_m capacity is skipped without ever reading a count on the host.
+#define PPU_MOE_BLOCK_DIM 256
+
+// src1 (F32, ragged) -> A (bf16, [n_experts, max_m, K]). expert e's real rows are the compact rows
+// [expert_bounds[e], expert_bounds[e+1]) produced by mm_ids_helper; row i of expert e lands at A[e*max_m + i].
 static __global__ void ppu_moe_gather_f32_to_bf16(
-        const float * __restrict__ src, nv_bfloat16 * __restrict__ dst,
-        const int32_t * __restrict__ src_rows, const int32_t * __restrict__ dst_rows,
-        const int64_t K, const int64_t src_row_stride) {
-    const int64_t i = blockIdx.x;
-    const float   * s = src + (int64_t) src_rows[i] * src_row_stride;
-    nv_bfloat16   * d = dst + (int64_t) dst_rows[i] * K;
-    for (int64_t k = threadIdx.x; k < K; k += blockDim.x) {
+        const float * __restrict__ src1, nv_bfloat16 * __restrict__ A,
+        const int32_t * __restrict__ ids_src1, const int32_t * __restrict__ expert_bounds,
+        const int64_t K, const int64_t src1_row_stride, const int64_t max_m) {
+    const int64_t i  = blockIdx.x;
+    const int64_t e  = blockIdx.y;
+    const int32_t lo = expert_bounds[e];
+    if (i >= expert_bounds[e + 1] - lo) {
+        return;
+    }
+    const float * s = src1 + (int64_t) ids_src1[lo + i] * src1_row_stride;
+    nv_bfloat16 * d = A + (e*max_m + i) * K;
+    for (int64_t k = threadIdx.x; k < K; k += PPU_MOE_BLOCK_DIM) {
         d[k] = __float2bfloat16(s[k]);
     }
 }
 
-// Route a bf16-weight MoE mul_mat_id through the external DeepGEMM grouped-GEMM .so (libppu_moe.so), using its
-// MASKED layout: A = [n_experts, max_m, K], out = [n_experts, max_m, N], masked_m[g] = expert g's real row count.
+// out (bf16, [n_experts, max_m, N]) -> dst (F32). Inverse of the gather; the capacity rows are never touched.
+static __global__ void ppu_moe_scatter_bf16_to_f32(
+        const nv_bfloat16 * __restrict__ out, float * __restrict__ dst,
+        const int32_t * __restrict__ ids_dst, const int32_t * __restrict__ expert_bounds,
+        const int64_t N, const int64_t dst_row_stride, const int64_t max_m) {
+    const int64_t i  = blockIdx.x;
+    const int64_t e  = blockIdx.y;
+    const int32_t lo = expert_bounds[e];
+    if (i >= expert_bounds[e + 1] - lo) {
+        return;
+    }
+    const nv_bfloat16 * s = out + (e*max_m + i) * N;
+    float * d = dst + (int64_t) ids_dst[lo + i] * dst_row_stride;
+    for (int64_t j = threadIdx.x; j < N; j += PPU_MOE_BLOCK_DIM) {
+        d[j] = __bfloat162float(s[j]);
+    }
+}
+
+// masked_m[e] = expert e's real row count, straight off mm_ids_helper's bounds.
+static __global__ void ppu_moe_bounds_to_masked_m(
+        const int32_t * __restrict__ expert_bounds, int32_t * __restrict__ masked_m, const int n_experts) {
+    const int e = blockIdx.x*blockDim.x + threadIdx.x;
+    if (e < n_experts) {
+        masked_m[e] = expert_bounds[e + 1] - expert_bounds[e];
+    }
+}
+
+// m_indices[r] = the expert owning compact row r, for the dense (no-padding) contiguous layout. One block per
+// expert, each filling its own [expert_bounds[e], expert_bounds[e+1]) slice.
+static __global__ void ppu_moe_bounds_to_m_indices(
+        const int32_t * __restrict__ expert_bounds, int32_t * __restrict__ m_indices) {
+    const int e = blockIdx.x;
+    for (int r = expert_bounds[e] + threadIdx.x; r < expert_bounds[e + 1]; r += PPU_MOE_BLOCK_DIM) {
+        m_indices[r] = e;
+    }
+}
+
+// src1 (F32, ragged) -> A (bf16, [total_rows, K]) for the dense contiguous layout: compact row r comes straight from
+// mm_ids_helper's ids_src1[r], no per-expert capacity and no padding.
+static __global__ void ppu_moe_gather_f32_to_bf16_dense(
+        const float * __restrict__ src1, nv_bfloat16 * __restrict__ A,
+        const int32_t * __restrict__ ids_src1, const int64_t K, const int64_t src1_row_stride) {
+    const int64_t r = blockIdx.x;
+    const float * s = src1 + (int64_t) ids_src1[r] * src1_row_stride;
+    nv_bfloat16 * d = A + r * K;
+    for (int64_t k = threadIdx.x; k < K; k += PPU_MOE_BLOCK_DIM) {
+        d[k] = __float2bfloat16(s[k]);
+    }
+}
+
+static __global__ void ppu_moe_scatter_bf16_to_f32_dense(
+        const nv_bfloat16 * __restrict__ out, float * __restrict__ dst,
+        const int32_t * __restrict__ ids_dst, const int64_t N, const int64_t dst_row_stride) {
+    const int64_t r = blockIdx.x;
+    const nv_bfloat16 * s = out + r * N;
+    float * d = dst + (int64_t) ids_dst[r] * dst_row_stride;
+    for (int64_t j = threadIdx.x; j < N; j += PPU_MOE_BLOCK_DIM) {
+        d[j] = __bfloat162float(s[j]);
+    }
+}
+
+// Route a bf16-weight MoE mul_mat_id through the external grouped-GEMM .so (libppu_moe.so).
 //
-// Why masked and not the contiguous/m_indices layout: contiguous pins BLOCK_M to the 128-row alignment, so an
-// expert holding 32 rows still costs a full 128-row wgmma. Masked's scheduler builds its block queue straight from
-// masked_m -- group g contributes exactly ceil(masked_m[g]/BLOCK_M) row-blocks (scheduler/gemm.cuh:207) -- and its
-// BLOCK_M is 64 or 128, so that same expert costs 64 rows. In the decode-adjacent regime llama.cpp actually runs
-// (a few hundred tokens across 100+ experts => ~32 rows/expert) that is a 2x cut in wasted FLOPs, and masked_m
-// itself needs no alignment at all.
+// Nothing here touches the host. The row permutation comes from ggml's own ggml_cuda_launch_mm_ids_helper -- the
+// same device kernel mmq/mmf use -- which emits ids_src1 / ids_dst / expert_bounds; m_indices and masked_m are
+// trivial functions of the bounds. So there is no D2H, no H2D and no cudaStreamSynchronize, and the path stays
+// CUDA-graph capturable, unlike ggml's own sorted-cuBLAS fallback below which sorts on the CPU.
 //
-// The one alignment that DOES matter: `max_m` is the row pitch between groups (scheduler/gemm.cuh:164 computes the
-// global row as current_group_idx*max_m + m_block_idx*BLOCK_M). If max_m were not a multiple of BLOCK_M, group g's
-// last row-block would spill across the group boundary and TMA-store over group g+1's real output rows. So we round
-// max_m up to 128, a safe superset of both BLOCK_M candidates.
+// Two layouts, picked by what the .so says it needs. ppu_moe_row_alignment() is the capability query:
 //
-// Rows [masked_m[g], max_m) of A are deliberately left uninitialized: garbage in compact row r only ever reaches
-// out row r, and we never scatter those rows back. That is what lets the gather above touch only the real rows.
+//   == 1  DENSE CONTIGUOUS ("NoPad"). The kernel takes each expert's rows exactly as they are, so the row count it
+//         needs is just total_rows = n_tokens * n_expert_used -- an identity, known on the host by construction.
+//         Zero padding, zero wasted flops, scratch is the compact total_rows*K. This is what the PPU kernel team's
+//         bf16_grouped_deep_gemm_NoPad provides and it is the path we actually want.
+//
+//   >  1  MASKED. Upstream/public DeepGEMM's bf16 contiguous kernel pins BLOCK_M to a 128-row alignment, so every
+//         expert's segment must be padded to it -- and the padded total is data-dependent, which would force a D2H.
+//         (Its fp8 kernel dodges that by skipping m_indices<0 blocks via is_computation_valid, but the bf16 kernel
+//         never calls it -- grep: sm90_fp8_gemm_1d2d.cuh:274 is the only call site in the repo.) So on public
+//         DeepGEMM we use the masked layout instead: its scheduler enqueues exactly ceil(masked_m[e]/BLOCK_M) blocks
+//         per expert, which means max_m only has to be an UPPER BOUND, and a host-known one exists -- mm_ids_helper
+//         emits at most one compact row per (token, expert), so no expert can hold more than n_tokens rows.
+//         Still zero-sync, but it pays n_experts/n_expert_used (16x on a 128-expert top-8 model) in scratch, and
+//         ceil(rows/64)*64 per expert in flops.
+//
+// For masked, max_m must be a multiple of BLOCK_M (64 or 128): it is the row pitch between experts
+// (scheduler/gemm.cuh:164 forms the global row as expert*max_m + m_block_idx*BLOCK_M), so a non-multiple would let
+// an expert's last row-block TMA-store over the next expert's real output rows. We round to 128, a safe superset.
+// Rows [masked_m[e], max_m) of A are left UNINITIALIZED on purpose: garbage in compact row r only ever reaches out
+// row r, and the scatter never reads those rows back.
 //
 // Returns false (fall through to the inline path) if unsupported or if the .so has no kernel for this shape.
 static bool ggml_cuda_mul_mat_id_ppu_so(ggml_backend_cuda_context & ctx,
         const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst) {
-    if (!ggml_ppu_so_moe_masked_available()) {
+    const int align = ggml_ppu_so_moe_available() ? ggml_ppu_so_moe_row_alignment() : 0;
+    const bool use_dense = align == 1;
+    if (!use_dense && !ggml_ppu_so_moe_masked_available()) {
         return false;
     }
     // DeepGEMM entry is bf16 A x bf16 B -> bf16 out. Require bf16 expert weights, F32 activations/out.
@@ -1819,103 +1902,92 @@ static bool ggml_cuda_mul_mat_id_ppu_so(ggml_backend_cuda_context & ctx,
     if (!ggml_is_contiguous(src0) || !ggml_is_contiguous(src1) || !ggml_is_contiguous(dst)) {
         return false;                              // rhs [n_experts, N, K] must be contiguous; so must src1/dst
     }
+    if (ids->type != GGML_TYPE_I32) {
+        return false;
+    }
 
     const int64_t K             = src0->ne[0];
     const int64_t N             = src0->ne[1];
     const int64_t n_experts     = src0->ne[2];
     const int64_t n_expert_used = ids->ne[0];
     const int64_t n_tokens      = src1->ne[2];
-    const int64_t ne11          = src1->ne[1];
     const int64_t total_rows    = n_tokens * n_expert_used;
     if (src1->ne[0] != K || dst->ne[0] != N || total_rows == 0) {
         return false;
     }
 
-    cudaStream_t stream = ctx.stream();
+    // Masked pays a capacity buffer; dense pays nothing. An expert holds at most one row per token (mm_ids_helper
+    // keeps a single slot per (token, expert)), so n_tokens is a hard upper bound -- known without reading the data.
+    const int64_t max_m    = use_dense ? 0 : GGML_PAD(n_tokens, 128);
+    const int64_t buf_rows = use_dense ? total_rows : n_experts * max_m;
+
     const size_t ts = ggml_type_size(GGML_TYPE_BF16);
-
-    // --- build the permutation on the host ---
-    // TODO: this needs a D2H + a hard stream sync, which also keeps the whole MoE path out of CUDA graphs. ggml's
-    // own inline mul_mat_id has exactly the same problem (see the note above its sort). Moving the histogram +
-    // prefix sum + scatter onto the device would leave only a G-int D2H (max_m has to be a host value: it sizes the
-    // buffers and goes into the TMA descriptor).
-    std::vector<char> ids_host(ggml_nbytes(ids));
-    CUDA_CHECK(cudaMemcpyAsync(ids_host.data(), ids->data, ggml_nbytes(ids), cudaMemcpyDeviceToHost, stream));
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-
-    const auto expert_of = [&](int64_t it, int64_t iex) {
-        return *(const int32_t *)(ids_host.data() + it*ids->nb[1] + iex*ids->nb[0]);
-    };
-
-    // pass 1: rows per expert. (Note this is O(n_tokens * n_expert_used); ggml's inline path instead loops experts x
-    // tokens x slots, which for 128 experts x 512 tokens x top-8 is ~500k iterations per layer.)
-    std::vector<int32_t> masked_m_host(n_experts, 0);
-    for (int64_t it = 0; it < n_tokens; ++it) {
-        for (int64_t iex = 0; iex < n_expert_used; ++iex) {
-            const int32_t e = expert_of(it, iex);
-            if (e < 0 || e >= n_experts) {
-                return false;
-            }
-            masked_m_host[e]++;
-        }
-    }
-    const int32_t max_rows = *std::max_element(masked_m_host.begin(), masked_m_host.end());
-    const int64_t max_m    = GGML_PAD(max_rows, 128);          // must be a multiple of DeepGEMM's BLOCK_M
-    const int64_t buf_rows = n_experts * max_m;
-
-    // Masked sizes the buffers as G*max_m rather than sum of the (padded) per-expert rows, so a badly imbalanced
-    // routing can blow the scratch up. Bail to the inline path rather than allocate absurdly.
-    if (buf_rows > 8*total_rows) {
-        return false;
+    if ((size_t) buf_rows * (K + N) * ts > (size_t) 1024*1024*1024) {
+        return false;                              // >1 GiB of scratch just for the capacity: not worth it
     }
 
-    // pass 2: place each (token,slot) at compact row expert*max_m + rank-within-expert.
-    std::vector<int32_t> fill(n_experts, 0);
-    std::vector<int32_t> src_rows(total_rows);                 // gather list: source row in src1
-    std::vector<int32_t> dst_rows(total_rows);                 // gather list: compact row in A
-    std::vector<int32_t> ids_from_sorted(total_rows);          // (token*used+slot) -> compact row, for the scatter
-    for (int64_t it = 0; it < n_tokens; ++it) {
-        for (int64_t iex = 0; iex < n_expert_used; ++iex) {
-            const int32_t e   = expert_of(it, iex);
-            const int64_t row = it*n_expert_used + iex;
-            const int64_t cmp = (int64_t) e*max_m + fill[e]++;
-            src_rows[row]        = (int32_t) (it*ne11 + iex % ne11);
-            dst_rows[row]        = (int32_t) cmp;
-            ids_from_sorted[row] = (int32_t) cmp;
-        }
-    }
+    cudaStream_t stream = ctx.stream();
 
-    ggml_cuda_pool_alloc<int32_t> idx_dev(ctx.pool(), 3*total_rows + n_experts);
-    int32_t * src_rows_dev = idx_dev.ptr;
-    int32_t * dst_rows_dev = src_rows_dev + total_rows;
-    int32_t * ids_from_dev = dst_rows_dev + total_rows;
-    int32_t * masked_m_dev = ids_from_dev + total_rows;
-    CUDA_CHECK(cudaMemcpyAsync(src_rows_dev, src_rows.data(),        total_rows*sizeof(int32_t), cudaMemcpyHostToDevice, stream));
-    CUDA_CHECK(cudaMemcpyAsync(dst_rows_dev, dst_rows.data(),        total_rows*sizeof(int32_t), cudaMemcpyHostToDevice, stream));
-    CUDA_CHECK(cudaMemcpyAsync(ids_from_dev, ids_from_sorted.data(), total_rows*sizeof(int32_t), cudaMemcpyHostToDevice, stream));
-    CUDA_CHECK(cudaMemcpyAsync(masked_m_dev, masked_m_host.data(),   n_experts *sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+    // --- device-side permutation: ggml's own mul_mat_id helper (the one mmq/mmf use) ---
+    ggml_cuda_pool_alloc<int32_t> ids_src1 (ctx.pool(), total_rows);
+    ggml_cuda_pool_alloc<int32_t> ids_dst  (ctx.pool(), total_rows);
+    ggml_cuda_pool_alloc<int32_t> bounds   (ctx.pool(), n_experts + 1);
+    ggml_cuda_pool_alloc<int32_t> layout   (ctx.pool(), use_dense ? total_rows : n_experts);  // m_indices | masked_m
 
-    // --- gather src1 (F32) -> A_bf16 [n_experts, max_m, K]; only the real rows are written ---
-    ggml_cuda_pool_alloc<char> A_bf16(ctx.pool(), buf_rows*K*ts);
-    ppu_moe_gather_f32_to_bf16<<<total_rows, std::min<int64_t>(K, 256), 0, stream>>>(
-        (const float *) src1->data, (nv_bfloat16 *) A_bf16.ptr,
-        src_rows_dev, dst_rows_dev, K, src1->nb[1]/sizeof(float));
+    const int si1  = (int) (ids->nb[1] / sizeof(int32_t));
+    const int sis1 = (int) (src1->nb[2] / src1->nb[1]);
+    GGML_ASSERT(sis1 > 0);
+
+    ggml_cuda_launch_mm_ids_helper((const int32_t *) ids->data, ids_src1.ptr, ids_dst.ptr, bounds.ptr,
+        (int) n_experts, (int) n_tokens, (int) n_expert_used, (int) src1->ne[1], si1, sis1, stream);
     CUDA_CHECK(cudaGetLastError());
 
-    // --- one masked grouped GEMM: out[g, :masked_m[g], :] = A[g, :masked_m[g], :] x src0[g]^T ---
+    ggml_cuda_pool_alloc<char> A_bf16 (ctx.pool(), buf_rows*K*ts);
     ggml_cuda_pool_alloc<char> out_bf16(ctx.pool(), buf_rows*N*ts);
-    const int rc = ggml_ppu_so_moe_grouped_gemm_bf16_masked(
-        A_bf16.ptr, src0->data, out_bf16.ptr, masked_m_dev,
+    int rc;
+
+    if (use_dense) {
+        ppu_moe_bounds_to_m_indices<<<n_experts, PPU_MOE_BLOCK_DIM, 0, stream>>>(bounds.ptr, layout.ptr);
+        CUDA_CHECK(cudaGetLastError());
+
+        ppu_moe_gather_f32_to_bf16_dense<<<total_rows, PPU_MOE_BLOCK_DIM, 0, stream>>>(
+            (const float *) src1->data, (nv_bfloat16 *) A_bf16.ptr, ids_src1.ptr,
+            K, src1->nb[1]/sizeof(float));
+        CUDA_CHECK(cudaGetLastError());
+
+        rc = ggml_ppu_so_moe_grouped_gemm_bf16_nopad(
+            A_bf16.ptr, src0->data, out_bf16.ptr, layout.ptr,
+            (int) total_rows, (int) N, (int) K, (int) n_experts, (int) (total_rows / n_experts), stream);
+        if (rc != 0) {
+            return false;
+        }
+
+        ppu_moe_scatter_bf16_to_f32_dense<<<total_rows, PPU_MOE_BLOCK_DIM, 0, stream>>>(
+            (const nv_bfloat16 *) out_bf16.ptr, (float *) dst->data, ids_dst.ptr,
+            N, dst->nb[1]/sizeof(float));
+        CUDA_CHECK(cudaGetLastError());
+        return true;
+    }
+
+    ppu_moe_bounds_to_masked_m<<<(n_experts + 255)/256, 256, 0, stream>>>(bounds.ptr, layout.ptr, (int) n_experts);
+    CUDA_CHECK(cudaGetLastError());
+
+    const dim3 grid(max_m, n_experts, 1);
+    ppu_moe_gather_f32_to_bf16<<<grid, PPU_MOE_BLOCK_DIM, 0, stream>>>(
+        (const float *) src1->data, (nv_bfloat16 *) A_bf16.ptr, ids_src1.ptr, bounds.ptr,
+        K, src1->nb[1]/sizeof(float), max_m);
+    CUDA_CHECK(cudaGetLastError());
+
+    rc = ggml_ppu_so_moe_grouped_gemm_bf16_masked(
+        A_bf16.ptr, src0->data, out_bf16.ptr, layout.ptr,
         (int) max_m, (int) N, (int) K, (int) n_experts, (int) (total_rows / n_experts), stream);
     if (rc != 0) {
         return false;                              // .so has no kernel for this shape/arch -> inline fallback
     }
 
-    // --- scatter the real rows of out_bf16 -> dst (F32); the pad rows are dropped here ---
-    get_rows_cuda(out_bf16.ptr, GGML_TYPE_BF16, ids_from_dev, dst->data, dst->type,
-        N, N*ts, buf_rows*N*ts, buf_rows*N*ts,
-        total_rows, 1, 1, sizeof(int32_t), total_rows*sizeof(int32_t), total_rows*sizeof(int32_t),
-        dst->nb[1], dst->nb[2], dst->nb[3], stream);
+    ppu_moe_scatter_bf16_to_f32<<<grid, PPU_MOE_BLOCK_DIM, 0, stream>>>(
+        (const nv_bfloat16 *) out_bf16.ptr, (float *) dst->data, ids_dst.ptr, bounds.ptr,
+        N, dst->nb[1]/sizeof(float), max_m);
     CUDA_CHECK(cudaGetLastError());
     return true;
 }
