@@ -1928,6 +1928,14 @@ static bool ggml_cuda_mul_mat_id_ppu_so(ggml_backend_cuda_context & ctx,
         return false;                              // >1 GiB of scratch just for the capacity: not worth it
     }
 
+    // mm_ids_helper stages one 4-byte entry per token in shared memory and hard-ASSERTS that it fits
+    // (mmid.cu:132) -- it does not fall back. Check first, so an oversized ubatch degrades to the inline path
+    // instead of aborting the process. Its other two asserts are bit-width limits on its packed store.
+    const size_t smpbo = ggml_cuda_info().devices[ggml_cuda_get_device()].smpbo;
+    if (n_tokens*sizeof(int32_t) > smpbo || n_tokens >= (1 << 22) || n_expert_used >= (1 << 10)) {
+        return false;
+    }
+
     cudaStream_t stream = ctx.stream();
 
     // --- device-side permutation: ggml's own mul_mat_id helper (the one mmq/mmf use) ---
