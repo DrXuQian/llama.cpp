@@ -1934,14 +1934,6 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
 
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
 
-#ifdef GGML_PPU_SO
-    // Try the external MoE grouped-GEMM .so (libppu_moe.so, wraps DeepGEMM) for bf16-weight MoE. Handles the
-    // ragged->masked gather + bf16 cast + scatter; returns false if unsupported -> inline path below.
-    if (ggml_cuda_mul_mat_id_ppu_so(ctx, src0, src1, ids, dst)) {
-        return;
-    }
-#endif // GGML_PPU_SO
-
     // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
     if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
         static_assert(MMVQ_MAX_BATCH_SIZE == MMVF_MAX_BATCH_SIZE);
@@ -1970,6 +1962,22 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
             return;
         }
     }
+
+#ifdef GGML_PPU_SO
+    // Try the external MoE grouped-GEMM .so (libppu_moe.so, wraps DeepGEMM) for bf16-weight MoE.
+    //
+    // Deliberately placed HERE, below mmvq/mmq/mmf and above the sorted-cuBLAS fallback -- NOT at the top of the
+    // function. Everything above takes `ids` on the device and needs no host round-trip; only the fallback below
+    // does the D2H + hard stream sync, and so does our hook. Hooking earlier would swap a sync-free device path
+    // (mmf handles bf16 mul_mat_id whenever src0->ne[1] <= 1024 && n_tokens <= 512, i.e. gate/up on a typical MoE
+    // prefill) for one that drains the pipeline -- strictly worse, whatever the GEMM underneath is worth.
+    //
+    // So the .so only competes where ggml itself already gave up on staying on-device: large-batch float MoE, i.e.
+    // the batched-cuBLAS regime. That is exactly where a grouped GEMM should win.
+    if (ggml_cuda_mul_mat_id_ppu_so(ctx, src0, src1, ids, dst)) {
+        return;
+    }
+#endif // GGML_PPU_SO
 
     // note: this path should not be reached when recording CUDA graphs, because it requires stream synchronization
     // TODO: add asserts to verify this. should work with CUDA, HIP, etc.

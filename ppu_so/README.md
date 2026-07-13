@@ -90,17 +90,40 @@ rows per group.
 Contiguous is still the better shape under heavy routing imbalance, where masked's `n_experts * max_m` buffer blows
 up. The hook falls back to the inline ggml path when that buffer would exceed `8 * total_rows`.
 
-## Which calls are routed
+## Which calls are routed — and where the hook sits
 
-Only what DeepGEMM actually handles well:
+The hook is **not** at the top of `ggml_cuda_mul_mat_id`. It sits below ggml's `mmvq` / `mmq` / `mmf` dispatch and
+directly above the sorted-cuBLAS fallback. That placement is the whole design:
 
-* `src0` (expert weights) is **bf16**, `dst`/`src1` F32 → gathered to bf16
-* sm90+
-* everything else (fp16 weights, any quantized format, unsupported `K`) stays on the inline path
+```
+ggml_cuda_mul_mat_id:
+  mul_mat_vec_q   quantized, small batch (decode)   takes ids on device, no sync
+  mul_mat_q       quantized (MMQ)                   takes ids on device, no sync
+  mul_mat_f       float, small batch (MMF)          takes ids on device, no sync
+  ---- ppu_so hook -----------------------------------------------------------
+  sorted cuBLAS   float, large batch                host sort => D2H + hard stream sync
+```
 
-**MoE decode must NOT be routed.** With one token per expert, even masked's 64-row `BLOCK_M` turns a 1-row GEMM into
-a 64-row GEMM. This path is for **prefill** (many tokens per expert). Quantized MoE is inherently ours: those are
-ggml-proprietary formats no external library has ever seen.
+Everything above the line already stays on the device. Only the fallback below it pays a `cudaMemcpy` D2H plus a
+`cudaStreamSynchronize` — and so does our hook, unavoidably (`max_m` sizes the buffers and goes into the TMA
+descriptor, so it has to be a host value). Hooking any earlier would trade a sync-free device kernel for one that
+drains the pipeline, and no GEMM is fast enough to pay that back.
+
+Concretely, `ggml_cuda_should_use_mmf` accepts a bf16 `mul_mat_id` when `src0->ne[1] <= 1024 && n_tokens <= 512`
+(mmf.cu:162). On a typical MoE prefill (`ubatch=512`, `moe_intermediate=768`, `hidden=2048`) that means **gate/up go
+to MMF and only down_proj falls through to the sorted path**. An early hook would have stolen gate/up from a
+sync-free kernel. So the `.so` competes only where ggml itself gave up on staying on-device: **large-batch float
+MoE**, i.e. exactly the batched-cuBLAS regime a grouped GEMM should win.
+
+On top of that the hook requires:
+
+* `src0` (expert weights) **bf16**, `src1`/`dst` F32 → gathered to bf16
+* sm90/sm100 (DeepGEMM's bf16 kernels; anything else returns `rc=3` → inline fallback)
+* all three operands contiguous, `K % 64 == 0`
+
+**MoE decode is never routed** — it is caught by `mul_mat_vec_q`/`mmf` long before the hook. Good: with one token per
+expert, even masked's 64-row `BLOCK_M` would turn a 1-row GEMM into a 64-row GEMM. Quantized MoE is likewise never
+routed: those are ggml-proprietary formats no external library has ever seen.
 
 ---
 
