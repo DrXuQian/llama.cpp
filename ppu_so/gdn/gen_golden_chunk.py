@@ -22,7 +22,7 @@ dev="cuda"
 # indexing, which is a genuinely different code path -- and it is what real models use (Qwen3.5: 16,32,128).
 _spec = sys.argv[1] if len(sys.argv) > 1 else "4,4,128"
 _H, _HV, _S = (int(x) for x in _spec.split(","))
-B,T,H,HV,K,V = 1, 256, _H, _HV, _S, _S   # T multiple of chunk 64
+B,T,H,HV,K,V = 1, int(os.environ.get("GOLDEN_T","256")), _H, _HV, _S, _S   # T multiple of chunk 64
 BT=64
 scale = 1.0/(K**0.5)
 q = torch.randn(B,T,H,K, device=dev, dtype=torch.float32)

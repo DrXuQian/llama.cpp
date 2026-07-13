@@ -92,20 +92,48 @@ def emit(cfgs):
         m = cfg["meta"]
         src.append(f"""
 static CUfunction fn_{tag}[5];
+static int load_ok_{tag} = 0;
+// EVERY driver call is checked. cuModuleLoadData failing (arch mismatch, no current context, OOM) used to leave
+// `mod` as an UNINITIALISED STACK VALUE, which cuModuleGetFunction then handed to the driver -- a host SEGFAULT,
+// not an error return. That is the single nastiest failure mode of the whole dlopen approach: it looks like a bug
+// in the caller.
 static void load_{tag}(void) {{
     const unsigned char* cbs[5] = {{cb_{tag}_cumsum, cb_{tag}_kkt, cb_{tag}_wu, cb_{tag}_h, cb_{tag}_o}};
     const char* nm[5] = {{"{m['cumsum']['name']}","{m['kkt']['name']}","{m['wu']['name']}","{m['h']['name']}","{m['o']['name']}"}};
     int smem[5] = {{{m['cumsum']['smem']},{m['kkt']['smem']},{m['wu']['smem']},{m['h']['smem']},{m['o']['smem']}}};
     for (int i=0;i<5;i++) {{
-        CUmodule mod; cuModuleLoadData(&mod, cbs[i]);
-        cuModuleGetFunction(&fn_{tag}[i], mod, nm[i]);
-        if (smem[i] > 49152) cuFuncSetAttribute(fn_{tag}[i], CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, smem[i]);
+        CUmodule mod = NULL;
+        CUresult r = cuModuleLoadData(&mod, cbs[i]);
+        if (r != CUDA_SUCCESS || mod == NULL) {{
+            const char * e = NULL; cuGetErrorString(r, &e);
+            fprintf(stderr, "[ppu-gdn] cuModuleLoadData(%s) failed: %d (%s) -- the cubin does not match this device, "
+                            "or there is no current CUDA context on this thread\\n", nm[i], (int) r, e ? e : "?");
+            fn_{tag}[i] = NULL;
+            return;
+        }}
+        r = cuModuleGetFunction(&fn_{tag}[i], mod, nm[i]);
+        if (r != CUDA_SUCCESS) {{
+            fprintf(stderr, "[ppu-gdn] cuModuleGetFunction(%s) failed: %d\\n", nm[i], (int) r);
+            fn_{tag}[i] = NULL;
+            return;
+        }}
+        if (smem[i] > 49152) {{
+            r = cuFuncSetAttribute(fn_{tag}[i], CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, smem[i]);
+            if (r != CUDA_SUCCESS) {{
+                fprintf(stderr, "[ppu-gdn] cuFuncSetAttribute(%s, smem=%d) failed: %d -- device cannot give that "
+                                "much dynamic shared memory\\n", nm[i], smem[i], (int) r);
+                fn_{tag}[i] = NULL;
+                return;
+            }}
+        }}
     }}
+    load_ok_{tag} = 1;
 }}
 // q,k[n,T,H,S] v[n,T,HV,S] g_cumsum? no: g_raw[n,T,HV] beta[n,T,HV] h0,ht[n,HV,S,S] o[n,T,HV,S]. one sequence at a time.
 static int run_{tag}(const float* q,const float* k,const float* v,const float* g_raw,const float* beta,
                      const float* h0,float* o,float* ht,int T,float scale,CUstream st,
                      float* g,float* A,float* w,float* u,float* h,float* vnew) {{
+    if (!load_ok_{tag}) return 2;   // module failed to load; see the message from load_{tag}()
     const int H={H},HV={HV},S={S},BT={cfg['BT']},BVh={cfg['BVh']}; const int NT=(T+BT-1)/BT; const float RCP=1.4426950408889634f;
     CUdeviceptr gsc=0; int Tv=T;
     CUdeviceptr dq=(CUdeviceptr)q,dk=(CUdeviceptr)k,dv=(CUdeviceptr)v,dgr=(CUdeviceptr)g_raw,db=(CUdeviceptr)beta,dh0=(CUdeviceptr)h0,dO=(CUdeviceptr)o,dht=(CUdeviceptr)ht;
@@ -122,12 +150,29 @@ static int run_{tag}(const float* q,const float* k,const float* v,const float* g
 }}""")
         dispatch_arms.append(f"""    if (H=={H} && HV=={HV} && S=={S}) {{
         pthread_once(&once_{tag}, load_{tag});
+        if (!load_ok_{tag}) return 2;
         const size_t es=4; const int NT=(T+63)/64;
-        // per-sequence intermediates
-        float *g,*A,*w,*u,*h,*vn;
-        cudaMalloc((void**)&g,(size_t)T*HV*es); cudaMalloc((void**)&A,(size_t)T*HV*64*es);
-        cudaMalloc((void**)&w,(size_t)T*HV*S*es); cudaMalloc((void**)&u,(size_t)T*HV*S*es);
-        cudaMalloc((void**)&h,(size_t)NT*HV*S*S*es); cudaMalloc((void**)&vn,(size_t)T*HV*S*es);
+        // Per-call scratch. NOTE this is cudaMalloc'd OUTSIDE ggml's pool, ~220 MB at T=2048 -- and llama.cpp has
+        // already filled the device with the model and the KV cache, so OOM here is entirely plausible. An
+        // unchecked cudaMalloc leaves the pointer UNINITIALISED, which then goes to the kernel. Check all six.
+        // (Caching this scratch across calls is the obvious fix, and is also what would make the path
+        // CUDA-graph-capturable.)
+        float *g=NULL,*A=NULL,*w=NULL,*u=NULL,*h=NULL,*vn=NULL;
+        int oom = 0;
+        oom |= cudaMalloc((void**)&g, (size_t)T*HV*es)      != cudaSuccess;
+        oom |= cudaMalloc((void**)&A, (size_t)T*HV*64*es)   != cudaSuccess;
+        oom |= cudaMalloc((void**)&w, (size_t)T*HV*S*es)    != cudaSuccess;
+        oom |= cudaMalloc((void**)&u, (size_t)T*HV*S*es)    != cudaSuccess;
+        oom |= cudaMalloc((void**)&h, (size_t)NT*HV*S*S*es) != cudaSuccess;
+        oom |= cudaMalloc((void**)&vn,(size_t)T*HV*S*es)    != cudaSuccess;
+        if (oom) {{
+            fprintf(stderr, "[ppu-gdn] chunked scratch cudaMalloc failed (T=%d, ~%zu MB needed outside ggml's pool)"
+                            " -- falling back\\n", T,
+                    (size_t)((size_t)T*HV*es + (size_t)T*HV*64*es + 3*(size_t)T*HV*S*es
+                             + (size_t)NT*HV*S*S*es) >> 20);
+            cudaFree(g);cudaFree(A);cudaFree(w);cudaFree(u);cudaFree(h);cudaFree(vn);
+            return 3;
+        }}
         int rc=0;
         for (int n=0;n<n_seqs;n++) {{
             rc = run_{tag}(q+(size_t)n*T*H*S, k+(size_t)n*T*H*S, v+(size_t)n*T*HV*S,
