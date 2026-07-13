@@ -48,18 +48,30 @@ def compile_config(H, HV, S):
     o = torch.empty_like(u); scale = 1.0/(K**0.5)
     BVh = 32; BKo = 64 if K % 64 == 0 else BK; BVo = 32
 
+    # Kernel faults are ASYNCHRONOUS: without this, a bad launch here surfaces at the next synchronisation point --
+    # which is the NEXT shape's first kernel -- and the traceback points at the wrong kernel entirely. Sync after each
+    # one so a fault is attributed to the launch that caused it. Costs nothing; this is a code generator.
+    def sync(tag):
+        torch.cuda.synchronize()
+
     K_ = {}
     c = unwrap(chunk_local_cumsum_scalar_kernel)[(triton.cdiv(T,BT), B*HV)](g_raw, g, RCP_LN2, None, None, T, B, HV, BT, False, True, False, False)
-    K_["cumsum"] = c
+    K_["cumsum"] = c; sync("cumsum")
     c = unwrap(chunk_gated_delta_rule_fwd_kkt_solve_kernel)[(triton.cdiv(T,BT), B*HV)](k, g, beta, A, None, None, T, H, HV, K, BT, 16, BK, True, False)
-    K_["kkt"] = c
+    K_["kkt"] = c; sync("kkt")
     c = unwrap(recompute_w_u_fwd_kernel)[(triton.cdiv(T,BT), B*HV)](k, v, beta, w, u, A, g, None, None, T, H, HV, K, V, BT, BK, BV, True, False)
-    K_["wu"] = c
+    K_["wu"] = c; sync("wu")
     # STATE_V_FIRST=True for ggml [v][k] layout
     c = unwrap(chunk_gated_delta_rule_fwd_kernel_h_blockdim64)[(triton.cdiv(V,BVh), B*HV)](k, u, w, vnew, g, None, h, h0, ht, None, None, T, H, HV, K, V, BT, BVh, True, False, True, True, True, False, False, num_warps=4, num_stages=1)
-    K_["h"] = c
-    c = unwrap(chunk_fwd_kernel_o)[(triton.cdiv(T,BT), B*HV)](q, k, vnew, h, g, None, o, None, None, scale, T, H, HV, K, V, BT, BKo, BVo, True, False, False, False, num_warps=4, num_stages=1)
-    K_["o"] = c
+    K_["h"] = c; sync("h")
+    # NOTE: chunk_fwd_kernel_o's grid is 3-D -- (i_v, i_t, i_bh) = program_id(0,1,2). Launching it 2-D lets i_t range
+    # over B*HV instead of NT, and `h += (i_tg*H + i_h)*V*K` is a RAW pointer bump that make_block_ptr's
+    # boundary_check cannot save (it only guards the (V,K) dims relative to that base). With the defaults that reads
+    # ~8x past the end of `h`. On NVIDIA the overrun lands inside torch's allocator pool -- garbage, but no fault, and
+    # invisible because we only want the cubin here, not the numbers. On other backends it is an unmapped page and
+    # the launch dies. The generated C launcher has always used the 3-D grid; only this warm-up did not.
+    c = unwrap(chunk_fwd_kernel_o)[(triton.cdiv(V,BVo), triton.cdiv(T,BT), B*HV)](q, k, vnew, h, g, None, o, None, None, scale, T, H, HV, K, V, BT, BKo, BVo, True, False, False, False, num_warps=4, num_stages=1)
+    K_["o"] = c; sync("o")
     meta = {kk: dict(name=cc.metadata.name, smem=int(cc.metadata.shared), block=cc.metadata.num_warps*32,
                      cubin=cc.asm["cubin"]) for kk, cc in K_.items()}
     return dict(H=H, HV=HV, S=S, BT=BT, BVh=BVh, meta=meta)
