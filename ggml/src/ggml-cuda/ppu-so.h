@@ -17,6 +17,7 @@ extern "C" {
 #endif
 
 #include <stdbool.h>
+#include <stddef.h>
 
 // ---- gated delta net, recurrent path (mirror of ppu-gdn-so.h's ppu_gdn_recurrent) ----
 bool ggml_ppu_so_gdn_available(void);
@@ -24,11 +25,14 @@ int  ggml_ppu_so_gdn_recurrent(
     const float * q, const float * k, const float * v, const float * g, const float * beta,
     const float * h0, float * o, float * ht,
     int n_seqs, int T, int H, int HV, int S, float scale, void * stream);
-bool ggml_ppu_so_gdn_chunked_available(void);
-int  ggml_ppu_so_gdn_chunked(
+bool   ggml_ppu_so_gdn_chunked_available(void);
+// Device scratch the chunked entry needs; the caller allocates it (we use ggml's CUDA pool). 0 if the .so is absent.
+size_t ggml_ppu_so_gdn_chunked_workspace_size(int n_seqs, int T, int H, int HV, int S);
+int    ggml_ppu_so_gdn_chunked(
     const float * q, const float * k, const float * v, const float * g_raw, const float * beta,
     const float * h0, float * o, float * ht,
-    int n_seqs, int T, int H, int HV, int S, float scale, void * stream);
+    int n_seqs, int T, int H, int HV, int S, float scale,
+    void * ws, size_t ws_bytes, void * stream);
 
 #ifdef __cplusplus
 }

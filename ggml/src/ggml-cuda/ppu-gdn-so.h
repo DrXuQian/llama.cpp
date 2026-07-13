@@ -17,6 +17,8 @@
 //   o    : [n_seqs, T, HV, S]   attention output (-> dst attention-score region)
 //   ht   : [n_seqs, HV, S, S]   final recurrent state (-> dst state tail / fused cache slot)
 // scale = 1/sqrt(S). Returns 0 on success, -1 unsupported shape, -2 launch error (both -> inline fallback).
+#include <stddef.h>
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -28,10 +30,19 @@ int ppu_gdn_recurrent(
 
 // Chunked prefill variant (WY tensor-core path; needs L2-normalized k for numerical stability, i.e. real models).
 // h0/ht are in FLA [k][v] layout (NOT ggml's [v][k]); the caller transposes. Returns -1 for unsupported (H,HV,S).
+// Bytes of device scratch ppu_gdn_chunked needs. A pure formula, so the caller can size the workspace before it
+// knows whether the shape is even compiled in.
+size_t ppu_gdn_chunked_workspace_size(int n_seqs, int T, int H, int HV, int S);
+
+// The .so allocates NOTHING: `ws` is device scratch supplied by the caller (llama.cpp hands it a ggml_cuda_pool_alloc
+// buffer). Doing this inside the .so meant a cudaMalloc/cudaFree of ~180 MB on every one of the model's 30 GDN
+// layers, outside ggml's pool -- slow, prone to OOM once llama.cpp had filled the device, and enough on its own to
+// keep the path out of CUDA-graph capture.
 int ppu_gdn_chunked(
     const float * q, const float * k, const float * v, const float * g_raw, const float * beta,
     const float * h0, float * o, float * ht,
-    int n_seqs, int T, int H, int HV, int S, float scale, void * stream);
+    int n_seqs, int T, int H, int HV, int S, float scale,
+    void * ws, size_t ws_bytes, void * stream);
 
 #ifdef __cplusplus
 }

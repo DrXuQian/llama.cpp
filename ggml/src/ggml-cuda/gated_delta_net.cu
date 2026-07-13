@@ -385,10 +385,19 @@ static void ggml_cuda_op_gated_delta_net_impl(
                 const int nblk = (int) (n_seqs * H);           // H here == HV (v heads)
                 ggml_cuda_pool_alloc<float> h0t(ctx.pool(), (size_t) nblk * S_v * S_v);
                 ggml_cuda_pool_alloc<float> htt(ctx.pool(), (size_t) nblk * S_v * S_v);
+
+                // The .so allocates nothing: its intermediates (g, A, w, u, h, v_new -- ~176 MB at T=2048) come out
+                // of ggml's CUDA pool, like every other scratch buffer in the backend. It used to cudaMalloc them
+                // itself on every one of the 30 GDN layers, outside the pool.
+                const size_t ws_bytes = ggml_ppu_so_gdn_chunked_workspace_size(
+                    (int) n_seqs, (int) n_tokens, (int) neqk1, (int) H, (int) S_v);
+                ggml_cuda_pool_alloc<char> ws(ctx.pool(), ws_bytes);
+
                 ppu_gdn_state_transpose<<<nblk, 256, 0, stream>>>(s_d, h0t.ptr, (int) S_v);   // [v][k] -> [k][v]
                 const int rc = ggml_ppu_so_gdn_chunked(
                     q_d, k_d, v_use, g_d, b_d, h0t.ptr, dst_d, htt.ptr,
-                    (int) n_seqs, (int) n_tokens, (int) neqk1, (int) H, (int) S_v, scale, stream);
+                    (int) n_seqs, (int) n_tokens, (int) neqk1, (int) H, (int) S_v, scale,
+                    ws.ptr, ws_bytes, stream);
                 if (rc == 0) {
                     ppu_gdn_state_transpose<<<nblk, 256, 0, stream>>>(htt.ptr, state_d, (int) S_v);  // [k][v]->[v][k]
                     return;

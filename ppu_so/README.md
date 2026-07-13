@@ -73,10 +73,14 @@ int ppu_gdn_recurrent(
     const float * h0, float * o, float * ht,
     int n_seqs, int T, int H, int HV, int S, float scale, void * stream);
 
-int ppu_gdn_chunked(  // same signature; `g` is the RAW gate (see trap 3)
+// The .so allocates NOTHING. Size the scratch, hand it in. llama.cpp uses ggml's CUDA pool.
+size_t ppu_gdn_chunked_workspace_size(int n_seqs, int T, int H, int HV, int S);   // ~176 MB at T=2048
+
+int ppu_gdn_chunked(  // `g` is the RAW gate (see trap 3)
     const float * q, const float * k, const float * v, const float * g_raw, const float * beta,
     const float * h0, float * o, float * ht,
-    int n_seqs, int T, int H, int HV, int S, float scale, void * stream);
+    int n_seqs, int T, int H, int HV, int S, float scale,
+    void * ws, size_t ws_bytes, void * stream);
 ```
 
 ---
@@ -149,8 +153,9 @@ copies it with `ppu_gdn_make_contig` first. The `.so` silently reads garbage oth
   order differs between FLA revisions (vLLM's vendored copy calls them `(H, Hg)` with `H` = value heads; ours passes
   `(H, HV)` with `H` = key heads), so a wrong order would be **silently wrong on GVA shapes only**. Extend the golden
   to `H != HV` before trusting this on an 80B.
-* **The chunked path is opt-in** (`GGML_PPU_GDN_CHUNKED`) because it `cudaMalloc`s its intermediates per call, which
-  breaks CUDA-graph capture. Caching that scratch is the obvious next fix.
+* **The chunked path is still opt-in** (`GGML_PPU_GDN_CHUNKED`), now only because it needs L2-normalized `k` to be
+  numerically stable (real models do this upstream; random test inputs do not). It no longer allocates: its scratch
+  comes from ggml's CUDA pool via `ppu_gdn_chunked_workspace_size()`.
 * **Benchmarks on H800 favour ggml's native kernels** on small models (pp512: 33354 native vs 26240 `.so`). The FLA
   kernels are tuned for large-batch training; the gap is the per-call `cudaMalloc`, the `v`-contiguity copy, and the
   F32↔bf16 bridge — all fixable seam overheads, not kernel quality.

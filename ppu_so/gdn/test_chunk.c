@@ -7,7 +7,8 @@
 #include <cuda_runtime.h>
 
 int ppu_gdn_chunked(const float*,const float*,const float*,const float*,const float*,const float*,float*,float*,
-                    int,int,int,int,int,float,void*);
+                    int,int,int,int,int,float,void*,size_t,void*);
+size_t ppu_gdn_chunked_workspace_size(int,int,int,int,int);
 
 static float * rd(const char * nm, size_t n) {
     char p[512]; snprintf(p, sizeof p, "golden_chunk/%s.bin", nm);
@@ -45,7 +46,11 @@ int main(void) {
     cudaMemcpy(dv,v,nv*4,cudaMemcpyHostToDevice); cudaMemcpy(dg,gr,ng*4,cudaMemcpyHostToDevice);
     cudaMemcpy(db,be,ng*4,cudaMemcpyHostToDevice); cudaMemcpy(dh0,h0,nh*4,cudaMemcpyHostToDevice);
 
-    const int rc = ppu_gdn_chunked(dq,dk,dv,dg,db,dh0,d_o,d_ht, B,T,H,HV,S, scale, (void*)0);
+    // The .so allocates nothing: we hand it the scratch, exactly as the ggml hook does from its CUDA pool.
+    const size_t wsb = ppu_gdn_chunked_workspace_size(B,T,H,HV,S);
+    void * ws = NULL; cudaMalloc(&ws, wsb);
+    printf("workspace = %.1f MB\n", wsb / 1048576.0);
+    const int rc = ppu_gdn_chunked(dq,dk,dv,dg,db,dh0,d_o,d_ht, B,T,H,HV,S, scale, ws, wsb, (void*)0);
     if (rc) { printf("ppu_gdn_chunked rc=%d (shape not compiled in?)\n", rc); return 1; }
     if (cudaDeviceSynchronize() != cudaSuccess) { printf("launch failed: %s\n", cudaGetErrorString(cudaGetLastError())); return 1; }
 
