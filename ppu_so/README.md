@@ -71,26 +71,29 @@ kernel, and `ppu_moe_row_alignment()` is the capability query that decides:
 ```c
 // ppu-moe-so.h
 
-// MASKED (what the hook uses)
+// Capability query. 1 = "NoPad" (dense, take each expert's rows as they are). >1 = per-expert segments must start
+// and end on a multiple of it. 0 = no .so.
+int ppu_moe_row_alignment(void);
+
+// DENSE CONTIGUOUS / "NoPad" — preferred; used when row_alignment() == 1
+int ppu_moe_grouped_gemm_bf16_nopad(
+        const void * A,            // [total_rows, K] bf16, expert-grouped, NO padding
+        const void * B,            // [n_experts, N, K] bf16
+        void       * out,          // [total_rows, N] bf16
+        const int  * m_indices,    // [total_rows] expert id per compact row
+        int total_rows, int N, int K, int n_experts, int expected_m, void * stream);
+
+// MASKED — used when row_alignment() > 1 (i.e. against public DeepGEMM)
 int ppu_moe_grouped_gemm_bf16_masked(
         const void * A,            // [n_experts, max_m, K] bf16
         const void * B,            // [n_experts, N, K] bf16
         void       * out,          // [n_experts, max_m, N] bf16
         const int  * masked_m,     // [n_experts] real row count per expert — NO alignment required
         int max_m, int N, int K, int n_experts, int expected_m, void * stream);
-
-// CONTIGUOUS (kept as the documented alternative; "nopad" = the .so does not pad FOR you)
-int ppu_moe_row_alignment(void);   // = 128 (DeepGEMM pins BLOCK_M to it)
-int ppu_moe_grouped_gemm_bf16_nopad(
-        const void * A,            // [total_rows, K] bf16, expert-grouped, each segment padded to the alignment
-        const void * B,            // [n_experts, N, K] bf16
-        void       * out,          // [total_rows, N] bf16
-        const int  * m_indices,    // [total_rows] expert id per row
-        int total_rows, int N, int K, int n_experts, int expected_m, void * stream);
 ```
 
-The hook in `ggml-cuda.cu` builds the `(token, slot) -> expert` permutation on the host, gathers the F32
-activations into `A` as bf16, runs one grouped GEMM, and scatters the result back.
+The hook gathers the F32 activations into `A` as bf16 (device kernel), runs one grouped GEMM, and scatters the
+result back (device kernel). The permutation feeding both comes from `ggml_cuda_launch_mm_ids_helper`.
 
 ### Why the public build needs masked, and the PPU build does not
 
@@ -129,10 +132,9 @@ ggml_cuda_mul_mat_id:
   sorted cuBLAS   float, large batch                host sort => D2H + hard stream sync
 ```
 
-Everything above the line already stays on the device. Only the fallback below it pays a `cudaMemcpy` D2H plus a
-`cudaStreamSynchronize` — and so does our hook, unavoidably (`max_m` sizes the buffers and goes into the TMA
-descriptor, so it has to be a host value). Hooking any earlier would trade a sync-free device kernel for one that
-drains the pipeline, and no GEMM is fast enough to pay that back.
+Everything above the line already stays on the device; only the fallback below it sorts on the CPU. Our hook stays on
+the device too (see above), so the placement is not about the sync — it is about not stealing work from a kernel that
+is already the right tool. Hooking any earlier would preempt MMF on shapes it handles well.
 
 Concretely, `ggml_cuda_should_use_mmf` accepts a bf16 `mul_mat_id` when `src0->ne[1] <= 1024 && n_tokens <= 512`
 (mmf.cu:162). On a typical MoE prefill (`ubatch=512`, `moe_intermediate=768`, `hidden=2048`) that means **gate/up go
