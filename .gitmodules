@@ -1,0 +1,5 @@
+[submodule "thirdparty/DeepGEMM"]
+	path = thirdparty/DeepGEMM
+	url = https://github.com/deepseek-ai/DeepGEMM.git
+	branch = main
+	shallow = true

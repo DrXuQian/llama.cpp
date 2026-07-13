@@ -45,6 +45,7 @@
 #include "ggml-cuda/snake.cuh"
 #include "ggml-cuda/softcap.cuh"
 #include "ggml-cuda/softmax.cuh"
+#include "ggml-cuda/ppu-so.h"
 #include "ggml-cuda/ssm-conv.cuh"
 #include "ggml-cuda/ssm-scan.cuh"
 #include "ggml-cuda/sum.cuh"
@@ -1770,6 +1771,157 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     ggml_cuda_mul_mat_cublas(ctx, src0, src1, dst);
 }
 
+#ifdef GGML_PPU_SO
+// Gather the rows a MoE mul_mat_id needs into the compact per-expert layout the external grouped GEMM wants,
+// converting F32 -> bf16 on the way. One block per row; row i of the gather list reads src row src_rows[i] and
+// writes compact row dst_rows[i]. Unlike get_rows_cuda this is a true scatter (dst row != i), which lets us touch
+// ONLY the real rows: the masked layout permits the pad rows to stay uninitialized (see below).
+static __global__ void ppu_moe_gather_f32_to_bf16(
+        const float * __restrict__ src, nv_bfloat16 * __restrict__ dst,
+        const int32_t * __restrict__ src_rows, const int32_t * __restrict__ dst_rows,
+        const int64_t K, const int64_t src_row_stride) {
+    const int64_t i = blockIdx.x;
+    const float   * s = src + (int64_t) src_rows[i] * src_row_stride;
+    nv_bfloat16   * d = dst + (int64_t) dst_rows[i] * K;
+    for (int64_t k = threadIdx.x; k < K; k += blockDim.x) {
+        d[k] = __float2bfloat16(s[k]);
+    }
+}
+
+// Route a bf16-weight MoE mul_mat_id through the external DeepGEMM grouped-GEMM .so (libppu_moe.so), using its
+// MASKED layout: A = [n_experts, max_m, K], out = [n_experts, max_m, N], masked_m[g] = expert g's real row count.
+//
+// Why masked and not the contiguous/m_indices layout: contiguous pins BLOCK_M to the 128-row alignment, so an
+// expert holding 32 rows still costs a full 128-row wgmma. Masked's scheduler builds its block queue straight from
+// masked_m -- group g contributes exactly ceil(masked_m[g]/BLOCK_M) row-blocks (scheduler/gemm.cuh:207) -- and its
+// BLOCK_M is 64 or 128, so that same expert costs 64 rows. In the decode-adjacent regime llama.cpp actually runs
+// (a few hundred tokens across 100+ experts => ~32 rows/expert) that is a 2x cut in wasted FLOPs, and masked_m
+// itself needs no alignment at all.
+//
+// The one alignment that DOES matter: `max_m` is the row pitch between groups (scheduler/gemm.cuh:164 computes the
+// global row as current_group_idx*max_m + m_block_idx*BLOCK_M). If max_m were not a multiple of BLOCK_M, group g's
+// last row-block would spill across the group boundary and TMA-store over group g+1's real output rows. So we round
+// max_m up to 128, a safe superset of both BLOCK_M candidates.
+//
+// Rows [masked_m[g], max_m) of A are deliberately left uninitialized: garbage in compact row r only ever reaches
+// out row r, and we never scatter those rows back. That is what lets the gather above touch only the real rows.
+//
+// Returns false (fall through to the inline path) if unsupported or if the .so has no kernel for this shape.
+static bool ggml_cuda_mul_mat_id_ppu_so(ggml_backend_cuda_context & ctx,
+        const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst) {
+    if (!ggml_ppu_so_moe_masked_available()) {
+        return false;
+    }
+    // DeepGEMM entry is bf16 A x bf16 B -> bf16 out. Require bf16 expert weights, F32 activations/out.
+    if (src0->type != GGML_TYPE_BF16 || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
+        return false;
+    }
+    if (!ggml_is_contiguous(src0) || !ggml_is_contiguous(src1) || !ggml_is_contiguous(dst)) {
+        return false;                              // rhs [n_experts, N, K] must be contiguous; so must src1/dst
+    }
+
+    const int64_t K             = src0->ne[0];
+    const int64_t N             = src0->ne[1];
+    const int64_t n_experts     = src0->ne[2];
+    const int64_t n_expert_used = ids->ne[0];
+    const int64_t n_tokens      = src1->ne[2];
+    const int64_t ne11          = src1->ne[1];
+    const int64_t total_rows    = n_tokens * n_expert_used;
+    if (src1->ne[0] != K || dst->ne[0] != N || total_rows == 0) {
+        return false;
+    }
+
+    cudaStream_t stream = ctx.stream();
+    const size_t ts = ggml_type_size(GGML_TYPE_BF16);
+
+    // --- build the permutation on the host ---
+    // TODO: this needs a D2H + a hard stream sync, which also keeps the whole MoE path out of CUDA graphs. ggml's
+    // own inline mul_mat_id has exactly the same problem (see the note above its sort). Moving the histogram +
+    // prefix sum + scatter onto the device would leave only a G-int D2H (max_m has to be a host value: it sizes the
+    // buffers and goes into the TMA descriptor).
+    std::vector<char> ids_host(ggml_nbytes(ids));
+    CUDA_CHECK(cudaMemcpyAsync(ids_host.data(), ids->data, ggml_nbytes(ids), cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    const auto expert_of = [&](int64_t it, int64_t iex) {
+        return *(const int32_t *)(ids_host.data() + it*ids->nb[1] + iex*ids->nb[0]);
+    };
+
+    // pass 1: rows per expert. (Note this is O(n_tokens * n_expert_used); ggml's inline path instead loops experts x
+    // tokens x slots, which for 128 experts x 512 tokens x top-8 is ~500k iterations per layer.)
+    std::vector<int32_t> masked_m_host(n_experts, 0);
+    for (int64_t it = 0; it < n_tokens; ++it) {
+        for (int64_t iex = 0; iex < n_expert_used; ++iex) {
+            const int32_t e = expert_of(it, iex);
+            if (e < 0 || e >= n_experts) {
+                return false;
+            }
+            masked_m_host[e]++;
+        }
+    }
+    const int32_t max_rows = *std::max_element(masked_m_host.begin(), masked_m_host.end());
+    const int64_t max_m    = GGML_PAD(max_rows, 128);          // must be a multiple of DeepGEMM's BLOCK_M
+    const int64_t buf_rows = n_experts * max_m;
+
+    // Masked sizes the buffers as G*max_m rather than sum of the (padded) per-expert rows, so a badly imbalanced
+    // routing can blow the scratch up. Bail to the inline path rather than allocate absurdly.
+    if (buf_rows > 8*total_rows) {
+        return false;
+    }
+
+    // pass 2: place each (token,slot) at compact row expert*max_m + rank-within-expert.
+    std::vector<int32_t> fill(n_experts, 0);
+    std::vector<int32_t> src_rows(total_rows);                 // gather list: source row in src1
+    std::vector<int32_t> dst_rows(total_rows);                 // gather list: compact row in A
+    std::vector<int32_t> ids_from_sorted(total_rows);          // (token*used+slot) -> compact row, for the scatter
+    for (int64_t it = 0; it < n_tokens; ++it) {
+        for (int64_t iex = 0; iex < n_expert_used; ++iex) {
+            const int32_t e   = expert_of(it, iex);
+            const int64_t row = it*n_expert_used + iex;
+            const int64_t cmp = (int64_t) e*max_m + fill[e]++;
+            src_rows[row]        = (int32_t) (it*ne11 + iex % ne11);
+            dst_rows[row]        = (int32_t) cmp;
+            ids_from_sorted[row] = (int32_t) cmp;
+        }
+    }
+
+    ggml_cuda_pool_alloc<int32_t> idx_dev(ctx.pool(), 3*total_rows + n_experts);
+    int32_t * src_rows_dev = idx_dev.ptr;
+    int32_t * dst_rows_dev = src_rows_dev + total_rows;
+    int32_t * ids_from_dev = dst_rows_dev + total_rows;
+    int32_t * masked_m_dev = ids_from_dev + total_rows;
+    CUDA_CHECK(cudaMemcpyAsync(src_rows_dev, src_rows.data(),        total_rows*sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(dst_rows_dev, dst_rows.data(),        total_rows*sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(ids_from_dev, ids_from_sorted.data(), total_rows*sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(masked_m_dev, masked_m_host.data(),   n_experts *sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+
+    // --- gather src1 (F32) -> A_bf16 [n_experts, max_m, K]; only the real rows are written ---
+    ggml_cuda_pool_alloc<char> A_bf16(ctx.pool(), buf_rows*K*ts);
+    ppu_moe_gather_f32_to_bf16<<<total_rows, std::min<int64_t>(K, 256), 0, stream>>>(
+        (const float *) src1->data, (nv_bfloat16 *) A_bf16.ptr,
+        src_rows_dev, dst_rows_dev, K, src1->nb[1]/sizeof(float));
+    CUDA_CHECK(cudaGetLastError());
+
+    // --- one masked grouped GEMM: out[g, :masked_m[g], :] = A[g, :masked_m[g], :] x src0[g]^T ---
+    ggml_cuda_pool_alloc<char> out_bf16(ctx.pool(), buf_rows*N*ts);
+    const int rc = ggml_ppu_so_moe_grouped_gemm_bf16_masked(
+        A_bf16.ptr, src0->data, out_bf16.ptr, masked_m_dev,
+        (int) max_m, (int) N, (int) K, (int) n_experts, (int) (total_rows / n_experts), stream);
+    if (rc != 0) {
+        return false;                              // .so has no kernel for this shape/arch -> inline fallback
+    }
+
+    // --- scatter the real rows of out_bf16 -> dst (F32); the pad rows are dropped here ---
+    get_rows_cuda(out_bf16.ptr, GGML_TYPE_BF16, ids_from_dev, dst->data, dst->type,
+        N, N*ts, buf_rows*N*ts, buf_rows*N*ts,
+        total_rows, 1, 1, sizeof(int32_t), total_rows*sizeof(int32_t), total_rows*sizeof(int32_t),
+        dst->nb[1], dst->nb[2], dst->nb[3], stream);
+    CUDA_CHECK(cudaGetLastError());
+    return true;
+}
+
+#endif // GGML_PPU_SO
+
 static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
@@ -1781,6 +1933,14 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     GGML_TENSOR_BINARY_OP_LOCALS
 
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+
+#ifdef GGML_PPU_SO
+    // Try the external MoE grouped-GEMM .so (libppu_moe.so, wraps DeepGEMM) for bf16-weight MoE. Handles the
+    // ragged->masked gather + bf16 cast + scatter; returns false if unsupported -> inline path below.
+    if (ggml_cuda_mul_mat_id_ppu_so(ctx, src0, src1, ids, dst)) {
+        return;
+    }
+#endif // GGML_PPU_SO
 
     // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
     if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
