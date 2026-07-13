@@ -3,6 +3,9 @@
 //   masked      out[g, i, :] = A[g, i, :] @ B[g]^T   for i < masked_m[g]   A:[G,max_m,k]  out:[G,max_m,n]
 //   contiguous  out[i, :]    = A[i, :]    @ B[mi[i]]^T                     A:[m,k]        out:[m,n]
 //
+// NOTE: public DeepGEMM has no NoPad kernel, so this .so exports no ppu_moe_grouped_gemm_bf16_nopad and there is
+// nothing here to test for it. The PPU kernel team's bf16_grouped_deep_gemm_NoPad is what would provide it.
+//
 //   ./test_moe                 # G=4, rows_per_expert=128, n=256, k=128
 //   ./test_moe 8 100 512 256   # G rows_per_expert n k
 //
@@ -21,7 +24,7 @@
 extern "C" int ppu_moe_grouped_gemm_bf16_masked(
     const void * A, const void * B, void * out, const int * masked_m,
     int max_m, int N, int K, int n_experts, int expected_m, void * stream);
-extern "C" int ppu_moe_grouped_gemm_bf16_nopad(
+extern "C" int ppu_moe_grouped_gemm_bf16_contiguous(
     const void * A, const void * B, void * out, const int * m_indices,
     int total_rows, int N, int K, int n_experts, int expected_m, void * stream);
 extern "C" int ppu_moe_row_alignment(void);
@@ -148,9 +151,9 @@ int main(int argc, char ** argv) {
         cudaMemcpy(dMI, mi.data(), M*sizeof(int), cudaMemcpyHostToDevice);
 
         printf("contiguous G=%d rows/expert=%d(->%d) M=%zu N=%d K=%d align=%d\n", G, RPE, RPE_P, M, N, K, ALIGN);
-        const int rc = ppu_moe_grouped_gemm_bf16_nopad(dA, dB, dO, dMI, (int) M, N, K, G, (int) M / G, nullptr);
+        const int rc = ppu_moe_grouped_gemm_bf16_contiguous(dA, dB, dO, dMI, (int) M, N, K, G, (int) M / G, nullptr);
         if (rc != 0) {
-            printf("  ppu_moe_grouped_gemm_bf16_nopad rc=%d (unsupported arch / JIT failed)\n", rc);
+            printf("  ppu_moe_grouped_gemm_bf16_contiguous rc=%d (unsupported arch / JIT failed)\n", rc);
             all_ok = false;
         } else if (cudaDeviceSynchronize() != cudaSuccess) {
             printf("  launch failed: %s\n", cudaGetErrorString(cudaGetLastError()));

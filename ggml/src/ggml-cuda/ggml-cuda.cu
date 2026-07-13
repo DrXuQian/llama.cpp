@@ -1864,22 +1864,25 @@ static __global__ void ppu_moe_scatter_bf16_to_f32_dense(
 // trivial functions of the bounds. So there is no D2H, no H2D and no cudaStreamSynchronize, and the path stays
 // CUDA-graph capturable, unlike ggml's own sorted-cuBLAS fallback below which sorts on the CPU.
 //
-// Two layouts, picked by what the .so says it needs. ppu_moe_row_alignment() is the capability query:
+// Two layouts, picked by WHICH SYMBOL THE .so EXPORTS (presence is the capability query):
 //
-//   == 1  DENSE CONTIGUOUS ("NoPad"). The kernel takes each expert's rows exactly as they are, so the row count it
-//         needs is just total_rows = n_tokens * n_expert_used -- an identity, known on the host by construction.
-//         Zero padding, zero wasted flops, scratch is the compact total_rows*K. This is what the PPU kernel team's
-//         bf16_grouped_deep_gemm_NoPad provides and it is the path we actually want.
+//   nopad   DENSE CONTIGUOUS. The kernel takes each expert's rows exactly as they are, so the row count it needs is
+//           just total_rows = n_tokens * n_expert_used -- an identity, known on the host by construction. Zero
+//           padding, zero wasted flops, scratch is the compact total_rows*K. This is the contract of the PPU kernel
+//           team's bf16_grouped_deep_gemm_NoPad (m_grouped_gemm_bf16_bf16_bf16_nt_nopad, which runs a device-side
+//           computeBlockInfoKernel to build the block->group map). It is the path we actually want.
 //
-//   >  1  MASKED. Upstream/public DeepGEMM's bf16 contiguous kernel pins BLOCK_M to a 128-row alignment, so every
-//         expert's segment must be padded to it -- and the padded total is data-dependent, which would force a D2H.
-//         (Its fp8 kernel dodges that by skipping m_indices<0 blocks via is_computation_valid, but the bf16 kernel
-//         never calls it -- grep: sm90_fp8_gemm_1d2d.cuh:274 is the only call site in the repo.) So on public
-//         DeepGEMM we use the masked layout instead: its scheduler enqueues exactly ceil(masked_m[e]/BLOCK_M) blocks
-//         per expert, which means max_m only has to be an UPPER BOUND, and a host-known one exists -- mm_ids_helper
-//         emits at most one compact row per (token, expert), so no expert can hold more than n_tokens rows.
-//         Still zero-sync, but it pays n_experts/n_expert_used (16x on a 128-expert top-8 model) in scratch, and
-//         ceil(rows/64)*64 per expert in flops.
+//   masked  What a kernel that can only do PADDED contiguous can still offer sync-free. Public DeepGEMM is such a
+//           kernel: bf16_grouped_deep_gemm_contiguous pins BLOCK_M to a 128-row alignment, so every expert's segment
+//           must be padded to it -- and worse, its scheduler derives the block count from shape_m itself
+//           (scheduler/gemm.cuh:94, `num_blocks = num_m_blocks * num_n_blocks`), so shape_m must be the EXACT padded
+//           total, a data-dependent host value. (Its fp8 kernel dodges that the way vLLM does -- upper-bound m,
+//           m_indices=-1 on the tail, blocks skipped via is_computation_valid -- but the bf16 kernel never calls it;
+//           sm90_fp8_gemm_1d2d.cuh:274 is the only call site in the repo.) Masked's scheduler instead walks the
+//           groups off its device-resident masked_m and enqueues exactly ceil(masked_m[e]/BLOCK_M) blocks per expert,
+//           so max_m need only be an UPPER BOUND -- and a host-known one exists: mm_ids_helper emits at most one
+//           compact row per (token, expert), so no expert can hold more than n_tokens rows. Still zero-sync, but it
+//           pays n_experts/n_expert_used (16x on a 128-expert top-8 model) in scratch and ceil(rows/64)*64 in flops.
 //
 // For masked, max_m must be a multiple of BLOCK_M (64 or 128): it is the row pitch between experts
 // (scheduler/gemm.cuh:164 forms the global row as expert*max_m + m_block_idx*BLOCK_M), so a non-multiple would let
@@ -1890,8 +1893,7 @@ static __global__ void ppu_moe_scatter_bf16_to_f32_dense(
 // Returns false (fall through to the inline path) if unsupported or if the .so has no kernel for this shape.
 static bool ggml_cuda_mul_mat_id_ppu_so(ggml_backend_cuda_context & ctx,
         const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst) {
-    const int align = ggml_ppu_so_moe_available() ? ggml_ppu_so_moe_row_alignment() : 0;
-    const bool use_dense = align == 1;
+    const bool use_dense = ggml_ppu_so_moe_nopad_available();
     if (!use_dense && !ggml_ppu_so_moe_masked_available()) {
         return false;
     }

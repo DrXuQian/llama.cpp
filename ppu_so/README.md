@@ -58,13 +58,38 @@ one-line kernel. Gather and scatter are two small kernels. **Nothing crosses to 
 sorted-cuBLAS fallback — which does a D2H, an `O(n_experts × n_tokens × n_expert_used)` CPU loop, a
 `cudaStreamSynchronize` and three H2Ds per MoE layer — this path stays CUDA-graph capturable.
 
-That is only possible because **no host value depends on the routing**. Which layout makes that true depends on the
-kernel, and `ppu_moe_row_alignment()` is the capability query that decides:
+That is only possible because **no host value depends on the routing**. Whether a layout can guarantee that comes down
+to one thing: *where the kernel's scheduler gets its block count from.*
 
-| `row_alignment()` | layout | host-known row count | pad flops | scratch |
+```
+scheduler/gemm.cuh, Scheduler ctor:
+  MGroupedContiguous               num_blocks = num_m_blocks * num_n_blocks   <- from shape_m, a HOST value
+  MGroupedMasked                   (num_blocks not set)                       <- walks groups off device masked_m
+  MGroupedContiguousWithPsumLayout (num_blocks not set)                       <- walks groups off device psum array
+```
+
+Plain contiguous schedules from `shape_m`, so `shape_m` must be the *exact* padded total — a data-dependent host
+value, i.e. a mandatory D2H. Masked (and psum) walk their device-resident layout array instead, so `shape_m` is only
+a memory extent and an **upper bound suffices**. That is the whole trick, and it is what lets vLLM and the PPU stack
+run this path with no host round-trip.
+
+Which layout the hook uses is decided by **which symbol the `.so` exports** — presence is the capability query:
+
+| exported symbol | layout | host-known row count | pad flops | scratch |
 |---|---|---|---|---|
-| `1` (PPU `bf16_grouped_deep_gemm_NoPad`) | dense contiguous | `total_rows = n_tokens × n_expert_used` (an identity) | none | `total_rows × K` |
-| `128` (public DeepGEMM) | masked | `max_m = align(n_tokens, 128)` (an upper bound) | `ceil(rows/64)*64` per expert | `n_experts × max_m × K` |
+| `ppu_moe_grouped_gemm_bf16_nopad` | dense contiguous | `total_rows = n_tokens × n_expert_used` (an identity) | none | `total_rows × K` |
+| `ppu_moe_grouped_gemm_bf16_masked` | masked | `max_m = align(n_tokens, 128)` (an upper bound) | `ceil(rows/64)*64` per expert | `n_experts × max_m × K` |
+
+The PPU kernel team's DeepGemm has a genuine NoPad kernel — `bf16_grouped_deep_gemm_NoPad`, reached via
+`deep_gemm.m_grouped_gemm_bf16_bf16_bf16_nt_nopad(x, y, out, m_indices)`, which runs a device-side
+`computeBlockInfoKernel` to build the block→group map when `n_experts >= 128`. Its `.so` should export
+`ppu_moe_grouped_gemm_bf16_nopad` and the hook will take the dense arm automatically.
+
+**Public DeepGEMM has no such kernel** (grepped: `nopad` appears nowhere in the repo; the bf16 grouped APIs are only
+`m_grouped_bf16_gemm_nt_contiguous` and `..._masked`). So `libppu_moe.so` built here deliberately does **not** export
+that symbol — it exports `ppu_moe_grouped_gemm_bf16_contiguous` (padded, diagnostics/tests only) and
+`ppu_moe_grouped_gemm_bf16_masked`, and the hook takes the masked arm. Naming the padded entry `nopad` — as an
+earlier revision of this code did — is a trap: it silently promises a contract it cannot honour.
 
 ## The C ABI — two layouts
 
@@ -210,8 +235,12 @@ disk-cached, so this only bites on the first call.
   return `rc=3` and llama.cpp falls back inline. Run `./build/test_moe 8 100 512 256` and
   `test-backend-ops -o MUL_MAT_ID` on an sm90 box before trusting it. The contiguous path *was* validated on H800
   (`MUL_MAT_ID 790/790`).
-* **The dense/NoPad arm has never been exercised**, because no `.so` here reports `row_alignment() == 1` — public
-  DeepGEMM reports 128. It is written against the PPU kernel team's `bf16_grouped_deep_gemm_NoPad`; confirm its exact
-  entry signature with them before trusting it.
+* **The dense/NoPad arm has never been exercised**, because public DeepGEMM has no NoPad kernel and so this `.so`
+  does not export the symbol. It is written against `m_grouped_gemm_bf16_bf16_bf16_nt_nopad(x, y, out, m_indices)`;
+  confirm the exact entry signature with the kernel team before trusting it.
+* **`use_psum_layout` is unexplored.** Public DeepGEMM's contiguous entry has a `MGroupedContiguousWithPsumLayout`
+  variant whose scheduler also walks a device-resident array, so it too could run sync-free with an upper-bound
+  `shape_m`, at `align(rows, 128)` flops per expert but only ~1/3 of masked's scratch. Worth trying if masked's
+  capacity buffer turns out to hurt.
 * **MoE decode must not be routed here.** DeepGEMM is a prefill kernel; with one token per expert even masked's
   64-row `BLOCK_M` is a 64× waste.

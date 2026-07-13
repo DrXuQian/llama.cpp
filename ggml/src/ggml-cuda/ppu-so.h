@@ -19,20 +19,22 @@ extern "C" {
 #include <stdbool.h>
 
 // ---- MoE grouped-GEMM (mirrors ppu-moe-so.h; see it for the layout contracts) ----
-bool ggml_ppu_so_moe_available(void);
+// Which layout the hook uses is decided by WHICH SYMBOL THE .so EXPORTS. Preference: nopad > masked.
 
-// Masked layout (preferred): A = [n_experts, max_m, K], out = [n_experts, max_m, N], masked_m[g] unaligned.
+// NoPad: dense A = [total_rows, K], no padding at all. Only exported by a kernel that truly honours it.
+bool ggml_ppu_so_moe_nopad_available(void);
+int  ggml_ppu_so_moe_grouped_gemm_bf16_nopad(
+    const void * A, const void * B, void * out, const int * m_indices,
+    int total_rows, int N, int K, int n_experts, int expected_m, void * stream);
+
+// Masked: A = [n_experts, max_m, K], out = [n_experts, max_m, N], masked_m[g] unaligned.
 bool ggml_ppu_so_moe_masked_available(void);
 int  ggml_ppu_so_moe_grouped_gemm_bf16_masked(
     const void * A, const void * B, void * out, const int * masked_m,
     int max_m, int N, int K, int n_experts, int expected_m, void * stream);
 
-// Contiguous layout (fallback): A = [total_rows, K] with each expert's segment padded to row_alignment().
-// Per-expert row alignment the compact A buffer must satisfy; 0 if the .so is absent.
+// Diagnostics only: the padded-contiguous alignment the .so's own kernel needs; 0 if the .so is absent.
 int  ggml_ppu_so_moe_row_alignment(void);
-int  ggml_ppu_so_moe_grouped_gemm_bf16_nopad(
-    const void * A, const void * B, void * out, const int * m_indices,
-    int total_rows, int N, int K, int n_experts, int expected_m, void * stream);
 
 #ifdef __cplusplus
 }

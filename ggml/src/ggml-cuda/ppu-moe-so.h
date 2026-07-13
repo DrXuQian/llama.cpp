@@ -9,29 +9,26 @@
 extern "C" {
 #endif
 
-// ---- Capability query: what per-expert row alignment does the kernel need? ----
-// == 1  the kernel takes each expert's rows as they are ("NoPad"). The caller then hands it a DENSE compact A with
-//       total_rows = n_tokens * n_expert_used -- an identity, so no host value depends on the routing and the whole
-//       path is D2H/H2D/sync free. This is what the PPU kernel team's bf16_grouped_deep_gemm_NoPad provides, and it
-//       is the path the hook prefers: zero padding, zero wasted flops, compact scratch.
-// >  1  each expert's row segment must start and end on a multiple of it (upstream/public DeepGEMM pins BLOCK_M to
-//       exactly this value). The padded total is then data-dependent, i.e. it would cost a D2H + stream sync, so the
-//       hook uses the masked entry below instead. Typically 128.
-// == 0  the .so is absent.
-int ppu_moe_row_alignment(void);
+// The hook picks its layout by WHICH SYMBOL THE .so EXPORTS -- presence is the capability query. Preference order:
+// nopad > masked. A .so that can only do padded contiguous exports neither, and the hook falls back to inline ggml.
 
-// ---- DENSE CONTIGUOUS / "NoPad" (preferred; requires ppu_moe_row_alignment() == 1) ----
-// A = [total_rows, K] bf16, expert-grouped and expert-ordered, NO padding of any kind.
+// ---- NoPad: DENSE contiguous (preferred) ----
+// A = [total_rows, K] bf16, expert-grouped and expert-ordered, with NO padding of any kind.
 // out = [total_rows, N] bf16. m_indices[r] = the expert owning compact row r.
-// `expected_m` = average rows per expert (steers the tile heuristic).
 //
-// Historical note on the name: "nopad" originally meant "this entry does not pad FOR you". With a kernel that
-// reports alignment 1 it means what it says -- there is nothing to pad.
+// This is the contract of the PPU kernel team's `bf16_grouped_deep_gemm_NoPad`
+// (deep_gemm.m_grouped_gemm_bf16_bf16_bf16_nt_nopad(x, y, out, m_indices); it runs computeBlockInfoKernel on the
+// device to build the block->group map when n_experts >= 128). Because nothing is padded, the row count the kernel
+// needs is just total_rows = n_tokens * n_expert_used -- an identity. No host value depends on the routing, so the
+// whole llama.cpp path is D2H/H2D/sync free, and the scratch is the compact total_rows*K.
+//
+// ONLY export this symbol if you really honour that. Public DeepGEMM does NOT: its bf16 grouped kernel is
+// `bf16_grouped_deep_gemm_contiguous`, which demands ppu_moe_row_alignment()-row segments.
 int ppu_moe_grouped_gemm_bf16_nopad(
     const void * A, const void * B, void * out, const int * m_indices,
     int total_rows, int N, int K, int n_experts, int expected_m, void * stream);
 
-// ---- MASKED layout (fallback for a kernel that reports alignment > 1) ----
+// ---- MASKED (what a padded-contiguous-only kernel, e.g. public DeepGEMM, can still offer sync-free) ----
 // A = [n_experts, max_m, K] bf16, out = [n_experts, max_m, N] bf16, masked_m[g] = real row count of expert g.
 // masked_m needs NO alignment; the kernel skips whole row-blocks past masked_m[g], and its BLOCK_M is 64 or 128.
 // So an expert holding 32 rows costs ceil(32/64)*64 = 64 padded rows, vs 128 for a 128-aligned contiguous
@@ -42,6 +39,15 @@ int ppu_moe_grouped_gemm_bf16_nopad(
 int ppu_moe_grouped_gemm_bf16_masked(
     const void * A, const void * B, void * out, const int * masked_m,
     int max_m, int N, int K, int n_experts, int expected_m, void * stream);
+
+// ---- PADDED CONTIGUOUS (diagnostics / standalone tests only; the hook never calls it) ----
+// Requires each expert's row segment to start and end on a multiple of ppu_moe_row_alignment(). The padded total is
+// therefore data-dependent -- a host value that depends on the routing -- which is precisely why the hook cannot use
+// this layout without a D2H + stream sync. Kept because it is what public DeepGEMM natively provides.
+int ppu_moe_row_alignment(void);
+int ppu_moe_grouped_gemm_bf16_contiguous(
+    const void * A, const void * B, void * out, const int * m_indices,
+    int total_rows, int N, int K, int n_experts, int expected_m, void * stream);
 
 #ifdef __cplusplus
 }

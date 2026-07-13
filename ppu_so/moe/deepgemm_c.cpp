@@ -110,10 +110,13 @@ extern "C" int ppu_moe_row_alignment(void) {
     return heuristics_runtime->get_mk_alignment_for_contiguous_layout();
 }
 
-// NOTE ON THE NAME: "_nopad" means "this entry does NOT pad for you -- the caller must hand it a pre-padded A".
-// It does NOT mean padding-free; the contiguous layout inherently pads (see ppu_moe_row_alignment above). If you
-// want to avoid the padded FLOPs, use ppu_moe_grouped_gemm_bf16_masked below.
-extern "C" int ppu_moe_grouped_gemm_bf16_nopad(
+// PADDED CONTIGUOUS. Builds DeepGEMM's `bf16_grouped_deep_gemm_contiguous` kernel, which requires every expert's
+// row segment to be padded to ppu_moe_row_alignment() (=128). Do NOT name this "nopad": the PPU kernel team's
+// DeepGemm has a genuinely padding-free `bf16_grouped_deep_gemm_NoPad` kernel
+// (m_grouped_gemm_bf16_bf16_bf16_nt_nopad_impl), and a .so exporting ppu_moe_grouped_gemm_bf16_nopad is promising
+// THAT contract -- dense A, m = total_rows, no alignment. Public DeepGEMM cannot honour it, so it must not export
+// the symbol; the hook keys off its presence.
+extern "C" int ppu_moe_grouped_gemm_bf16_contiguous(
         const void * A, const void * B, void * out, const int * m_indices,
         int total_rows, int N, int K, int n_experts, int expected_m, void * stream) {
     (void) expected_m;
@@ -193,7 +196,7 @@ extern "C" int ppu_moe_grouped_gemm_bf16_nopad(
         SM90BF16GemmRuntime::launch_impl(kernel, launch_cfg, args);
         return 0;
     } catch (const std::exception & e) {
-        fprintf(stderr, "[ppu-moe] grouped-gemm (m=%d N=%d K=%d G=%d) failed: %s -> inline fallback\n",
+        fprintf(stderr, "[ppu-moe] contiguous grouped-gemm (m=%d N=%d K=%d G=%d) failed: %s -> inline fallback\n",
                 total_rows, N, K, n_experts, e.what());
         return 2;
     }
