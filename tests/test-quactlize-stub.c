@@ -91,14 +91,17 @@ int quactlize_ppu_dense_fully_quantized_dev_for_arrangement_v2(
     (void)x;(void)l;(void)h;(void)u;(void)out;(void)m;(void)n;(void)k;(void)qt;
     (void)w;(void)wb;(void)s;(void)cn;(void)a; return 0;}
 
+// Per EXPERT, and therefore including N: the ABI says units holds experts*quactlize_ppu_units_bytes(N,K,qtype)
+// bytes. A double that drops the N factor would let a caller size the metadata plane N times too small and still
+// pass every test here, so it is modelled the way the contract reads.
 int64_t quactlize_ppu_units_bytes(int n, int k, int qtype) {
     if (env_on("QZ_STUB_NO_CONVERSION")) return -1;
-    (void)n;
     // k-quant metadata bytes per 256-code superblock: Q2 20, Q3 14, Q4 16, Q5 16, Q6 18
     int per_sb = 0;
     switch (qtype) { case 10: per_sb=20; break; case 11: per_sb=14; break; case 12: per_sb=16; break;
                      case 13: per_sb=16; break; case 14: per_sb=18; break; default: return -1; }
-    return (int64_t) (k / 256) * per_sb;
+    if (n <= 0 || k <= 0 || k % 256 != 0) return -1;
+    return (int64_t) n * (k / 256) * per_sb;
 }
 int quactlize_ppu_prepare_fully_quantized_for_arrangement_v2(
         const void*b,void*l,void*h,void*u,int n,int k,int e,int qt,const void*a){

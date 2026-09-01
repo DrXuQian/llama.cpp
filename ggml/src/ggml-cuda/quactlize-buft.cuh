@@ -45,3 +45,14 @@ struct ggml_quactlize_artifact {
 };
 
 bool ggml_quactlize_artifact_for(const ggml_tensor * tensor, ggml_quactlize_artifact * out);
+
+// Does this node read a K-pack artifact through ANY of its sources?
+//
+// For the fusion gates. Fusion runs inside the backend's graph_compute, after supports_op has already admitted each
+// node one at a time, and it launches mmvf/mmvq/mmf directly -- so a fused node never reaches ggml_cuda_mul_mat or
+// ggml_cuda_mul_mat_id and never reaches the K-pack branch there. A K-pack tensor still reports its GGUF type, so
+// ggml_cuda_should_fuse_mul_mat_vec_q would happily take it and hand the artifact to a Q4_K reader.
+//
+// Any source, not just src[0]: refusing a fusion that would have been fine costs one intermediate write and read,
+// while missing one costs a wrong answer that looks plausible. That asymmetry is the whole design of this check.
+bool ggml_quactlize_node_reads_artifact(const ggml_tensor * node);

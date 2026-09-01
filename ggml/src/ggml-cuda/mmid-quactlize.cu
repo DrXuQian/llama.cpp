@@ -70,6 +70,10 @@ void ggml_cuda_mul_mat_id_quactlize(ggml_backend_cuda_context & ctx,
     if (total_rows == 0) {
         return;
     }
+    // The library's ABI is int-typed throughout. The mm_ids_helper bounds below allow n_tokens*n_expert_used up to
+    // 2^32, so the narrowing is checked rather than assumed -- a wrapped total_rows would be a negative row count
+    // handed to a kernel, not a decline.
+    GGML_ASSERT(total_rows <= INT32_MAX && N <= INT32_MAX && K <= INT32_MAX && n_experts <= INT32_MAX);
 
     // mm_ids_helper's scan path stages one 4-byte entry per token in shared memory and ASSERTS it fits -- it aborts,
     // it does not fall back. With no inline path to degrade to, that assert would fire anyway; checking here just
