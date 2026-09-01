@@ -10,6 +10,8 @@
 //   QZ_STUB_NO_CONVERSION   prepare/recover/units_bytes report failure
 //   QZ_STUB_BAD_UNITS  units_bytes one superblock too large     (negative control 3)
 //   QZ_STUB_NO_TACTIC  the inventories return 0 rows
+//   QZ_STUB_INTERLEAVE the packing keys off the expert index WITHIN THE CALL, so the artifact is NOT a
+//                      per-expert concatenation: serial conversion round-trips, a threaded one cannot
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -115,11 +117,68 @@ int64_t quactlize_ppu_units_bytes(int n, int k, int qtype) {
     // so nothing upstream fires -- only the byte-neutrality identity can catch this, which is the point.
     return (int64_t) n * (k / 256) * per_sb + (env_on("QZ_STUB_BAD_UNITS") ? per_sb : 0);
 }
+// A real, invertible, SLICE-SENSITIVE packing. The point is not fidelity to K-pack -- it is that a caller which
+// hands the wrong expert offset, or splits an artifact that is not a per-expert concatenation, must fail the round
+// trip. A prepare that ignored its arguments would let any decomposition "work".
+//
+// Per expert: the expert's blk_e bytes are XOR'd with a per-plane key and split [low][high][units] in order, which
+// byte neutrality guarantees fits exactly.
+//
+// QZ_STUB_INTERLEAVE=1 makes the key depend on the expert's index WITHIN THIS CALL. Serial conversion then
+// succeeds (one call, indices are global) while a threaded one fails (each slice restarts at 0), which is exactly
+// what an artifact that is not a per-expert concatenation looks like from the outside.
+static int plane_split(int n, int k, int qtype, long long * low_e, long long * high_e, long long * units_e) {
+    const int * r = row(qtype);
+    if (!r || n <= 0 || k <= 0 || k % 256 != 0) return 1;
+    const long long codes = (long long) n * k;
+    *low_e   = codes * r[1] / 8;
+    *high_e  = codes * r[2] / 8;
+    *units_e = quactlize_ppu_units_bytes(n, k, qtype);
+    return *units_e < 0 ? 1 : 0;
+}
+
+#define KEY_LOW 0xA5
+#define KEY_HIGH 0x5A
+#define KEY_UNITS 0x3C
+
 int quactlize_ppu_prepare_fully_quantized_for_arrangement_v2(
-        const void*b,void*l,void*h,void*u,int n,int k,int e,int qt,const void*a){
-    (void)b;(void)l;(void)h;(void)u;(void)n;(void)k;(void)e;(void)qt;(void)a;
-    return env_on("QZ_STUB_NO_CONVERSION") ? 1 : 0;}
+        const void * b, void * l, void * h, void * u, int n, int k, int e, int qt, const void * a) {
+    (void) a;
+    if (env_on("QZ_STUB_NO_CONVERSION")) return 1;
+    long long low_e, high_e, units_e;
+    if (plane_split(n, k, qt, &low_e, &high_e, &units_e)) return 2;
+    const int interleave = env_on("QZ_STUB_INTERLEAVE");
+    const unsigned char * src = (const unsigned char *) b;
+    unsigned char * lo = (unsigned char *) l;
+    unsigned char * hi = (unsigned char *) h;
+    unsigned char * un = (unsigned char *) u;
+    for (int i = 0; i < e; ++i) {
+        const unsigned char salt = interleave ? (unsigned char) i : 0;
+        long long j = 0;
+        for (long long x = 0; x < low_e;   ++x, ++j) lo[i*low_e   + x] = src[i*(low_e+high_e+units_e) + j] ^ (KEY_LOW   ^ salt);
+        for (long long x = 0; x < high_e;  ++x, ++j) hi[i*high_e  + x] = src[i*(low_e+high_e+units_e) + j] ^ (KEY_HIGH  ^ salt);
+        for (long long x = 0; x < units_e; ++x, ++j) un[i*units_e + x] = src[i*(low_e+high_e+units_e) + j] ^ (KEY_UNITS ^ salt);
+    }
+    return 0;
+}
+
 int quactlize_ppu_recover_fully_quantized_for_arrangement_v2(
-        const void*l,const void*h,const void*u,void*r,int n,int k,int e,int qt,const void*a){
-    (void)l;(void)h;(void)u;(void)r;(void)n;(void)k;(void)e;(void)qt;(void)a;
-    return env_on("QZ_STUB_NO_CONVERSION") ? 1 : 0;}
+        const void * l, const void * h, const void * u, void * r, int n, int k, int e, int qt, const void * a) {
+    (void) a;
+    if (env_on("QZ_STUB_NO_CONVERSION")) return 1;
+    long long low_e, high_e, units_e;
+    if (plane_split(n, k, qt, &low_e, &high_e, &units_e)) return 2;
+    const int interleave = env_on("QZ_STUB_INTERLEAVE");
+    const unsigned char * lo = (const unsigned char *) l;
+    const unsigned char * hi = (const unsigned char *) h;
+    const unsigned char * un = (const unsigned char *) u;
+    unsigned char * dst = (unsigned char *) r;
+    for (int i = 0; i < e; ++i) {
+        const unsigned char salt = interleave ? (unsigned char) i : 0;
+        long long j = 0;
+        for (long long x = 0; x < low_e;   ++x, ++j) dst[i*(low_e+high_e+units_e) + j] = lo[i*low_e   + x] ^ (KEY_LOW   ^ salt);
+        for (long long x = 0; x < high_e;  ++x, ++j) dst[i*(low_e+high_e+units_e) + j] = hi[i*high_e  + x] ^ (KEY_HIGH  ^ salt);
+        for (long long x = 0; x < units_e; ++x, ++j) dst[i*(low_e+high_e+units_e) + j] = un[i*units_e + x] ^ (KEY_UNITS ^ salt);
+    }
+    return 0;
+}

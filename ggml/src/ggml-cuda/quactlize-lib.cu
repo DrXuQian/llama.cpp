@@ -14,7 +14,10 @@
 
 #include <dlfcn.h>
 #include <pthread.h>
+#include <cstdlib>
 #include <cstring>
+#include <thread>
+#include <vector>
 
 // quactlize numbers its formats with the same integers ggml does. Neither project derives the other's, so the
 // identity is asserted here: if either renumbers, this stops the build instead of decoding Q4_K as Q5_K.
@@ -348,6 +351,120 @@ extern "C" bool ggml_quactlize_plane_sizes(
     return true;
 }
 
+extern "C" int ggml_quactlize_convert_threads(int64_t experts) {
+    if (experts <= 0) {
+        return 1;
+    }
+    if (const char * v = getenv("GGML_QUACTLIZE_CONVERT_THREADS")) {
+        const int n = atoi(v);
+        if (n >= 1) {
+            return (int) (n < experts ? n : experts);
+        }
+    }
+    const unsigned hw = std::thread::hardware_concurrency();
+    const int64_t  t  = hw ? (int64_t) hw : 1;
+    return (int) (t < experts ? t : experts);
+}
+
+// One pass: convert (optionally split across the expert axis) and round-trip. Returns 0 when the recovered bytes
+// equal the input exactly.
+static int qz_convert_once(
+        int qtype, const unsigned char * blocks,
+        unsigned char * low, unsigned char * high, unsigned char * units, unsigned char * recovered,
+        int64_t nbytes, int64_t n, int64_t k, int64_t experts,
+        const quactlize_ppu_placed_arrangement_v2 * arr,
+        int64_t low_bytes, int64_t high_bytes, int64_t units_bytes, int nthreads) {
+    unsigned char * high_arg = high_bytes ? high : nullptr;
+
+    int rc = 0;
+    if (nthreads <= 1 || experts <= 1) {
+        rc = ggml_quactlize_prepare(qtype, blocks, low, high_arg, units, (int) n, (int) k, (int) experts, arr);
+    } else {
+        // Every plane has to divide evenly by expert or the slice arithmetic is meaningless.
+        if (nbytes % experts || low_bytes % experts || high_bytes % experts || units_bytes % experts) {
+            return -2;
+        }
+        const int64_t blk_e   = nbytes      / experts;
+        const int64_t low_e   = low_bytes   / experts;
+        const int64_t high_e  = high_bytes  / experts;
+        const int64_t units_e = units_bytes / experts;
+
+        std::vector<int>         rcs((size_t) nthreads, 0);
+        std::vector<std::thread> workers;
+        workers.reserve((size_t) nthreads);
+
+        for (int t = 0; t < nthreads; ++t) {
+            const int64_t first = experts * t       / nthreads;
+            const int64_t last  = experts * (t + 1) / nthreads;
+            if (first >= last) {
+                continue;
+            }
+            workers.emplace_back([&, t, first, last]() {
+                rcs[(size_t) t] = ggml_quactlize_prepare(
+                    qtype,
+                    blocks + first*blk_e,
+                    low    + first*low_e,
+                    high_arg ? high + first*high_e : nullptr,
+                    units  + first*units_e,
+                    (int) n, (int) k, (int) (last - first), arr);
+            });
+        }
+        for (auto & w : workers) {
+            w.join();
+        }
+        for (const int r : rcs) {
+            if (r != 0) {
+                rc = r;
+                break;
+            }
+        }
+    }
+    if (rc != 0) {
+        return rc;
+    }
+
+    const int rrc = ggml_quactlize_recover(qtype, low, high_arg, units, recovered,
+                                           (int) n, (int) k, (int) experts, arr);
+    if (rrc != 0) {
+        return rrc;
+    }
+    return memcmp(recovered, blocks, (size_t) nbytes) == 0 ? 0 : -1;
+}
+
+extern "C" int ggml_quactlize_convert_verified(
+        int qtype, const unsigned char * blocks,
+        unsigned char * low, unsigned char * high, unsigned char * units, unsigned char * recovered,
+        int64_t nbytes, int64_t n, int64_t k, int64_t experts,
+        const quactlize_ppu_placed_arrangement_v2 * arrangement,
+        int64_t low_bytes, int64_t high_bytes, int64_t units_bytes,
+        int * threads_used) {
+    // Learned once per process, not per tensor: paying a failed parallel attempt on every expert tensor of a model
+    // would cost more than the threading saves.
+    static bool split_by_expert_rejected = false;
+
+    int nthreads = split_by_expert_rejected ? 1 : ggml_quactlize_convert_threads(experts);
+    int rc = qz_convert_once(qtype, blocks, low, high, units, recovered, nbytes, n, k, experts, arrangement,
+                             low_bytes, high_bytes, units_bytes, nthreads);
+
+    if (rc != 0 && nthreads > 1) {
+        GGML_LOG_WARN("[quactlize] conversion split across %d threads did not round-trip (rc=%d) -- retrying in "
+                      "one thread to tell a bad split from a bad library\n", nthreads, rc);
+        nthreads = 1;
+        rc = qz_convert_once(qtype, blocks, low, high, units, recovered, nbytes, n, k, experts, arrangement,
+                             low_bytes, high_bytes, units_bytes, 1);
+        if (rc == 0) {
+            split_by_expert_rejected = true;
+            GGML_LOG_WARN("[quactlize] the serial conversion round-trips, so this format's artifact is not a "
+                          "per-expert concatenation -- staying single-threaded for the rest of this load\n");
+        }
+    }
+
+    if (threads_used) {
+        *threads_used = nthreads;
+    }
+    return rc;
+}
+
 #else  // quactlize off: inert stubs
 
 extern "C" bool    ggml_quactlize_available(int)            { return false; }
@@ -382,5 +499,9 @@ extern "C" int  ggml_quactlize_recover(int, const uint8_t *, const uint8_t *, co
 extern "C" int64_t ggml_quactlize_units_bytes(int, int, int) { return -1; }
 extern "C" bool ggml_quactlize_plane_sizes(int, int64_t, int64_t, int64_t,
         const quactlize_ppu_placed_arrangement_v2 *, int64_t *, int64_t *, int64_t *) { return false; }
+extern "C" int ggml_quactlize_convert_threads(int64_t) { return 1; }
+extern "C" int ggml_quactlize_convert_verified(int, const unsigned char *, unsigned char *, unsigned char *,
+        unsigned char *, unsigned char *, int64_t, int64_t, int64_t, int64_t,
+        const quactlize_ppu_placed_arrangement_v2 *, int64_t, int64_t, int64_t, int *) { return -1; }
 
 #endif // GGML_NCP_QUACTLIZE
