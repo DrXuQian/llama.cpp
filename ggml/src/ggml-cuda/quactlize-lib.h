@@ -147,6 +147,32 @@ bool ggml_quactlize_plane_sizes(
     const quactlize_ppu_placed_arrangement_v2 * arrangement,
     int64_t * low_bytes, int64_t * high_bytes, int64_t * units_bytes);
 
+// How many threads the host-side conversion may use for a tensor with this many experts.
+//
+// The conversion is the ONLY new cost the K-pack path adds to a model load -- the GGUF bytes are already on the
+// host and the upload was going to happen anyway -- and it is a scatter, so the difference between one thread and
+// all of them is the difference between a load nobody notices and one everybody does. GGML_QUACTLIZE_CONVERT_
+// THREADS=1 forces the serial path, which is what makes that delta measurable rather than asserted.
+int ggml_quactlize_convert_threads(int64_t experts);
+
+// Convert blocks into the three resident planes and PROVE the result reproduces its input, byte for byte.
+//
+// The proof is not belt-and-braces, it is what makes threading safe. Splitting the work by expert assumes each
+// expert's share of every plane is a contiguous slice at the same index -- which the ABI's sizing implies but does
+// not state -- and a wrong decomposition cannot survive the round trip. So the split is attempted, and a failure
+// is retried in one thread: if the serial run then succeeds, the split was the problem and this says so and stays
+// serial; if it fails too, the library is the problem. Collapsing the two into one abort would have thrown away
+// the distinction that tells you which side to go fix.
+//
+// recovered must hold nbytes. Returns 0 on success; *threads_used reports what produced the accepted result.
+int ggml_quactlize_convert_verified(
+    int qtype, const unsigned char * blocks,
+    unsigned char * low, unsigned char * high, unsigned char * units, unsigned char * recovered,
+    int64_t nbytes, int64_t n, int64_t k, int64_t experts,
+    const quactlize_ppu_placed_arrangement_v2 * arrangement,
+    int64_t low_bytes, int64_t high_bytes, int64_t units_bytes,
+    int * threads_used);
+
 #ifdef __cplusplus
 }
 #endif

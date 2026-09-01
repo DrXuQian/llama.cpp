@@ -17,9 +17,16 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <vector>
 #include <unistd.h>
 
+enum qz_kind {
+    QZ_GATES,     // the admission guards: identity, registry, capability, byte neutrality
+    QZ_CONVERT,   // the conversion itself: threading, the round trip, and the fallback when the split is invalid
+};
+
 struct qz_case {
+    qz_kind      kind;
     const char * name;
     const char * env;              // what makes the stub lie, "" for the honest library
     int          qtype;
@@ -36,30 +43,40 @@ struct qz_case {
 // Five positives, one per format; five negatives, each making one guard fire; two deployment conditions. Every
 // negative must flip at least one column to false: a guard that cannot be made to fire is not a guard.
 static const qz_case g_cases[] = {
-    { "q2k",  "", GGML_TYPE_Q2_K, true,  true,  true,  true,  false, "fmt2 -> Q2_K, arrangement matches the registry" },
-    { "q3k",  "", GGML_TYPE_Q3_K, true,  true,  true,  true,  false, "fmt3 -> Q3_K, two planes (2 + 1 bits)" },
-    { "q4k",  "", GGML_TYPE_Q4_K, true,  true,  true,  true,  false, "fmt0 -> Q4_K, one plane, gs=32" },
-    { "q5k",  "", GGML_TYPE_Q5_K, true,  true,  true,  true,  false, "fmt1 -> Q5_K, two planes (4 + 1 bits)" },
-    { "q6k",  "", GGML_TYPE_Q6_K, true,  true,  true,  true,  false, "fmt4 -> Q6_K, two planes (4 + 2 bits)" },
+    { QZ_GATES, "q2k",  "", GGML_TYPE_Q2_K, true,  true,  true,  true,  false, "fmt2 -> Q2_K, arrangement matches the registry" },
+    { QZ_GATES, "q3k",  "", GGML_TYPE_Q3_K, true,  true,  true,  true,  false, "fmt3 -> Q3_K, two planes (2 + 1 bits)" },
+    { QZ_GATES, "q4k",  "", GGML_TYPE_Q4_K, true,  true,  true,  true,  false, "fmt0 -> Q4_K, one plane, gs=32" },
+    { QZ_GATES, "q5k",  "", GGML_TYPE_Q5_K, true,  true,  true,  true,  false, "fmt1 -> Q5_K, two planes (4 + 1 bits)" },
+    { QZ_GATES, "q6k",  "", GGML_TYPE_Q6_K, true,  true,  true,  true,  false, "fmt4 -> Q6_K, two planes (4 + 2 bits)" },
 
-    { "wrong-identity",    "QZ_STUB_FMT=3",           GGML_TYPE_Q4_K, false, false, false, true,  false,
+    { QZ_GATES, "wrong-identity",    "QZ_STUB_FMT=3",           GGML_TYPE_Q4_K, false, false, false, true,  false,
       "the file named fmt0 reports format 3: a reshuffled bundle must not arm" },
-    { "default-library",   "QZ_STUB_NO_IDENTITY=1",   GGML_TYPE_Q4_K, false, false, false, true,  false,
+    { QZ_GATES, "default-library",   "QZ_STUB_NO_IDENTITY=1",   GGML_TYPE_Q4_K, false, false, false, true,  false,
       "the default/ScaleFirst build reports -1 and is not a K-pack library" },
-    { "registry-mismatch", "QZ_STUB_BAD_GS=1",        GGML_TYPE_Q4_K, true,  false, false, true,  false,
+    { QZ_GATES, "registry-mismatch", "QZ_STUB_BAD_GS=1",        GGML_TYPE_Q4_K, true,  false, false, true,  false,
       "group_size off by one against ppu_format_config.inc" },
-    { "xplane-descriptor", "QZ_STUB_BAD_ATK=1",       GGML_TYPE_Q4_K, true,  false, false, true,  false,
+    { QZ_GATES, "xplane-descriptor", "QZ_STUB_BAD_ATK=1",       GGML_TYPE_Q4_K, true,  false, false, true,  false,
       "artifact_tile_k != 0: an Xplane descriptor arriving by the K-pack door" },
-    { "no-conversion",     "QZ_STUB_NO_CONVERSION=1", GGML_TYPE_Q4_K, true,  true,  false, true,  false,
+    { QZ_GATES, "no-conversion",     "QZ_STUB_NO_CONVERSION=1", GGML_TYPE_Q4_K, true,  true,  false, true,  false,
       "the conversion entries are exported but cannot answer for a 256-code superblock" },
 
-    { "bad-units",         "QZ_STUB_BAD_UNITS=1",     GGML_TYPE_Q4_K, true,  true,  true,  false, false,
+    { QZ_GATES, "bad-units",         "QZ_STUB_BAD_UNITS=1",     GGML_TYPE_Q4_K, true,  true,  true,  false, false,
       "units_bytes one superblock too large: the descriptor still matches, only byte neutrality can catch it" },
 
-    { "unsupported-type",  "",                        GGML_TYPE_Q8_0, false, false, false, true,  false,
+    { QZ_GATES, "unsupported-type",  "",                        GGML_TYPE_Q8_0, false, false, false, true,  false,
       "Q8_0 is outside the K-pack format range: unavailable, not a lookup past the table" },
-    { "no-bundle",         "",                        GGML_TYPE_Q4_K, false, false, false, true,  true,
+    { QZ_GATES, "no-bundle",         "",                        GGML_TYPE_Q4_K, false, false, false, true,  true,
       "nothing installed on the loader path: every format unavailable, no crash" },
+
+    // The conversion path. want_available doubles as "expect rc == 0"; want_arrangement as "expect more than one
+    // thread to have produced the accepted result". The stub's packing is slice-sensitive on purpose, so a
+    // threaded run that lands bytes at the wrong expert offset cannot pass.
+    { QZ_CONVERT, "convert-threaded", "",                          GGML_TYPE_Q4_K, true,  true,  true,  true, false,
+      "eight experts split across threads, round-tripping" },
+    { QZ_CONVERT, "convert-serial",   "GGML_QUACTLIZE_CONVERT_THREADS=1", GGML_TYPE_Q4_K, true, false, true, true, false,
+      "the knob that makes the threaded-vs-serial load delta measurable" },
+    { QZ_CONVERT, "convert-fallback", "QZ_STUB_INTERLEAVE=1",      GGML_TYPE_Q4_K, true,  false, true,  true, false,
+      "artifact is NOT a per-expert concatenation: the split must fail, be detected, and fall back to serial" },
 };
 
 static const size_t g_ncases = sizeof(g_cases) / sizeof(g_cases[0]);
@@ -102,6 +119,57 @@ static int check_byte_neutrality(int qtype, const quactlize_ppu_placed_arrangeme
                (long long) n, (long long) k, (long long) e, (long long) low, (long long) high,
                (long long) units, (long long) total, (long long) nbytes, ok ? "ok" : "FAIL");
     }
+    return failures;
+}
+
+// Exercises ggml_quactlize_convert_verified end to end against the stub's packing: threading, the byte-exact
+// round trip, and -- with QZ_STUB_INTERLEAVE -- the retry that tells a bad split from a bad library. That retry is
+// otherwise code nobody runs until the day it matters.
+static int run_convert(const qz_case & c) {
+    int failures = 0;
+
+    quactlize_ppu_placed_arrangement_v2 a;
+    memset(&a, 0, sizeof(a));
+    if (!ggml_quactlize_arrangement_for(c.qtype, &a)) {
+        printf("    no arrangement for %s -- cannot exercise conversion\n", ggml_type_name((ggml_type) c.qtype));
+        return 1;
+    }
+
+    const int64_t n = 4, k = 512, experts = 8;
+    const int64_t nbytes = (int64_t) ggml_row_size((ggml_type) c.qtype, k) * n * experts;
+
+    int64_t low_b = 0, high_b = 0, units_b = 0;
+    if (!ggml_quactlize_plane_sizes(c.qtype, n, k, experts, &a, &low_b, &high_b, &units_b)) {
+        printf("    no plane sizes\n");
+        return 1;
+    }
+    if (low_b + high_b + units_b != nbytes) {
+        printf("    planes do not add up: %lld vs %lld\n", (long long)(low_b+high_b+units_b), (long long) nbytes);
+        return 1;
+    }
+
+    std::vector<unsigned char> blocks((size_t) nbytes), recovered((size_t) nbytes);
+    std::vector<unsigned char> low((size_t) low_b), high((size_t) (high_b ? high_b : 1)), units((size_t) units_b);
+    // Deterministic but not uniform: a constant fill would survive a wrong offset.
+    unsigned int seed = 12345;
+    for (auto & b : blocks) { seed = seed*1103515245u + 12345u; b = (unsigned char) (seed >> 16); }
+
+    int threads_used = -1;
+    const int rc = ggml_quactlize_convert_verified(
+        c.qtype, blocks.data(), low.data(), high_b ? high.data() : nullptr, units.data(), recovered.data(),
+        nbytes, n, k, experts, &a, low_b, high_b, units_b, &threads_used);
+
+    const bool ok_rc = (rc == 0) == c.want_available;
+    if (!ok_rc) failures++;
+    printf("    %-34s rc=%-4d want=%s %s\n", "convert_verified", rc, c.want_available ? "0" : "!=0",
+           ok_rc ? "ok" : "FAIL");
+
+    const bool threaded = threads_used > 1;
+    const bool ok_thr = threaded == c.want_arrangement;
+    if (!ok_thr) failures++;
+    printf("    %-34s threads=%-3d want=%s %s\n", "threads_used", threads_used,
+           c.want_arrangement ? ">1" : "==1", ok_thr ? "ok" : "FAIL");
+
     return failures;
 }
 
@@ -157,7 +225,8 @@ int main(int argc, char ** argv) {
     if (argc >= 3 && strcmp(argv[1], "--case") == 0) {
         for (size_t i = 0; i < g_ncases; ++i) {
             if (strcmp(g_cases[i].name, argv[2]) == 0) {
-                return run_one(g_cases[i]) == 0 ? 0 : 1;
+                const int f = g_cases[i].kind == QZ_CONVERT ? run_convert(g_cases[i]) : run_one(g_cases[i]);
+                return f == 0 ? 0 : 1;
             }
         }
         fprintf(stderr, "unknown case '%s'\n", argv[2]);
