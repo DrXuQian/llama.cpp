@@ -314,12 +314,17 @@ bool ggml_quactlize_can_serve(const ggml_tensor * weight, ggml_op op) {
         return true;
     }
 
-    // GGML_OP_MUL_MAT (dense) has no K-pack consumer in ggml_cuda_mul_mat yet, so admitting a dense weight would
-    // put an artifact in a buffer nothing can read -- with no GGUF copy left to notice with. The gate goes here,
-    // beside the operator it refuses, and turns into the dense-inventory query when that consumer lands.
-    GGML_UNUSED(n);
-    GGML_UNUSED(k);
-    return false;
+    // Dense: one matrix, no expert axis. ggml hands src1 over as [k, m] with ne[0] contiguous, which is already
+    // the row-major [m, k] the dense entry wants, so the ladder is over the batch dimension and nothing else.
+    if (experts != 1) {
+        return false;
+    }
+    for (size_t i = 0; i < g_m_ladder_n; ++i) {
+        if (ggml_quactlize_list_dense_configs(qtype, nullptr, 0, g_m_ladder[i], n, k, arr.group_size, &arr) <= 0) {
+            return false;
+        }
+    }
+    return true;
 }
 
 bool ggml_quactlize_artifact_for(const ggml_tensor * tensor, ggml_quactlize_artifact * out) {
@@ -336,6 +341,19 @@ bool ggml_quactlize_artifact_for(const ggml_tensor * tensor, ggml_quactlize_arti
     }
     *out = it->second;
     return true;
+}
+
+bool ggml_quactlize_node_reads_artifact(const ggml_tensor * node) {
+    if (node == nullptr) {
+        return false;
+    }
+    for (int i = 0; i < GGML_MAX_SRC; ++i) {
+        const ggml_tensor * src = node->src[i];
+        if (src && src->buffer && ggml_backend_buft_is_cuda_quactlize(src->buffer->buft)) {
+            return true;
+        }
+    }
+    return false;
 }
 
 #else  // quactlize off
@@ -359,6 +377,11 @@ bool ggml_quactlize_can_serve(const ggml_tensor * weight, ggml_op op) {
 bool ggml_quactlize_artifact_for(const ggml_tensor * tensor, ggml_quactlize_artifact * out) {
     GGML_UNUSED(tensor);
     GGML_UNUSED(out);
+    return false;
+}
+
+bool ggml_quactlize_node_reads_artifact(const ggml_tensor * node) {
+    GGML_UNUSED(node);
     return false;
 }
 
