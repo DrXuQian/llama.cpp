@@ -4,8 +4,11 @@
 
 #include "ggml-backend-impl.h"
 
+#include <chrono>
 #include <cinttypes>
+#include <cstdlib>
 #include <cstring>
+#include <thread>
 #include <map>
 #include <mutex>
 #include <vector>
@@ -28,18 +31,18 @@ struct qz_plane_sizes {
     int64_t units;
 };
 
-// The three resident planes, laid out [low][high][units] inside the tensor's own allocation. K-pack is byte-neutral,
-// so they must add up to exactly ggml_nbytes: that identity is the check that the descriptor and the tensor agree,
-// and it is asserted rather than assumed -- a wrong `bits` would otherwise silently shorten the units plane.
+// The three resident planes, laid out [low][high][units] inside the tensor's own allocation. The sizing itself is
+// host-only arithmetic and lives in the loader translation unit so it can be tested off-box; what belongs here is
+// the identity it has to satisfy, because only this side knows what ggml allocated.
 static bool qz_plane_sizes_for(
         const ggml_tensor * t, const quactlize_ppu_placed_arrangement_v2 & arr, qz_plane_sizes * out) {
     if (!ggml_quactlize_plane_sizes((int) t->type, t->ne[1], t->ne[0], t->ne[2]*t->ne[3], &arr,
                                     &out->low, &out->high, &out->units)) {
         return false;
     }
-    // The byte-neutrality identity, checked against what ggml itself allocates for this tensor. This is where the
-    // registry, the library's units_bytes and ggml's block size have to agree; anything else is a descriptor that
-    // would silently shorten one of the planes.
+    // K-pack is byte-neutral, and that is the whole reason this path can own the weight buffer without growing the
+    // resident footprint: the three planes must add up to exactly what ggml already allocates. This is where the
+    // registry, the library's units_bytes and ggml's block size have to agree.
     return out->low + out->high + out->units == (int64_t) ggml_nbytes(t);
 }
 
@@ -106,26 +109,29 @@ static void qz_buffer_set_tensor(
     std::vector<uint8_t> high ((size_t) ps.high);
     std::vector<uint8_t> units((size_t) ps.units);
 
-    const int rc = ggml_quactlize_prepare(qtype, (const uint8_t *) data,
-                                          low.data(), ps.high ? high.data() : nullptr, units.data(),
-                                          (int) n, (int) k, (int) experts, &arr);
+    // Convert and prove the artifact reproduces its own input. All of the policy -- how many threads, whether the
+    // expert axis may be split, what a failure on one side means -- lives in the loader translation unit, where it
+    // is host-only and therefore testable without a device. See ggml_quactlize_convert_verified.
+    std::vector<uint8_t> recovered(size);
+    int threads_used = 0;
+
+    const auto t_begin = std::chrono::steady_clock::now();
+
+    const int rc = ggml_quactlize_convert_verified(
+        qtype, (const uint8_t *) data, low.data(), ps.high ? high.data() : nullptr, units.data(), recovered.data(),
+        (int64_t) size, n, k, experts, &arr, ps.low, ps.high, ps.units, &threads_used);
+
     if (rc != 0) {
-        GGML_ABORT("[quactlize] %s: prepare returned %d for n=%" PRId64 " k=%" PRId64 " experts=%" PRId64
-                   " -- the GGUF bytes are the only copy and they are not going to survive this", 
+        GGML_ABORT("[quactlize] %s: K-pack conversion did not round-trip (rc=%d) for n=%" PRId64 " k=%" PRId64
+                   " experts=%" PRId64 " -- refusing to keep an artifact that does not reproduce its own input, "
+                   "and the GGUF bytes are the only other copy",
                    tensor->name, rc, n, k, experts);
     }
 
-    // Byte-exact round trip. Separate from dequantisation on purpose: it tells a packing bug from an arithmetic
-    // one, and it runs before anything downstream can mistake a misplaced plane for a bad kernel.
-    {
-        std::vector<uint8_t> recovered(size);
-        const int rrc = ggml_quactlize_recover(qtype, low.data(), ps.high ? high.data() : nullptr, units.data(),
-                                               recovered.data(), (int) n, (int) k, (int) experts, &arr);
-        if (rrc != 0 || memcmp(recovered.data(), data, size) != 0) {
-            GGML_ABORT("[quactlize] %s: K-pack round trip failed (recover rc=%d) -- refusing to keep an artifact "
-                       "that does not reproduce its own input", tensor->name, rrc);
-        }
-    }
+    const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_begin).count();
+    GGML_LOG_DEBUG("[quactlize] %s: %.1f MiB converted in %.1f ms on %d thread(s) (%.0f MiB/s, includes the "
+                   "round-trip check)\n", tensor->name, size / 1048576.0, ms, threads_used,
+                   ms > 0.0 ? size / 1048576.0 / (ms / 1000.0) : 0.0);
 
     uint8_t * dst = (uint8_t *) tensor->data;
     ggml_cuda_set_device(ctx->device);
