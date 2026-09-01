@@ -8,6 +8,7 @@
 //   QZ_STUB_BAD_ATK    report artifact_tile_k = 256                 (negative control 2)
 //   QZ_STUB_NO_ARRANGEMENT  canonical_arrangement_v2 returns non-zero
 //   QZ_STUB_NO_CONVERSION   prepare/recover/units_bytes report failure
+//   QZ_STUB_BAD_UNITS  units_bytes one superblock too large     (negative control 3)
 //   QZ_STUB_NO_TACTIC  the inventories return 0 rows
 #include <stdint.h>
 #include <stdlib.h>
@@ -33,7 +34,16 @@ static const int reg[5][6] = {
 };
 
 static int env_on(const char * k) { const char * v = getenv(k); return v && *v && strcmp(v, "0") != 0; }
+
+// Which format this copy of the stub plays. Compile-time, because all five copies are loaded into ONE process and
+// they would otherwise all read the same environment variable and all claim the same qtype -- which is exactly the
+// confusion (five libraries, identical symbol names) the RTLD_LOCAL handling exists to prevent, so the double must
+// not reintroduce it. QZ_STUB_QTYPE remains as a fallback for a single-library build.
+#ifdef QZ_STUB_BUILD_QTYPE
+static int my_qtype(void) { return QZ_STUB_BUILD_QTYPE; }
+#else
 static int my_qtype(void) { const char * v = getenv("QZ_STUB_QTYPE"); return v ? atoi(v) : 12; }
+#endif
 static const int * row(int qtype) {
     for (int i = 0; i < 5; ++i) if (reg[i][0] == qtype) return reg[i];
     return 0;
@@ -101,7 +111,9 @@ int64_t quactlize_ppu_units_bytes(int n, int k, int qtype) {
     switch (qtype) { case 10: per_sb=20; break; case 11: per_sb=14; break; case 12: per_sb=16; break;
                      case 13: per_sb=16; break; case 14: per_sb=18; break; default: return -1; }
     if (n <= 0 || k <= 0 || k % 256 != 0) return -1;
-    return (int64_t) n * (k / 256) * per_sb;
+    // QZ_STUB_BAD_UNITS: one superblock's worth of metadata too much. The descriptor still matches the registry,
+    // so nothing upstream fires -- only the byte-neutrality identity can catch this, which is the point.
+    return (int64_t) n * (k / 256) * per_sb + (env_on("QZ_STUB_BAD_UNITS") ? per_sb : 0);
 }
 int quactlize_ppu_prepare_fully_quantized_for_arrangement_v2(
         const void*b,void*l,void*h,void*u,int n,int k,int e,int qt,const void*a){

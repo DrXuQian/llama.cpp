@@ -133,6 +133,20 @@ int ggml_quactlize_recover(
 // Bytes of the metadata (units) plane for one expert; < 0 when unavailable.
 int64_t ggml_quactlize_units_bytes(int qtype, int n, int k);
 
+// The three resident planes, laid out [low][high][units] inside the tensor's own allocation.
+//
+// K-pack is BYTE-NEUTRAL, and that is the whole reason this path can own the weight buffer without growing the
+// resident footprint -- so the three sizes must add up to exactly what ggml already allocates for the tensor. The
+// caller checks that; this only computes. Returns false for a shape or descriptor it cannot size at all.
+//
+// The identity is a cross-check between three independent sources: quactlize's per-format registry (bits,
+// high_bits), the library's own units_bytes, and ggml's block size for the type. Two of them agreeing means
+// nothing; all three is the claim.
+bool ggml_quactlize_plane_sizes(
+    int qtype, int64_t n, int64_t k, int64_t experts,
+    const quactlize_ppu_placed_arrangement_v2 * arrangement,
+    int64_t * low_bytes, int64_t * high_bytes, int64_t * units_bytes);
+
 #ifdef __cplusplus
 }
 #endif
