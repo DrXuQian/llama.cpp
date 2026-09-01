@@ -255,6 +255,23 @@ static void parse_tensor_buffer_overrides(const std::string & value, std::vector
         if (buft) {
             buft_list[ggml_backend_buft_name(buft)] = buft;
         }
+
+        // A device's extra buffer types are nameable here too. Without this the only bufts -ot could reach were the
+        // defaults, so an extra buffer type could be reached only by the automatic selection in select_weight_buft
+        // -- which takes the first supported entry, and the defaults come first. That makes an extra buft usable but
+        // unaddressable: there was no way to ask for one, or to keep a single tensor out of one.
+        auto * reg = ggml_backend_dev_backend_reg(dev);
+        if (!reg) {
+            continue;
+        }
+        auto get_extra_bufts = (ggml_backend_dev_get_extra_bufts_t)
+            ggml_backend_reg_get_proc_address(reg, "ggml_backend_dev_get_extra_bufts");
+        if (!get_extra_bufts) {
+            continue;
+        }
+        for (auto ** extra = get_extra_bufts(dev); extra && *extra; ++extra) {
+            buft_list[ggml_backend_buft_name(*extra)] = *extra;
+        }
     }
 
     for (const auto & override : string_split<std::string>(value, ',')) {

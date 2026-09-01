@@ -30,6 +30,7 @@
 #include "ggml-cuda/im2col.cuh"
 #include "ggml-cuda/mmf.cuh"
 #include "ggml-cuda/mmid-ncp.cuh"
+#include "ggml-cuda/mmid-quactlize.cuh"
 #include "ggml-cuda/mmq.cuh"
 #include "ggml-cuda/mmvf.cuh"
 #if defined(GGML_USE_PPU)
@@ -37,6 +38,7 @@
 #endif
 #include "ggml-cuda/mmvq.cuh"
 #include "ggml-cuda/ncp-lib.h"
+#include "ggml-cuda/quactlize-buft.cuh"
 #include "ggml-cuda/norm.cuh"
 #include "ggml-cuda/opt-step-adamw.cuh"
 #include "ggml-cuda/opt-step-sgd.cuh"
@@ -2682,6 +2684,15 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     GGML_ASSERT(dst->type  == GGML_TYPE_F32);
     GGML_ASSERT(!ggml_backend_buft_is_cuda_split(src0->buffer->buft) && "mul_mat_id does not support split buffers");
 
+    // K-pack experts go through quactlize and NOWHERE ELSE. This is first, and it returns rather than falling
+    // through, because src0 no longer holds GGUF blocks: every branch below -- mmvq, to_bf16, MMF, the D2H
+    // fallback -- would read the artifact as the quantised type it still claims to be and return plausible
+    // garbage. See mmid-quactlize.cuh.
+    if (ggml_cuda_mul_mat_id_is_quactlize(src0)) {
+        ggml_cuda_mul_mat_id_quactlize(ctx, src0, src1, ids, dst);
+        return;
+    }
+
     GGML_TENSOR_BINARY_OP_LOCALS
 
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
@@ -5173,6 +5184,19 @@ static ggml_backend_buffer_type_t ggml_backend_cuda_device_get_host_buffer_type(
 static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
     ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *) dev->context;
 
+    // K-pack buffers serve exactly one operator and only for shapes the library's own inventory admits.
+    //
+    // This is asked during buffer-type selection, where llama.cpp attaches a zero-size buffer of each candidate type
+    // to the weight so that this function can see which one it would land in. It is answered FIRST and it is
+    // exclusive: a tensor in this buffer type has had its GGUF bytes replaced by the artifact, so saying yes to any
+    // other operator would hand a different format to a kernel that cannot tell.
+    for (int i = 0; i < GGML_MAX_SRC; i++) {
+        const ggml_tensor * src = op->src[i];
+        if (src && src->buffer && ggml_backend_buft_is_cuda_quactlize(src->buffer->buft)) {
+            return i == 0 && ggml_quactlize_can_serve(src, op->op);
+        }
+    }
+
     // split buffers can only be used with GGML_OP_MUL_MAT
     if (op->op != GGML_OP_MUL_MAT) {
         for (int i = 0; i < GGML_MAX_SRC; i++) {
@@ -5742,8 +5766,36 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t 
     GGML_UNUSED(reg);
 }
 
+// The device's extra buffer types: today just the K-pack one, and only when the build has quactlize support and the
+// device is the one that buffer type was made for. Null-terminated, as ggml_backend_dev_get_extra_bufts_t wants.
+static ggml_backend_buffer_type_t * ggml_backend_cuda_device_get_extra_bufts(ggml_backend_dev_t dev) {
+    ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *) dev->context;
+
+    static std::mutex mutex;
+    std::lock_guard<std::mutex> lock(mutex);
+
+    static std::map<int, std::vector<ggml_backend_buffer_type_t>> per_device;
+
+    auto it = per_device.find(dev_ctx->device);
+    if (it == per_device.end()) {
+        std::vector<ggml_backend_buffer_type_t> bufts;
+        if (ggml_backend_buffer_type_t kpack = ggml_backend_cuda_quactlize_buffer_type(dev_ctx->device)) {
+            bufts.push_back(kpack);
+        }
+        bufts.push_back(nullptr);
+        it = per_device.emplace(dev_ctx->device, std::move(bufts)).first;
+    }
+
+    // A list holding only the terminator is no list: return null so callers do not walk an empty array.
+    return it->second.size() > 1 ? it->second.data() : nullptr;
+}
+
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
+    if (strcmp(name, "ggml_backend_dev_get_extra_bufts") == 0) {
+        ggml_backend_dev_get_extra_bufts_t fct = ggml_backend_cuda_device_get_extra_bufts;
+        return (void *) fct;
+    }
     if (strcmp(name, "ggml_backend_comm_init") == 0) {
         return (void *)ggml_backend_cuda_comm_init;
     }

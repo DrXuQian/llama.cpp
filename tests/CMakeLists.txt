@@ -250,6 +250,37 @@ if (GGML_NCP_FA OR GGML_NCP_MOE OR GGML_NCP_GDN)
     llama_build_and_test(test-llama-ncp.cpp)
 endif()
 
+# The quactlize K-pack loader against a stub library. Not llama_build_and_test: this one needs neither llama nor a
+# model nor a device -- it links the loader translation unit directly (which is host-only C++ despite the .cu name)
+# so the guards that decide whether a tensor's GGUF bytes get thrown away have negative controls that run anywhere,
+# including on a machine with no PPU and no real .so.
+if (GGML_NCP_QUACTLIZE)
+    add_library(quactlize-stub MODULE test-quactlize-stub.c)
+    set_target_properties(quactlize-stub PROPERTIES
+        OUTPUT_NAME              "quactlize_ppu_fmt0"
+        PREFIX                   "lib"
+        LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/quactlize-stub")
+
+    set(QUACTLIZE_LOADER_TU ${PROJECT_SOURCE_DIR}/ggml/src/ggml-cuda/quactlize-lib.cu)
+    set_source_files_properties(${QUACTLIZE_LOADER_TU} PROPERTIES LANGUAGE CXX)
+
+    add_executable(test-quactlize-loader test-quactlize-loader.cpp ${QUACTLIZE_LOADER_TU})
+    target_compile_definitions(test-quactlize-loader PRIVATE GGML_USE_PPU GGML_NCP_QUACTLIZE)
+    target_include_directories(test-quactlize-loader PRIVATE
+        ${PROJECT_SOURCE_DIR}/ggml/include
+        ${PROJECT_SOURCE_DIR}/ggml/src
+        ${PROJECT_SOURCE_DIR}/ggml/src/ggml-cuda)
+    target_link_libraries(test-quactlize-loader PRIVATE ggml-base ${CMAKE_DL_LIBS})
+    add_dependencies(test-quactlize-loader quactlize-stub)
+
+    # The stub is found the way the real libraries are -- by bare soname on the loader path -- so the test exercises
+    # the same dlopen call the product uses, not a special-cased path.
+    add_test(NAME test-quactlize-loader COMMAND $<TARGET_FILE:test-quactlize-loader>)
+    set_tests_properties(test-quactlize-loader PROPERTIES
+        LABELS "main"
+        ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_CURRENT_BINARY_DIR}/quactlize-stub:$ENV{LD_LIBRARY_PATH};QZ_STUB_DIR=${CMAKE_CURRENT_BINARY_DIR}/quactlize-stub")
+endif()
+
 llama_build_and_test(test-model-load-cancel.cpp LABEL "model")
 llama_build_and_test(test-autorelease.cpp       LABEL "model")
 llama_build_and_test(test-backend-sampler.cpp   LABEL "model")
