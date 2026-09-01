@@ -268,6 +268,12 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
 #ifdef GGML_CUDA_FORCE_CUBLAS
     return false;
 #endif // GGML_CUDA_FORCE_CUBLAS
+#ifdef GGML_USE_PPU
+    // PPU's ACBLAS performs better than native MMQ when the node is quantized,
+    // so ggml_cuda_mul_mat/ggml_cuda_mul_mat_id will be routed to the ACBLAS pipeline.
+    // PPU: Quantized matrix multiplication skips MMQ and uniformly uses cuBLAS (pre-dequantization → FP16 → cublasGemmEx).
+    return false;
+#endif // GGML_USE_PPU
 
     bool mmq_supported;
 

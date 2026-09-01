@@ -1,6 +1,7 @@
 #include "convert.cuh"
 #include "ggml-cuda/common.cuh"
 #include "ggml.h"
+#include "rope-neox-vec.cuh"
 #include "rope.cuh"
 
 struct rope_corr_dims {
@@ -398,6 +399,15 @@ static void rope_neox_cuda(const T *            x,
                            const int            set_rows_stride,
                            cudaStream_t         stream) {
     GGML_ASSERT(ne00 % 2 == 0);
+
+    if constexpr (std::is_same_v<T, float> && std::is_same_v<D, float>) {
+        if (ggml_cuda_rope_neox_vec_f32(x, dst, ne00, ne01, ne02, s01, s02, s03, s1, s2, s3, n_dims, nr, pos,
+                                        freq_scale, freq_base, ext_factor, attn_factor, corr_dims.v, freq_factors,
+                                        forward, set_rows_stride, stream)) {
+            return;
+        }
+    }
+
     const dim3 block_dims(1, CUDA_ROPE_BLOCK_SIZE, 1);
     const int  n_blocks_x = (ne00 + 2 * CUDA_ROPE_BLOCK_SIZE - 1) / (2 * CUDA_ROPE_BLOCK_SIZE);
     const dim3 block_nums(nr, n_blocks_x, 1);

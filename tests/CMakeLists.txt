@@ -243,6 +243,13 @@ endif()
 llama_build_and_test(test-gguf.cpp)
 llama_build_and_test(test-backend-ops.cpp)
 
+# NCP external kernel .so vs ggml's inline kernels. Needs at least one hook compiled in to have anything to compare;
+# the test itself skips cleanly when the .so is absent or the GPU backend exposes no route control, so the OR is only
+# about not building a binary that can do nothing at all.
+if (GGML_NCP_FA OR GGML_NCP_MOE OR GGML_NCP_GDN)
+    llama_build_and_test(test-llama-ncp.cpp)
+endif()
+
 llama_build_and_test(test-model-load-cancel.cpp LABEL "model")
 llama_build_and_test(test-autorelease.cpp       LABEL "model")
 llama_build_and_test(test-backend-sampler.cpp   LABEL "model")

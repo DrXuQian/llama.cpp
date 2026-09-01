@@ -29,9 +29,14 @@
 #include "ggml-cuda/getrows.cuh"
 #include "ggml-cuda/im2col.cuh"
 #include "ggml-cuda/mmf.cuh"
+#include "ggml-cuda/mmid-ncp.cuh"
 #include "ggml-cuda/mmq.cuh"
 #include "ggml-cuda/mmvf.cuh"
+#if defined(GGML_USE_PPU)
+#include "ggml-cuda/mmvf-ppu.cuh"  // pulls <cuda_bf16.h>; PPU-only -> guard so MUSA/HIP builds don't include it
+#endif
 #include "ggml-cuda/mmvq.cuh"
+#include "ggml-cuda/ncp-lib.h"
 #include "ggml-cuda/norm.cuh"
 #include "ggml-cuda/opt-step-adamw.cuh"
 #include "ggml-cuda/opt-step-sgd.cuh"
@@ -1714,9 +1719,18 @@ static void ggml_cuda_op_mul_mat_cublas(
 
         const auto & force_compute_type = ggml_cuda_cublas_get_force_compute_type();
 
+#ifdef GGML_USE_PPU
+        // PPU: ACBLASS's cublasGemmEx returns all zeros for CUBLAS_COMPUTE_16F at M == 1.
+        // The fp32 branch is correct there, and the batched entry points are unaffected.
+        const bool needs_fp32_acc_m1 = row_diff == 1;
+#else
+        const bool needs_fp32_acc_m1 = false;
+#endif // GGML_USE_PPU
+
         if (!force_compute_type.fp16 && (GGML_CUDA_CC_IS_CDNA(cc)
                                         || GGML_CUDA_CC_IS_RDNA4(cc)
                                         || cc == GGML_CUDA_CC_VOLTA
+                                        || needs_fp32_acc_m1
                                         || force_compute_type.fp32))
         {
             const float alpha = 1.0f;
@@ -2470,6 +2484,25 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_f(const ggml_tensor * tensor) {
     ggml_tensor *       src1 = tensor->src[1];
     const ggml_tensor * dst  = tensor;
 
+#if defined(GGML_USE_PPU)
+    // The PPU has a dedicated decode-GEMV kernel (mmvf-ppu, ~82% HBM vs the generic mmvf's ~30%). The fusion path
+    // launches the generic mmvf directly and bypasses our _ppu dispatch gate in ggml_cuda_mul_mat -> disable fusion
+    // when our kernel can handle the base matmul so the node routes through ggml_cuda_mul_mat -> mmvf-ppu instead.
+    // The dropped fusion only costs a tiny intermediate write/read (FFN intermediate) -- cheap vs the 82% vs 30% win.
+    if (tensor->op == GGML_OP_MUL_MAT && ggml_cuda_mul_mat_vec_f_ppu_supported(src0, src1, dst)) {
+        return false;
+    }
+#endif
+
+#ifdef GGML_NCP_MOE
+    // The gate/up GLU fusion consumes both MUL_MAT_ID nodes and launches the generic mmvf, so they never reach the
+    // mul_mat_id dispatcher and never see the .so; only the un-fused down projection would. Decline fusion when the
+    // .so can take the matmul. Same shape as the GGML_USE_PPU case above.
+    if (ggml_cuda_mul_mat_id_ncp_lib_supported(tensor)) {
+        return false;
+    }
+#endif
+
     const bool is_mul_mat_id = tensor->op == GGML_OP_MUL_MAT_ID;
 
     bool use_mul_mat_vec_f =
@@ -2608,6 +2641,15 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     if (!split && use_mul_mat_vec_f) {
         // the custom F16 vector kernel can be used over batched cuBLAS GEMM
         // but this is only faster for GPUs without tensor cores or with a thin src0 matrix (particularly KQV in attention)
+#if defined(GGML_USE_PPU)
+        // PPU decode-GEMV fast path (mmvf-ppu.cuh, the gemv_ppu.cu v8d winner: 1-row/block lean register GEMV, all
+        // bf16, ~82% HBM == cuBLAS-fp16, parameter-free). Only the simple case (bf16 W, single-token f32 x,
+        // contiguous, K%8==0) routes here; everything else falls through to the generic vec kernel.
+        if (ggml_cuda_mul_mat_vec_f_ppu_supported(src0, src1, dst)) {
+            ggml_cuda_mul_mat_vec_f_ppu(ctx, src0, src1, dst);
+            return;
+        }
+#endif
         ggml_cuda_mul_mat_vec_f(ctx, src0, src1, nullptr, dst);
     } else if (!split && use_mul_mat_f) {
         ggml_cuda_mul_mat_f(ctx, src0, src1, nullptr, dst);
@@ -2629,6 +2671,7 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         ggml_cuda_op_mul_mat(ctx, src0, src1, dst, ggml_cuda_op_mul_mat_cublas, nullptr);
     }
 }
+
 
 static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
@@ -2661,10 +2704,86 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
             }
         }
 
+#ifdef GGML_NCP_MOE
+        // External DeepGemm grouped-GEMM .so for bf16-weight MoE, before mmq/mmf. Declines (unsupported shape, or no
+        // NoPad kernel in the .so) -> fall through.
+        //
+        // Quantized src0 is filtered out here instead of being left to the hook's own type gate: GGML_NCP_MOE implies
+        // GGML_USE_PPU, so those weights are dequantized to bf16 below and offered to the .so there. Asking now would
+        // decline for certain and spend a ggml_ncp_route_log slot (64 total, deduped per line) on a "-> GENERIC" line
+        // contradicting the "-> so-deepgemm-nopad" the same tensor logs seconds later.
+        if (!ggml_is_quantized(src0->type) && ggml_cuda_mul_mat_id_ncp_lib(ctx, src0, src1, ids, dst)) {
+            static bool logged = false;   // one line the first time the .so actually serves a shape, not just loads
+            if (!logged) { logged = true; GGML_LOG_INFO("[ncp-lib] using external MoE grouped-GEMM (libncp_moe.so)\n"); }
+            return;
+        }
+#endif
+
+#ifdef GGML_USE_PPU
+        // Avoid the CPU sort pipeline when MMQ is disabled and GGML_USE_PPU is used.
+        // PPU: quantized MoE prefill -> dequantize weights to BF16 -> grouped GEMM (.so) or MMF.
+        // If the activation is not FP32, this conversion will need to be changed.
+        //
+        // BF16 and not FP16 as the dequant target: MMF gates BF16 exactly like FP16 (same type size, and its only
+        // BF16 exclusion is CDNA3, which the PPU is not), so this costs MMF nothing -- while the .so entry is
+        // bf16-only, so dequantizing to FP16 would put it permanently out of reach for quantized experts. BF16 does
+        // give up 3 mantissa bits against FP16, paid by the fp16-stored per-block d/dmin scales (~0.2% relative) --
+        // small next to the 4-5 bit quantization already in the weights, but not free.
+        //
+        // ggml_get_to_bf16_cuda only lists the quantized types added for this path, so a type without an entry falls
+        // through to the pre-existing D2H path at the bottom of this function instead of aborting: output stays correct
+        // (just slow) if a model turns up with an expert type the table does not cover. Worth keeping as a branch rather
+        // than an assert because Q4_K_M and friends are mixed recipes -- one file can hold several types here.
+        const to_bf16_cuda_t to_bf16 = ggml_is_quantized(src0->type) ? ggml_get_to_bf16_cuda(src0->type) : nullptr;
+
+        if (to_bf16 != nullptr) {
+            cudaStream_t stream = ctx.stream();
+
+            const size_t nelements_src0 = ne00 * ne01 * ne02 * ne03;
+            ggml_cuda_pool_alloc<nv_bfloat16> src0_bf16_pool(ctx.pool(), nelements_src0);
+
+            to_bf16(src0->data, src0_bf16_pool.get(), nelements_src0, stream);
+
+            ggml_tensor src0_dequant = *src0;
+            src0_dequant.type     = GGML_TYPE_BF16;
+            src0_dequant.data     = src0_bf16_pool.get();
+            src0_dequant.nb[0]    = sizeof(nv_bfloat16);
+            src0_dequant.nb[1]    = ne00 * sizeof(nv_bfloat16);
+            src0_dequant.nb[2]    = ne00 * ne01 * sizeof(nv_bfloat16);
+            src0_dequant.nb[3]    = ne00 * ne01 * ne02 * sizeof(nv_bfloat16);
+            src0_dequant.op       = GGML_OP_VIEW;
+            src0_dequant.view_src = dst->src[0];
+
+#ifdef GGML_NCP_MOE
+            // The .so was skipped for this node above because src0 was still quantized. The weights are bf16 now, so
+            // give it first refusal ahead of MMF -- both read the same buffer, so a decline here costs only the failed
+            // gate check, not another dequant. Referencing the hook is safe: GGML_NCP_MOE is forced OFF without
+            // GGML_USE_PPU (ggml-cuda/CMakeLists.txt), so this branch and the one above always compile together.
+            if (ggml_cuda_mul_mat_id_ncp_lib(ctx, &src0_dequant, src1, ids, dst)) {
+                static bool logged = false;
+                if (!logged) {
+                    logged = true;
+                    GGML_LOG_INFO("[ncp-lib] using external MoE grouped-GEMM (libncp_moe.so) on dequantized experts\n");
+                }
+                return;
+            }
+#endif
+
+            if (ggml_cuda_should_use_mmf(src0_dequant.type, cc, WARP_SIZE,
+                        src0_dequant.ne, src0_dequant.nb, src1->ne[2], /*mul_mat_id=*/true)) {
+                ggml_cuda_mul_mat_f(ctx, &src0_dequant, src1, ids, dst);
+                return;
+            }
+
+            GGML_LOG_WARN("mul_mat_id: dequant+MMF path not taken for type=%s, falling back to D2H\n",
+                          ggml_type_name(src0->type));
+        }
+#else
         if (ggml_cuda_should_use_mmq(src0->type, cc, ne12, /*n_experts=*/ne02)) {
             ggml_cuda_mul_mat_q(ctx, src0, src1, ids, dst);
             return;
         }
+#endif
 
         if (ggml_cuda_should_use_mmf(src0->type, cc, WARP_SIZE, src0->ne, src0->nb, src1->ne[2], /*mul_mat_id=*/true)) {
             ggml_cuda_mul_mat_f(ctx, src0, src1, ids, dst);
@@ -3352,13 +3471,13 @@ static void ggml_cuda_graph_update_executable(ggml_backend_cuda_context * cuda_c
     cudaError_t stat = cudaGraphExecUpdate(graph->instance, graph->graph, &errorNode, &result_info);
 #endif // CUDART_VERSION >= 12000
 
-    if (stat == cudaErrorGraphExecUpdateFailure) {
+    if (stat == cudaErrorGraphExecUpdateFailure || stat == cudaErrorNotSupported) {
 #ifndef NDEBUG
-        GGML_LOG_DEBUG("%s: CUDA graph update failed\n", __func__);
+        GGML_LOG_DEBUG("%s: CUDA graph update failed or not supported (stat=%d)\n", __func__, stat);
 #endif
 
         // The pre-existing graph exec cannot be updated due to violated constraints
-        // so instead clear error and re-instantiate
+        // or the API is not supported on this device, so re-instantiate
         (void)cudaGetLastError();
         CUDA_CHECK(cudaGraphExecDestroy(graph->instance));
         graph->instance = nullptr;
@@ -5598,6 +5717,16 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t 
                 break;
             }
         }
+    }
+
+    // The GDN chunked prefill hook runs FLA's WY chain in bf16 (see gated_delta_net-ncp.cu: with f32
+    // operands the PPU spills fwd_h and the tensor cores go unused, so the dtype is not a precision
+    // knob there). Its gap to the f32 CPU reference therefore sits at bf16's rounding floor, two orders
+    // of magnitude above f32's -- test-backend-ops has to be told, or it holds GATED_DELTA_NET to the
+    // same 1e-7 nmse it holds every other f32 op to and reports a permanent FAIL. Both the arm's enable
+    // state and the .so's compiled-in shape table are runtime state, so this cannot be an #ifdef.
+    if (ggml_ncp_gdn_chunked_enabled() && ggml_ncp_lib_gdn_chunked_available()) {
+        features.push_back({ "NCP_GDN_CHUNKED", "1" });
     }
 
     #undef _STRINGIFY

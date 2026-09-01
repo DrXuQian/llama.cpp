@@ -3,14 +3,44 @@
 #include "ggml.h"
 #include "gguf.h"
 
+// clang-format off
 #include "llama-arch.h"
 #include "llama.h"
 #include "llama-hparams.h"
 #include "llama-model.h"
 #include "llama-vocab.h"
+// clang-format on
 
 #include <cstdint>
 #include <string>
+#include <vector>
+
+// How this arch's loader READS LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN. The key has two incompatible encodings and
+// llama_model_loader enforces the difference: the scalar overload REJECTS an array (get_key_or_arr, "expected scalar,
+// found array"), and the array overload BROADCASTS a scalar to every layer. So writing the wrong one is not a
+// near-miss -- it silently reconstructs a different set of SWA layers.
+//
+// KEEP IN SYNC with the read side: `grep -rn SLIDING_WINDOW_PATTERN src/models/`. Only archs that
+// llama_model_saver_supports_arch() accepts matter here; MIMO2 / STEP35 / MELLUM / COHERE2MOE are already excluded
+// above, which is why this list is as short as it is.
+enum llama_swa_pattern_encoding {
+    LLAMA_SWA_PATTERN_SCALAR,              // scalar period -> set_swa_pattern(p)
+    LLAMA_SWA_PATTERN_SCALAR_DENSE_FIRST,  // scalar period -> set_swa_pattern(p, /*dense_first =*/ true)
+    LLAMA_SWA_PATTERN_PER_LAYER,           // array read straight into hparams.is_swa_impl
+};
+
+static llama_swa_pattern_encoding llama_swa_pattern_encoding_for(llm_arch arch) {
+    switch (arch) {
+        case LLM_ARCH_GEMMA4:
+        case LLM_ARCH_GEMMA4_ASSISTANT:
+            return LLAMA_SWA_PATTERN_PER_LAYER;
+        case LLM_ARCH_SMALLTHINKER:
+        case LLM_ARCH_MODERN_BERT:
+            return LLAMA_SWA_PATTERN_SCALAR_DENSE_FIRST;
+        default:
+            return LLAMA_SWA_PATTERN_SCALAR;
+    }
+}
 
 bool llama_model_saver_supports_arch(llm_arch arch) {
     switch (arch) {
@@ -267,7 +297,51 @@ void llama_model_saver::add_kv_from_model() {
     add_kv(LLM_KV_ATTENTION_GATE_LORA_RANK,          hparams.n_lora_gate);
     add_kv(LLM_KV_ATTENTION_RELATIVE_BUCKETS_COUNT,  hparams.n_rel_attn_bkts);
     add_kv(LLM_KV_ATTENTION_SLIDING_WINDOW,          hparams.n_swa);
-    // add_kv(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN,  ???);
+    // The per-layer SWA layout. This used to be `// add_kv(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, ???)` -- the
+    // window SIZE was saved but the PATTERN was not, so a reloaded model fell back to the arch's built-in default
+    // period and ended up with a DIFFERENT set of SWA layers than the one that was saved. llama4, for instance,
+    // defaults to 4; a model saved with period 2 came back as 4, moving layers 1 and 2 from dense to SWA.
+    //
+    // That went unnoticed because llama4 also pins n_swa to 8192: for any sequence shorter than the window the SWA
+    // mask and the causal mask hold the same VALUES, so the logits were unchanged. What did change is the causal
+    // HINT on the attention node (llama-graph.cpp passes !hparams.is_swa(il) into it), and the one consumer of that
+    // hint -- the external-FA hook, which has no mask input and can only run when the mask is provably pure causal --
+    // then engaged on a different set of layers before and after the save. test-llama-archs compares those two runs
+    // bit for bit.
+    //
+    // Written in whichever encoding this arch reads, and ONLY when it is verified to reproduce is_swa_impl exactly:
+    // if no period fits, writing nothing leaves the previous (wrong-but-known) behaviour rather than inventing a
+    // layout the loader would misread.
+    if (const uint32_t n_layer = hparams.n_layer()) {
+        std::vector<uint32_t> is_swa(n_layer);
+        for (uint32_t il = 0; il < n_layer; ++il) {
+            is_swa[il] = hparams.is_swa(il) ? 1 : 0;
+        }
+
+        const llama_swa_pattern_encoding enc = llama_swa_pattern_encoding_for(model->arch);
+
+        if (enc == LLAMA_SWA_PATTERN_PER_LAYER) {
+            // per_layer = false deliberately: add_kv's per-layer path COLLAPSES an all-equal vector to a scalar, and
+            // a scalar here means a period, not a per-layer flag. An all-SWA model would collapse to 1, and period 1
+            // expands to all-DENSE -- the exact inverse.
+            add_kv(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, is_swa);
+        } else {
+            const bool dense_first = enc == LLAMA_SWA_PATTERN_SCALAR_DENSE_FIRST;
+            // Invert llama_hparams::set_swa_pattern. p == 0 is its "every layer SWA" case and must short-circuit
+            // before the modulo.
+            for (uint32_t p = 0; p <= n_layer; ++p) {
+                bool ok = true;
+                for (uint32_t il = 0; il < n_layer && ok; ++il) {
+                    const bool expect = p == 0 || (dense_first ? il % p != 0 : il % p < p - 1);
+                    ok                = (is_swa[il] != 0) == expect;
+                }
+                if (ok) {
+                    add_kv(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, p);
+                    break;
+                }
+            }
+        }
+    }
     add_kv(LLM_KV_ATTENTION_SCALE,                   hparams.f_attention_scale);
     add_kv(LLM_KV_ATTENTION_OUTPUT_SCALE,            hparams.f_attn_out_scale);
     add_kv(LLM_KV_ATTENTION_VALUE_SCALE,             hparams.f_attn_value_scale);

@@ -1,4 +1,5 @@
 #include "norm.cuh"
+#include "rms_norm_ppu.cuh"
 #include <cstdint>
 
 template <int block_size>
@@ -350,6 +351,21 @@ static void rms_norm_mul_f32_cuda(const float *  x,
                                   const uint32_t add_nsamples,
                                   const float    eps,
                                   cudaStream_t   stream) {
+#if defined(GGML_USE_PPU)
+    // OPT: route to the optimized fused kernel for large shape + large batch + float4-aligned; otherwise fall through to the native path below.
+    {
+        const int64_t opt_total_rows = (int64_t) nrows * nchannels * nsamples;
+        if (mul != nullptr && opt_rms_norm_should_use(ncols, opt_total_rows, stride_row, stride_channel, stride_sample)) {
+            opt_rms_norm_mul_f32(x, mul, add, dst, ncols, nrows, nchannels, nsamples,
+                stride_row, stride_channel, stride_sample,
+                mul_stride_row, mul_stride_channel, mul_stride_sample,
+                mul_ncols, mul_nrows, mul_nchannels, mul_nsamples,
+                add_stride_row, add_stride_channel, add_stride_sample,
+                add_ncols, add_nrows, add_nchannels, add_nsamples, eps, stream);
+            return;
+        }
+    }
+#endif    
     const dim3 blocks_num(nrows, nchannels, nsamples);
     if (mul == nullptr) {
         rms_norm_f32_cuda(x, dst, ncols, nrows, nchannels, nsamples, stride_row, stride_channel, stride_sample, eps, stream);

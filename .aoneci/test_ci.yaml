@@ -1,0 +1,186 @@
+name: llama UT v0.1
+
+strategy:
+  fast-fail: false
+
+triggers:
+  merge_request:
+    target-branches:
+      - ppu_dev
+    types:
+      - opened
+      - synchronize
+  push:
+    branches:
+      - ppu_dev
+
+jobs:
+  # ─── Stage 1: Static Code Analysis ──────────────────────────
+  static-check:
+    runs-on:
+      - aone-hosted
+      - amd64
+      - 8-32Gi
+    timeout: 10m
+    steps:
+      - uses: checkout
+        inputs:
+          enable-cache: false
+
+      - name: Print trigger context
+        run: |
+          echo "=============================================="
+          echo "Stage 1: Static Code Analysis"
+          echo "  enable_static_check = ${{params.enable_static_check}}"
+          echo "  git.branch   = ${{git.branch}}"
+          echo "  git.commitId = ${{git.commitId}}"
+          echo "  triggerMode  = ${{pipeline.inst.triggerMode}}"
+          echo "=============================================="
+
+      - name: clang-format check
+        run: |
+          export MR_TARGET="${{git.merge_request.targetBranch}}"
+          export PUSH_BEFORE="${{git.push.beforeSha256}}"
+          bash .aoneci/scripts/clang_format_check.sh
+
+      - name: Set result
+        id: result
+        run: |
+          echo "true" > ${{outputs.passed.path}}
+
+    outputs:
+      passed: ${{steps.result.outputs.passed}}
+
+  # ─── Stage 2: Build ───────────────────────────────────────
+  build:
+    needs: static-check
+    when: ${{jobs.static-check.outputs.passed == 'true'}}
+    runs-on:
+      - aone-hosted
+      - 32-128Gi
+      - amd64
+    steps:
+      - uses: checkout
+        inputs:
+          enable-cache: false
+          ssh-key: ${{secrets.bot_ssh_key}}
+
+      - uses: setup-github-proxy
+
+      - name: checkout llama cpp
+        uses: checkout
+        inputs:
+          ssh-key: ${{secrets.bot_ssh_key}}
+          path: /workspace/llama_cpp
+
+      - name: checkout ncp flash lib
+        uses: checkout
+        inputs:
+          repository-url: 'git@gitlab.alibaba-inc.com:T-Head-EEC/ncp_flash_lib.git'
+          ref: 'master'
+          path: /workspace/ncp_flash_lib
+          lfs: true
+          submodules: true
+          ssh-key: ${{secrets.bot_ssh_key}}
+ 
+      - name: build llama cpp
+        image: ${{vars.run_image}}
+        timeout: 4h
+        run: |
+          export LLAMA_CI_DIR=/workspace/llama_cpp
+          export NCP_LIB_DIR=/workspace/ncp_flash_lib
+          cd /workspace/llama_cpp/.aoneci/scripts
+          bash ./build.sh
+
+      - name: package
+        run: |
+          cd /workspace
+          tar -zcvf /workspace/llama_cpp.tar.gz \
+              --exclude='.git' llama_cpp \
+              ncp_flash_lib
+          ls -al /workspace/llama_cpp.tar.gz
+ 
+      - uses: upload-oss
+        id: upload-oss
+        inputs:
+          path: /workspace/llama_cpp.tar.gz
+          retention-days: 1
+
+      - id: artifact
+        name: parse oss url
+        run: |
+          echo ${{ #array(steps.upload-oss.outputs.result)[0].remote }} > ${{outputs.oss_url.path}}
+          echo "[debug] oss_url=$(cat ${{outputs.oss_url.path}})"
+
+      - run: echo 5 > $AONE_CI_STEP_GRACE_PERIOD_SECONDS
+
+    outputs:
+      oss_url: ${{steps.artifact.outputs.oss_url}}
+
+  # ─── Stage 2b: ctest (parallel with backend-ops-tests ) ──
+  ctest-tests:
+    needs: build
+    runs-on:
+      - 32-128Gi
+      - amd64
+    steps:
+      - run: echo 5 > $AONE_CI_STEP_GRACE_PERIOD_SECONDS
+
+      - uses: ptg-ai-test
+        inputs:
+          ppu: 1
+          labels: PCIE
+          run_image: ${{vars.run_image}}
+          image_url: ${{jobs.build.outputs.oss_url}}
+          cmd: |
+            echo "========== ctest Started =========="
+            rm -rf /workspace/llama_cpp /workspace/ncp_flash_lib
+            mkdir -p /workspace
+            ln -sfn "$(pwd)/llama_cpp" /workspace/llama_cpp
+            ln -sfn "$(pwd)/ncp_flash_lib" /workspace/ncp_flash_lib
+
+            export LLAMA_CI_DIR="/workspace/llama_cpp"
+            export NCP_LIB_DIR="/workspace/ncp_flash_lib"
+            bash llama_cpp/.aoneci/scripts/run_tests.sh
+            TEST_EXIT=$?
+            echo "========== ctest Done =========="
+            exit $TEST_EXIT
+          timeout: 14400
+
+  # ─── Stage 2c: backend-ops (trigger-mode dependent) ──
+  backend-tests:
+    needs: build
+    runs-on:
+      - 32-128Gi
+      - amd64
+    steps:
+      - run: echo 5 > $AONE_CI_STEP_GRACE_PERIOD_SECONDS
+
+      - uses: ptg-ai-test
+        inputs:
+          ppu: 1
+          labels: PCIE
+          run_image: ${{vars.run_image}}
+          image_url: ${{jobs.build.outputs.oss_url}}
+          cmd: |
+
+            # MR: run a subset of ops for fast feedback
+            # Push: run all ops for full validation
+            if [ "${{git.push != null}}" = "true" ]; then
+              OPS=""
+            else
+              OPS="FLASH_ATTN_EXT,MUL_MAT,MUL_MAT_ID,MUL_MAT_VEC_FUSION"
+            fi
+            echo "========== backend-ops Started (ops=${OPS:-ALL}) =========="
+            rm -rf /workspace/llama_cpp /workspace/ncp_flash_lib
+            mkdir -p /workspace
+            ln -sfn "$(pwd)/llama_cpp" /workspace/llama_cpp
+            ln -sfn "$(pwd)/ncp_flash_lib" /workspace/ncp_flash_lib
+
+            export LLAMA_CI_DIR="/workspace/llama_cpp"
+            export NCP_LIB_DIR="/workspace/ncp_flash_lib"
+            bash llama_cpp/.aoneci/scripts/run_backend_ops.sh "$OPS"
+            OPS_EXIT=$?
+            echo "========== backend-ops Done =========="
+            exit $OPS_EXIT
+          timeout: 14400

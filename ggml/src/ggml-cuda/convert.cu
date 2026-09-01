@@ -1,5 +1,6 @@
 #include "convert.cuh"
 #include "dequantize.cuh"
+#include "convert-ppu.cuh"
 
 #include <cstdint>
 
@@ -686,6 +687,12 @@ template <typename src_t, typename dst_t>
 static void convert_unary_cuda(const void * vx, dst_t * y,
         const int64_t ne00, const int64_t ne01, const int64_t ne02, const int64_t ne03,
         const int64_t s01, const int64_t s02, const int64_t s03, cudaStream_t stream) {
+    #if defined(GGML_USE_PPU)
+    // PPU: vectorized strided convert (4 elems/thread) for {f32,f16,bf16} cross-cast.
+    if constexpr (ppu_convert_cont_supported<src_t, dst_t>()) {
+        if ((ne00 & 3) == 0) { ppu_convert_unary_strided<src_t, dst_t>(vx, y, ne00, ne01, ne02, ne03, s01, s02, s03, stream); return; }
+    }
+    #endif
     const int64_t ne0203 = ne02*ne03;
     const uint3 ne02_fdv = init_fastdiv_values(ne02);
     const dim3 num_blocks((ne00 + CUDA_DEQUANTIZE_BLOCK_SIZE - 1) / CUDA_DEQUANTIZE_BLOCK_SIZE, (int)std::min(ne01, (int64_t)65535), (int)std::min(ne0203, (int64_t)65535));
@@ -695,11 +702,41 @@ static void convert_unary_cuda(const void * vx, dst_t * y,
 
 template <typename src_t, typename dst_t>
 static void convert_unary_cont_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
+#if defined(GGML_USE_PPU)
+    // PPU: vectorized convert (8 elems/thread) for any {f32,f16,bf16} cross-cast, instead of the scalar 1-elem/
+    // thread convert_unary. The if constexpr keeps the ppu kernel out of unsupported instantiations (quant src etc.).
+    if constexpr (ppu_convert_cont_supported<src_t, dst_t>()) {
+        if ((k & 7) == 0) { ppu_convert_unary_cont<src_t, dst_t>(vx, y, k, stream); return; }   // k % 8 -> 16B-aligned
+    }
+#endif
     convert_unary_cuda<src_t>(vx, y, k, 1, 1, 1, k, k, k, stream);
 }
 
 to_bf16_cuda_t ggml_get_to_bf16_cuda(ggml_type type) {
     switch (type) {
+        // Q4_K/Q5_K/Q6_K are here for the PPU MoE path, which dequantizes quantized experts to bf16 because the external
+        // grouped-GEMM .so is bf16-only. Upstream stops at F32/F16 because all three of its callers ask for either
+        // GGML_TYPE_F32 outright (split-buffer reduction, allreduce) or an activation type (mul_mat_cublas bf16 branch,
+        // asserted F32/F16) -- never a quantized one, so the missing entries are unused-code pruning rather than a
+        // known-bad path.
+        //
+        // The trio is covered together because the K-quant mixes move between exactly these three, and which one a given
+        // MoE tensor ends up as is a property of the file rather than of the nominal ftype: a Qwen3.5-35B-A3B-Q4_K_M
+        // holds Q4_K for ffn_gate/up_exps and Q5_K for ffn_down_exps. The IQ* and legacy Q4_0-family entries are left
+        // out -- adding one costs another instantiation of its dequant kernel per CUDA arch, and nothing routes them
+        // here yet; a type missing from this table takes the D2H path in ggml_cuda_mul_mat_id instead of failing.
+        //
+        // All three dequantize_row_*_cuda are template<typename dst_t>, already instantiated for float by
+        // ggml_get_to_fp32_cuda and for half by ggml_get_to_fp16_cuda; their kernels only ever assign float
+        // expressions into dst_t (the fp16 d/dmin block scales are widened to float on entry), so nv_bfloat16 goes
+        // through unchanged. Note bf16 keeps ~8 mantissa bits against fp16's 11, so those scales give up a couple of
+        // bits here -- small next to the 4-6 bit weight quantization, but not nothing.
+        case GGML_TYPE_Q4_K:
+            return dequantize_row_q4_K_cuda;
+        case GGML_TYPE_Q5_K:
+            return dequantize_row_q5_K_cuda;
+        case GGML_TYPE_Q6_K:
+            return dequantize_row_q6_K_cuda;
         case GGML_TYPE_F32:
             return convert_unary_cont_cuda<float>;
         case GGML_TYPE_F16:

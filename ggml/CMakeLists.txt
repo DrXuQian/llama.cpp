@@ -200,12 +200,18 @@ option(GGML_CUDA                            "ggml: use CUDA"                    
 option(GGML_MUSA                            "ggml: use MUSA"                                  OFF)
 option(GGML_CUDA_FORCE_MMQ                  "ggml: use mmq kernels instead of cuBLAS"         OFF)
 option(GGML_CUDA_FORCE_CUBLAS               "ggml: always use cuBLAS instead of mmq kernels"  OFF)
+option(GGML_USE_PPU                         "ggml: use PPU-optimized kernels on the CUDA backend" ON)
 set   (GGML_CUDA_PEER_MAX_BATCH_SIZE "128" CACHE STRING
                                             "ggml: max. batch size for using peer access")
 option(GGML_CUDA_NO_PEER_COPY               "ggml: do not use peer to peer copies"            OFF)
 option(GGML_CUDA_NO_VMM                     "ggml: do not try to use CUDA VMM"                OFF)
 option(GGML_CUDA_FA                         "ggml: compile ggml FlashAttention CUDA kernels"  ON)
 option(GGML_CUDA_FA_ALL_QUANTS              "ggml: compile all quants for FlashAttention"     OFF)
+# External NCP kernel .so, one flag per library. Require GGML_USE_PPU (PPU kernels). The .so are looked for next
+# to the binaries that load them, never through an env var -- see ncp-lib.h.
+option(GGML_NCP_FA                          "ggml: dlopen libncp_fa.so  (external FA-3; needs GGML_USE_PPU)"    OFF)
+option(GGML_NCP_MOE                         "ggml: dlopen libncp_moe.so (external DeepGemm; needs GGML_USE_PPU)" OFF)
+option(GGML_NCP_GDN                         "ggml: dlopen libncp_gdn.so (external FLA GDN; needs GGML_USE_PPU)" OFF)
 option(GGML_CUDA_GRAPHS                     "ggml: use CUDA graphs (llama.cpp only)"          ${GGML_CUDA_GRAPHS_DEFAULT})
 option(GGML_CUDA_NCCL                       "ggml: use NVIDIA Collective Comm. Library"       ON)
 set   (GGML_CUDA_COMPRESSION_MODE "size" CACHE STRING

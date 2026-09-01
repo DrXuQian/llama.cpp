@@ -143,6 +143,10 @@ static __global__ void mul_mat_f(
             if (threadIdx.x == 0) {
                 slot_map[j] = -1;
             }
+            // Ensure the lane0 initialization (-1) is committed before any lane
+            // writes its matched slot below; otherwise lane0's -1 can race with
+            // and overwrite a matched slot>=1 written by another lane.
+            __syncwarp();
 
             if (col_base + j >= ncols_dst_total) {
                 continue;
