@@ -324,6 +324,30 @@ extern "C" int64_t ggml_quactlize_units_bytes(int qtype, int n, int k) {
     return L->units_bytes(n, k, qtype);
 }
 
+extern "C" bool ggml_quactlize_plane_sizes(
+        int qtype, int64_t n, int64_t k, int64_t experts,
+        const quactlize_ppu_placed_arrangement_v2 * arrangement,
+        int64_t * low_bytes, int64_t * high_bytes, int64_t * units_bytes) {
+    if (!arrangement || !low_bytes || !high_bytes || !units_bytes) {
+        return false;
+    }
+    if (n <= 0 || k <= 0 || experts <= 0) {
+        return false;
+    }
+
+    const int64_t unit_per_expert = ggml_quactlize_units_bytes(qtype, (int) n, (int) k);
+    if (unit_per_expert < 0) {
+        return false;
+    }
+
+    const int64_t codes = experts * n * k;
+    *low_bytes   = codes * arrangement->bits      / 8;
+    *high_bytes  = codes * arrangement->high_bits / 8;
+    *units_bytes = experts * unit_per_expert;
+
+    return true;
+}
+
 #else  // quactlize off: inert stubs
 
 extern "C" bool    ggml_quactlize_available(int)            { return false; }
@@ -356,5 +380,7 @@ extern "C" int  ggml_quactlize_prepare(int, const uint8_t *, uint8_t *, uint8_t 
 extern "C" int  ggml_quactlize_recover(int, const uint8_t *, const uint8_t *, const uint8_t *, uint8_t *,
                                        int, int, int, const quactlize_ppu_placed_arrangement_v2 *) { return -1; }
 extern "C" int64_t ggml_quactlize_units_bytes(int, int, int) { return -1; }
+extern "C" bool ggml_quactlize_plane_sizes(int, int64_t, int64_t, int64_t,
+        const quactlize_ppu_placed_arrangement_v2 *, int64_t *, int64_t *, int64_t *) { return false; }
 
 #endif // GGML_NCP_QUACTLIZE

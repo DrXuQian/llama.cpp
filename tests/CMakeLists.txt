@@ -255,11 +255,25 @@ endif()
 # so the guards that decide whether a tensor's GGUF bytes get thrown away have negative controls that run anywhere,
 # including on a machine with no PPU and no real .so.
 if (GGML_NCP_QUACTLIZE)
-    add_library(quactlize-stub MODULE test-quactlize-stub.c)
-    set_target_properties(quactlize-stub PROPERTIES
-        OUTPUT_NAME              "quactlize_ppu_fmt0"
-        PREFIX                   "lib"
-        LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/quactlize-stub")
+    # One stub per format, from one source, each fixed to its qtype at COMPILE time. All five are loaded into the
+    # same process and export the same symbol names, so this is the shape the real bundle has -- and a stub that took
+    # its identity from the environment would have all five answering as the same format, hiding the very mix-up the
+    # loader's RTLD_LOCAL handling exists to prevent.
+    #
+    # qtype -> fmt index is the bundle's table and is NOT the identity map: fmt0 is Q4_K, not Q2_K.
+    set(QUACTLIZE_STUB_TARGETS "")
+    foreach (pair "10:2" "11:3" "12:0" "13:1" "14:4")
+        string(REPLACE ":" ";" pair_list ${pair})
+        list(GET pair_list 0 stub_qtype)
+        list(GET pair_list 1 stub_fmt)
+        add_library(quactlize-stub-fmt${stub_fmt} MODULE test-quactlize-stub.c)
+        target_compile_definitions(quactlize-stub-fmt${stub_fmt} PRIVATE QZ_STUB_BUILD_QTYPE=${stub_qtype})
+        set_target_properties(quactlize-stub-fmt${stub_fmt} PROPERTIES
+            OUTPUT_NAME              "quactlize_ppu_fmt${stub_fmt}"
+            PREFIX                   "lib"
+            LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/quactlize-stub")
+        list(APPEND QUACTLIZE_STUB_TARGETS quactlize-stub-fmt${stub_fmt})
+    endforeach()
 
     set(QUACTLIZE_LOADER_TU ${PROJECT_SOURCE_DIR}/ggml/src/ggml-cuda/quactlize-lib.cu)
     set_source_files_properties(${QUACTLIZE_LOADER_TU} PROPERTIES LANGUAGE CXX)
@@ -271,7 +285,7 @@ if (GGML_NCP_QUACTLIZE)
         ${PROJECT_SOURCE_DIR}/ggml/src
         ${PROJECT_SOURCE_DIR}/ggml/src/ggml-cuda)
     target_link_libraries(test-quactlize-loader PRIVATE ggml-base ${CMAKE_DL_LIBS})
-    add_dependencies(test-quactlize-loader quactlize-stub)
+    add_dependencies(test-quactlize-loader ${QUACTLIZE_STUB_TARGETS})
 
     # The stub is found the way the real libraries are -- by bare soname on the loader path -- so the test exercises
     # the same dlopen call the product uses, not a special-cased path.

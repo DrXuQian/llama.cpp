@@ -33,24 +33,13 @@ struct qz_plane_sizes {
 // and it is asserted rather than assumed -- a wrong `bits` would otherwise silently shorten the units plane.
 static bool qz_plane_sizes_for(
         const ggml_tensor * t, const quactlize_ppu_placed_arrangement_v2 & arr, qz_plane_sizes * out) {
-    const int64_t k       = t->ne[0];
-    const int64_t n       = t->ne[1];
-    const int64_t experts = t->ne[2] * t->ne[3];
-
-    if (k <= 0 || n <= 0 || experts <= 0) {
+    if (!ggml_quactlize_plane_sizes((int) t->type, t->ne[1], t->ne[0], t->ne[2]*t->ne[3], &arr,
+                                    &out->low, &out->high, &out->units)) {
         return false;
     }
-
-    const int64_t unit_per_expert = ggml_quactlize_units_bytes((int) t->type, (int) n, (int) k);
-    if (unit_per_expert < 0) {
-        return false;
-    }
-
-    const int64_t codes = experts * n * k;
-    out->low   = codes * arr.bits      / 8;
-    out->high  = codes * arr.high_bits / 8;
-    out->units = experts * unit_per_expert;
-
+    // The byte-neutrality identity, checked against what ggml itself allocates for this tensor. This is where the
+    // registry, the library's units_bytes and ggml's block size have to agree; anything else is a descriptor that
+    // would silently shorten one of the planes.
     return out->low + out->high + out->units == (int64_t) ggml_nbytes(t);
 }
 
