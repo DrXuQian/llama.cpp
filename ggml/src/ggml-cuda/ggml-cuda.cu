@@ -31,6 +31,7 @@
 #include "ggml-cuda/mmf.cuh"
 #include "ggml-cuda/mmid-ncp.cuh"
 #include "ggml-cuda/mmid-quactlize.cuh"
+#include "ggml-cuda/mul-mat-quactlize.cuh"
 #include "ggml-cuda/mmq.cuh"
 #include "ggml-cuda/mmvf.cuh"
 #if defined(GGML_USE_PPU)
@@ -2416,6 +2417,12 @@ static bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
         return false;
     }
 
+    // A K-pack source can never be fused: fusion launches mmvf/mmvq directly and would read the artifact as the
+    // quantised type it still reports. See ggml_quactlize_node_reads_artifact.
+    if (ggml_quactlize_node_reads_artifact(ffn_up) || ggml_quactlize_node_reads_artifact(ffn_gate)) {
+        return false;
+    }
+
     const ggml_op expected_bias_op = is_mul_mat ? GGML_OP_ADD : GGML_OP_ADD_ID;
 
     if (has_bias) {
@@ -2486,6 +2493,12 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_f(const ggml_tensor * tensor) {
     ggml_tensor *       src1 = tensor->src[1];
     const ggml_tensor * dst  = tensor;
 
+    // A K-pack source can never be fused: fusion launches mmvf/mmvq directly and would read the artifact as the
+    // quantised type it still reports. See ggml_quactlize_node_reads_artifact.
+    if (ggml_quactlize_node_reads_artifact(tensor)) {
+        return false;
+    }
+
 #if defined(GGML_USE_PPU)
     // The PPU has a dedicated decode-GEMV kernel (mmvf-ppu, ~82% HBM vs the generic mmvf's ~30%). The fusion path
     // launches the generic mmvf directly and bypasses our _ppu dispatch gate in ggml_cuda_mul_mat -> disable fusion
@@ -2540,6 +2553,12 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
     ggml_tensor *       src1 = tensor->src[1];
     const ggml_tensor * dst  = tensor;
 
+    // A K-pack source can never be fused: fusion launches mmvf/mmvq directly and would read the artifact as the
+    // quantised type it still reports. See ggml_quactlize_node_reads_artifact.
+    if (ggml_quactlize_node_reads_artifact(tensor)) {
+        return false;
+    }
+
     const bool bad_padding_clear = ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
                                    ggml_nbytes(src0) != ggml_backend_buffer_get_alloc_size(src0->buffer, src0) &&
                                    src0->view_src;
@@ -2574,6 +2593,14 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
 }
 
 static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    // K-pack weights go through quactlize and NOWHERE ELSE, for the same reason as in mul_mat_id: src0 no longer
+    // holds GGUF blocks, so MMQ, MMVQ, MMF and the cuBLAS dequant path would all read the artifact as the quantised
+    // type it still claims to be. See mul-mat-quactlize.cuh.
+    if (ggml_cuda_mul_mat_is_quactlize(src0)) {
+        ggml_cuda_mul_mat_quactlize(ctx, src0, src1, dst);
+        return;
+    }
+
     const bool split = ggml_backend_buft_is_cuda_split(src0->buffer->buft);
 
     // If src0 is a temporary compute buffer it may have some padding that needs to be cleared for mul_mat_vec_q or mul_mat_q.
