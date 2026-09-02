@@ -36,6 +36,9 @@ struct qz_case {
     // Whether the byte-neutrality identity is expected to HOLD. False is a case that exists to prove the identity
     // can be broken -- without one, "the sums always matched" says nothing about whether anything is checking.
     bool         want_byte_neutral;
+    // Whether the any-M admission query is expected to say yes. This replaced an M ladder that could be fooled by
+    // a shape with a tactic at 512 and 4096 but none at 1024.
+    bool         want_any_m;
     bool         hide_bundle;      // run with an empty loader path: nothing installed
     const char * why;
 };
@@ -43,39 +46,42 @@ struct qz_case {
 // Five positives, one per format; five negatives, each making one guard fire; two deployment conditions. Every
 // negative must flip at least one column to false: a guard that cannot be made to fire is not a guard.
 static const qz_case g_cases[] = {
-    { QZ_GATES, "q2k",  "", GGML_TYPE_Q2_K, true,  true,  true,  true,  false, "fmt2 -> Q2_K, arrangement matches the registry" },
-    { QZ_GATES, "q3k",  "", GGML_TYPE_Q3_K, true,  true,  true,  true,  false, "fmt3 -> Q3_K, two planes (2 + 1 bits)" },
-    { QZ_GATES, "q4k",  "", GGML_TYPE_Q4_K, true,  true,  true,  true,  false, "fmt0 -> Q4_K, one plane, gs=32" },
-    { QZ_GATES, "q5k",  "", GGML_TYPE_Q5_K, true,  true,  true,  true,  false, "fmt1 -> Q5_K, two planes (4 + 1 bits)" },
-    { QZ_GATES, "q6k",  "", GGML_TYPE_Q6_K, true,  true,  true,  true,  false, "fmt4 -> Q6_K, two planes (4 + 2 bits)" },
+    { QZ_GATES, "q2k",  "", GGML_TYPE_Q2_K, true,  true,  true,  true,  true,  false, "fmt2 -> Q2_K, arrangement matches the registry" },
+    { QZ_GATES, "q3k",  "", GGML_TYPE_Q3_K, true,  true,  true,  true,  true,  false, "fmt3 -> Q3_K, two planes (2 + 1 bits)" },
+    { QZ_GATES, "q4k",  "", GGML_TYPE_Q4_K, true,  true,  true,  true,  true,  false, "fmt0 -> Q4_K, one plane, gs=32" },
+    { QZ_GATES, "q5k",  "", GGML_TYPE_Q5_K, true,  true,  true,  true,  true,  false, "fmt1 -> Q5_K, two planes (4 + 1 bits)" },
+    { QZ_GATES, "q6k",  "", GGML_TYPE_Q6_K, true,  true,  true,  true,  true,  false, "fmt4 -> Q6_K, two planes (4 + 2 bits)" },
 
-    { QZ_GATES, "wrong-identity",    "QZ_STUB_FMT=3",           GGML_TYPE_Q4_K, false, false, false, true,  false,
+    { QZ_GATES, "wrong-identity",    "QZ_STUB_FMT=3",           GGML_TYPE_Q4_K, false, false, false, true,  true,  false,
       "the file named fmt0 reports format 3: a reshuffled bundle must not arm" },
-    { QZ_GATES, "default-library",   "QZ_STUB_NO_IDENTITY=1",   GGML_TYPE_Q4_K, false, false, false, true,  false,
+    { QZ_GATES, "default-library",   "QZ_STUB_NO_IDENTITY=1",   GGML_TYPE_Q4_K, false, false, false, true,  true,  false,
       "the default/ScaleFirst build reports -1 and is not a K-pack library" },
-    { QZ_GATES, "registry-mismatch", "QZ_STUB_BAD_GS=1",        GGML_TYPE_Q4_K, true,  false, false, true,  false,
+    { QZ_GATES, "registry-mismatch", "QZ_STUB_BAD_GS=1",        GGML_TYPE_Q4_K, true,  false, false, true,  true,  false,
       "group_size off by one against ppu_format_config.inc" },
-    { QZ_GATES, "xplane-descriptor", "QZ_STUB_BAD_ATK=1",       GGML_TYPE_Q4_K, true,  false, false, true,  false,
+    { QZ_GATES, "xplane-descriptor", "QZ_STUB_BAD_ATK=1",       GGML_TYPE_Q4_K, true,  false, false, true,  true,  false,
       "artifact_tile_k != 0: an Xplane descriptor arriving by the K-pack door" },
-    { QZ_GATES, "no-conversion",     "QZ_STUB_NO_CONVERSION=1", GGML_TYPE_Q4_K, true,  true,  false, true,  false,
+    { QZ_GATES, "no-conversion",     "QZ_STUB_NO_CONVERSION=1", GGML_TYPE_Q4_K, true,  true,  false, true,  true,  false,
       "the conversion entries are exported but cannot answer for a 256-code superblock" },
 
-    { QZ_GATES, "bad-units",         "QZ_STUB_BAD_UNITS=1",     GGML_TYPE_Q4_K, true,  true,  true,  false, false,
+    { QZ_GATES, "bad-units",         "QZ_STUB_BAD_UNITS=1",     GGML_TYPE_Q4_K, true,  true,  true,  false, true,  false,
       "units_bytes one superblock too large: the descriptor still matches, only byte neutrality can catch it" },
 
-    { QZ_GATES, "unsupported-type",  "",                        GGML_TYPE_Q8_0, false, false, false, true,  false,
+    { QZ_GATES, "no-tactic",         "QZ_STUB_NO_TACTIC=1",     GGML_TYPE_Q4_K, true,  true,  true,  true,  false, false,
+      "descriptor and conversion fine, but no tactic for every M: admission must say no" },
+
+    { QZ_GATES, "unsupported-type",  "",                        GGML_TYPE_Q8_0, false, false, false, true,  true,  false,
       "Q8_0 is outside the K-pack format range: unavailable, not a lookup past the table" },
-    { QZ_GATES, "no-bundle",         "",                        GGML_TYPE_Q4_K, false, false, false, true,  true,
+    { QZ_GATES, "no-bundle",         "",                        GGML_TYPE_Q4_K, false, false, false, true,  true,  true,
       "nothing installed on the loader path: every format unavailable, no crash" },
 
     // The conversion path. want_available doubles as "expect rc == 0"; want_arrangement as "expect more than one
     // thread to have produced the accepted result". The stub's packing is slice-sensitive on purpose, so a
     // threaded run that lands bytes at the wrong expert offset cannot pass.
-    { QZ_CONVERT, "convert-threaded", "",                          GGML_TYPE_Q4_K, true,  true,  true,  true, false,
+    { QZ_CONVERT, "convert-threaded", "",                          GGML_TYPE_Q4_K, true,  true,  true,  true, true,  false,
       "eight experts split across threads, round-tripping" },
-    { QZ_CONVERT, "convert-serial",   "GGML_QUACTLIZE_CONVERT_THREADS=1", GGML_TYPE_Q4_K, true, false, true, true, false,
+    { QZ_CONVERT, "convert-serial",   "GGML_QUACTLIZE_CONVERT_THREADS=1", GGML_TYPE_Q4_K, true, false, true, true, true,  false,
       "the knob that makes the threaded-vs-serial load delta measurable" },
-    { QZ_CONVERT, "convert-fallback", "QZ_STUB_INTERLEAVE=1",      GGML_TYPE_Q4_K, true,  false, true,  true, false,
+    { QZ_CONVERT, "convert-fallback", "QZ_STUB_INTERLEAVE=1",      GGML_TYPE_Q4_K, true,  false, true,  true, true,  false,
       "artifact is NOT a per-expert concatenation: the split must fail, be detected, and fall back to serial" },
 };
 
@@ -201,6 +207,11 @@ static int run_one(const qz_case & c) {
             printf("      FAIL: artifact_tile_k must be 0 for K-pack\n");
             failures++;
         }
+        // Admission for every M, dense and grouped, on the expert shape measured on the box and a dense one.
+        const bool any_m = ggml_quactlize_grouped_any_m_valid(c.qtype, 512, 3072, 256, &a) == 1 &&
+                           ggml_quactlize_dense_any_m_valid(c.qtype, 4096, 4096, &a) == 1;
+        check("any_m_valid (dense+grouped)", any_m, c.want_any_m);
+
         // Only for a library that is fully usable. Byte neutrality is a claim about an artifact that can actually
         // be produced, and the units plane's size comes from the conversion side -- so a case that deliberately
         // breaks conversion has no units size to check, which is the correct outcome and not a finding.

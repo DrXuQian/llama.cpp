@@ -1,6 +1,9 @@
 # quactlize ABI headers (verbatim copies)
 
-Copied unmodified from `quactlize/quactlize/include/`. llama.cpp compiles against these and dlopen's the prebuilt
+Copied unmodified from `quactlize/quactlize/include/` at source commit **`2826cf12451e02ca4590f7a44682b57d2098bfb9`**
+-- the commit the published six-library bundle (`prebuilt/ppu0010/2826cf1/runtime6-46fc3096e1a1`) was built from.
+The handoff pins headers and libraries to each other: do not refresh these from another revision, even when a struct
+or export name looks unchanged, without moving the bundle too. llama.cpp compiles against these and dlopen's the prebuilt
 `libquactlize_ppu_fmt*.so`; it never builds quactlize sources. `ABI_SHA256` records the exact bytes this tree was
 built against, so a drifted ABI is a one-line `sha256sum -c` away rather than a link error nobody reads:
 

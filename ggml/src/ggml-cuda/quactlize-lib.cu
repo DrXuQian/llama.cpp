@@ -16,6 +16,7 @@
 #include <pthread.h>
 #include <cstdlib>
 #include <cstring>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -31,15 +32,11 @@ static_assert(GGML_TYPE_Q6_K == 14, "quactlize qtype 14 is Q6_K");
 #define QZ_QTYPE_MAX 14
 #define QZ_NFMT (QZ_QTYPE_MAX - QZ_QTYPE_MIN + 1)
 
-typedef int32_t (*qz_list_grouped_fn)(quactlize_ppu_config_v3 *, int32_t, int, int, int, int, int, int, int,
-                                      const quactlize_ppu_placed_arrangement_v2 *);
 typedef int64_t (*qz_ws_grouped_fn)(int, int, int, int, int, int, const quactlize_ppu_placed_arrangement_v2 *);
 typedef int     (*qz_dev_grouped_fn)(const uint16_t *, const uint8_t *, const uint8_t *, const uint8_t *,
                                      const int *, uint16_t *, int, int, int, int, int, int,
                                      void *, int64_t, void *, const char *,
                                      const quactlize_ppu_placed_arrangement_v2 *);
-typedef int32_t (*qz_list_dense_fn)(quactlize_ppu_config_v3 *, int32_t, int, int, int, int, int,
-                                    const quactlize_ppu_placed_arrangement_v2 *);
 typedef int64_t (*qz_ws_dense_fn)(int, int, int, int, const quactlize_ppu_placed_arrangement_v2 *);
 typedef int     (*qz_dev_dense_fn)(const uint16_t *, const uint8_t *, const uint8_t *, const uint8_t *, uint16_t *,
                                    int, int, int, int, void *, int64_t, void *, const char *,
@@ -52,16 +49,19 @@ typedef int     (*qz_recover_fn)(const uint8_t *, const uint8_t *, const uint8_t
                                  const quactlize_ppu_placed_arrangement_v2 *);
 typedef int64_t (*qz_units_bytes_fn)(int, int, int);
 
+typedef int32_t (*qz_any_m_dense_fn)(int, int, int, const quactlize_ppu_placed_arrangement_v2 *);
+typedef int32_t (*qz_any_m_grouped_fn)(int, int, int, int, const quactlize_ppu_placed_arrangement_v2 *);
+
 struct qz_lib {
     void * handle;
     int32_t packed_format;          // what the library says it is; -2 when nothing is loaded
-    qz_list_grouped_fn list_grouped;
+    qz_any_m_grouped_fn any_m_grouped;
     qz_ws_grouped_fn   ws_grouped;
     qz_dev_grouped_fn  dev_grouped;
-    qz_list_dense_fn   list_dense;
+    qz_any_m_dense_fn  any_m_dense;
     qz_ws_dense_fn     ws_dense;
     qz_dev_dense_fn    dev_dense;
-    // Optional: absent in the currently shipping bundle. Absence is a decline, never a fallback to _v1 (Xplane).
+    // Present from bundle 2826cf1 on. Absence is a decline, never a fallback to _v1 (Xplane).
     qz_arrangement_fn  arrangement;
     qz_prepare_fn      prepare;
     qz_recover_fn      recover;
@@ -80,16 +80,47 @@ static const struct { int qtype; int fmt; const char * soname; } g_fmt_table[QZ_
     { GGML_TYPE_Q6_K, 4, "libquactlize_ppu_fmt4.so" },
 };
 
+// The PPU SDK wrapper, once and RTLD_GLOBAL, before any format library: the handoff's load order. On a PPU build
+// it is already a dependency of the CUDA backend, so this is normally a refcount bump; on a host without the SDK
+// it is skipped and the format libraries then fail to open on their own terms, which is the right outcome.
+static void qz_preload_sdk_wrapper(void) {
+    static bool done = false;
+    if (done) {
+        return;
+    }
+    done = true;
+    const char * sdk = getenv("PPU_SDK");
+    if (!sdk || !*sdk) {
+        return;
+    }
+    const std::string wrapper = std::string(sdk) + "/lib/libhggc_wrapper.so";
+    if (!dlopen(wrapper.c_str(), RTLD_NOW | RTLD_GLOBAL)) {
+        GGML_LOG_INFO("[quactlize] SDK wrapper %s not preloaded (%s)\n", wrapper.c_str(), dlerror());
+    }
+}
+
 static void qz_load_one(qz_lib * L, int qtype, int want_fmt, const char * soname) {
     L->handle = NULL;
     L->packed_format = -2;
 
+    // The deployment contract (quactlize docs/LLAMA_CPP_KPACK_HANDOFF.md): the SDK wrapper first and RTLD_GLOBAL,
+    // then each format library by ABSOLUTE PATH from the bundle directory, RTLD_LOCAL. QUACTLIZE_PPU_BUNDLE names
+    // that directory -- the same variable quactlize's own packer takes -- and without it the SONAME goes to the
+    // dynamic loader as before, which is how the stub-driven tests find their doubles.
+    //
     // RTLD_LOCAL is load-bearing, not hygiene: all five libraries export the same symbol names, so a global open
     // would let whichever came first answer every dlsym and silently decode one format with another's reader.
-    void * h = dlopen(soname, RTLD_NOW | RTLD_LOCAL);
+    qz_preload_sdk_wrapper();
+    std::string path = soname;
+    if (const char * dir = getenv("QUACTLIZE_PPU_BUNDLE")) {
+        if (*dir) {
+            path = std::string(dir) + "/" + soname;
+        }
+    }
+    void * h = dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
     if (!h) {
         GGML_LOG_INFO("[quactlize] %s not loaded (%s) -> %s stays on the existing path\n",
-                      soname, dlerror(), ggml_type_name((enum ggml_type) qtype));
+                      path.c_str(), dlerror(), ggml_type_name((enum ggml_type) qtype));
         return;
     }
 
@@ -108,10 +139,10 @@ static void qz_load_one(qz_lib * L, int qtype, int want_fmt, const char * soname
         return;
     }
 
-    L->list_grouped = (qz_list_grouped_fn) dlsym(h, "quactlize_ppu_list_valid_grouped_fully_quantized_configs_for_arrangement_v2");
+    L->any_m_grouped = (qz_any_m_grouped_fn) dlsym(h, "quactlize_ppu_grouped_fully_quantized_any_m_valid_for_arrangement_v2");
     L->ws_grouped   = (qz_ws_grouped_fn)   dlsym(h, "quactlize_ppu_grouped_fully_quantized_workspace_bytes_for_arrangement_v2");
     L->dev_grouped  = (qz_dev_grouped_fn)  dlsym(h, "quactlize_ppu_grouped_fully_quantized_dev_for_arrangement_v2");
-    L->list_dense   = (qz_list_dense_fn)   dlsym(h, "quactlize_ppu_list_valid_dense_fully_quantized_configs_for_arrangement_v2");
+    L->any_m_dense   = (qz_any_m_dense_fn)   dlsym(h, "quactlize_ppu_dense_fully_quantized_any_m_valid_for_arrangement_v2");
     L->ws_dense     = (qz_ws_dense_fn)     dlsym(h, "quactlize_ppu_dense_fully_quantized_workspace_bytes_for_arrangement_v2");
     L->dev_dense    = (qz_dev_dense_fn)    dlsym(h, "quactlize_ppu_dense_fully_quantized_dev_for_arrangement_v2");
 
@@ -120,11 +151,11 @@ static void qz_load_one(qz_lib * L, int qtype, int want_fmt, const char * soname
     L->recover     = (qz_recover_fn)     dlsym(h, "quactlize_ppu_recover_fully_quantized_for_arrangement_v2");
     L->units_bytes = (qz_units_bytes_fn) dlsym(h, "quactlize_ppu_units_bytes");
 
-    // All six or none. A library with the launch entry but no inventory would make supports_op unanswerable, and one
-    // with the inventory but no launch would advertise tactics it cannot run -- and the tensor that took this buffer
-    // type has no un-K-packed copy left to fall back to.
-    if (!L->list_grouped || !L->ws_grouped || !L->dev_grouped ||
-        !L->list_dense   || !L->ws_dense   || !L->dev_dense) {
+    // All six or none. A library with the launch entry but no any-M admission query would make supports_op
+    // unanswerable -- it runs before any M exists -- and one with the query but no launch would admit tensors it
+    // cannot run; either way the tensor that took this buffer type has no un-K-packed copy left to fall back to.
+    if (!L->any_m_grouped || !L->ws_grouped || !L->dev_grouped ||
+        !L->any_m_dense   || !L->ws_dense   || !L->dev_dense) {
         GGML_LOG_WARN("[quactlize] %s is missing one of the arrangement-v2 entries -- refusing to arm it\n", soname);
         dlclose(h);
         memset(L, 0, sizeof(*L));
@@ -168,13 +199,11 @@ extern "C" int32_t ggml_quactlize_build_packed_format(int qtype) {
     return g_libs[qtype - QZ_QTYPE_MIN].packed_format;
 }
 
-extern "C" int32_t ggml_quactlize_list_grouped_configs(
-        int qtype, quactlize_ppu_config_v3 * configs, int32_t capacity,
-        int total_rows, int n, int k, int group_size, int experts, int max_rows,
-        const quactlize_ppu_placed_arrangement_v2 * arrangement) {
+extern "C" int32_t ggml_quactlize_grouped_any_m_valid(
+        int qtype, int n, int k, int experts, const quactlize_ppu_placed_arrangement_v2 * arrangement) {
     qz_lib * L = qz_get(qtype);
     if (!L) return -1;
-    return L->list_grouped(configs, capacity, total_rows, n, k, group_size, experts, max_rows, qtype, arrangement);
+    return L->any_m_grouped(n, k, experts, qtype, arrangement);
 }
 
 extern "C" int64_t ggml_quactlize_grouped_workspace_bytes(
@@ -200,13 +229,11 @@ extern "C" int ggml_quactlize_grouped_dev(
                           workspace, workspace_bytes, stream, config_name, arrangement);
 }
 
-extern "C" int32_t ggml_quactlize_list_dense_configs(
-        int qtype, quactlize_ppu_config_v3 * configs, int32_t capacity,
-        int m, int n, int k, int group_size,
-        const quactlize_ppu_placed_arrangement_v2 * arrangement) {
+extern "C" int32_t ggml_quactlize_dense_any_m_valid(
+        int qtype, int n, int k, const quactlize_ppu_placed_arrangement_v2 * arrangement) {
     qz_lib * L = qz_get(qtype);
     if (!L) return -1;
-    return L->list_dense(configs, capacity, m, n, k, group_size, qtype, arrangement);
+    return L->any_m_dense(n, k, qtype, arrangement);
 }
 
 extern "C" int64_t ggml_quactlize_dense_workspace_bytes(
@@ -470,9 +497,8 @@ extern "C" int ggml_quactlize_convert_verified(
 extern "C" bool    ggml_quactlize_available(int)            { return false; }
 extern "C" int32_t ggml_quactlize_build_packed_format(int)  { return -2; }
 
-extern "C" int32_t ggml_quactlize_list_grouped_configs(
-        int, quactlize_ppu_config_v3 *, int32_t, int, int, int, int, int, int,
-        const quactlize_ppu_placed_arrangement_v2 *) { return -1; }
+extern "C" int32_t ggml_quactlize_grouped_any_m_valid(
+        int, int, int, int, const quactlize_ppu_placed_arrangement_v2 *) { return -1; }
 extern "C" int64_t ggml_quactlize_grouped_workspace_bytes(
         int, int, int, int, int, int, const quactlize_ppu_placed_arrangement_v2 *) { return -1; }
 extern "C" int ggml_quactlize_grouped_dev(
@@ -480,9 +506,8 @@ extern "C" int ggml_quactlize_grouped_dev(
         const int *, uint16_t *, int, int, int, int, int,
         void *, int64_t, void *, const char *,
         const quactlize_ppu_placed_arrangement_v2 *) { return -1; }
-extern "C" int32_t ggml_quactlize_list_dense_configs(
-        int, quactlize_ppu_config_v3 *, int32_t, int, int, int, int,
-        const quactlize_ppu_placed_arrangement_v2 *) { return -1; }
+extern "C" int32_t ggml_quactlize_dense_any_m_valid(
+        int, int, int, const quactlize_ppu_placed_arrangement_v2 *) { return -1; }
 extern "C" int64_t ggml_quactlize_dense_workspace_bytes(
         int, int, int, int, const quactlize_ppu_placed_arrangement_v2 *) { return -1; }
 extern "C" int ggml_quactlize_dense_dev(

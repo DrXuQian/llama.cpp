@@ -88,6 +88,18 @@ int32_t quactlize_ppu_list_valid_dense_fully_quantized_configs_for_arrangement_v
     if (env_on("QZ_STUB_NO_TACTIC") || qt != my_qtype()) return 0;
     return 1;
 }
+// Load-time admission for every M at once (bundle 2826cf1+). The real entries answer from the compiled tactic
+// tables; here the only thing that can make them say no is the switch that models "no tactic".
+int32_t quactlize_ppu_grouped_fully_quantized_any_m_valid_for_arrangement_v2(int n, int k, int e, int qt, const void * a) {
+    (void)n;(void)k;(void)a;
+    if (env_on("QZ_STUB_NO_TACTIC") || qt != my_qtype() || e <= 0) return 0;
+    return 1;
+}
+int32_t quactlize_ppu_dense_fully_quantized_any_m_valid_for_arrangement_v2(int n, int k, int qt, const void * a) {
+    (void)n;(void)k;(void)a;
+    if (env_on("QZ_STUB_NO_TACTIC") || qt != my_qtype()) return 0;
+    return 1;
+}
 int64_t quactlize_ppu_grouped_fully_quantized_workspace_bytes_for_arrangement_v2(
         int tr,int mr,int n,int k,int e,int qt,const void*a){(void)tr;(void)mr;(void)n;(void)k;(void)e;(void)qt;(void)a;return 0;}
 int64_t quactlize_ppu_dense_fully_quantized_workspace_bytes_for_arrangement_v2(
