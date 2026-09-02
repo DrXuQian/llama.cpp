@@ -15,15 +15,6 @@
 
 #ifdef GGML_NCP_QUACTLIZE
 
-// M values the tactic inventory is required to cover before a tensor is allowed into this buffer type.
-//
-// supports_op runs at model load, when nothing knows what M the graph will present, and taking this buffer type
-// throws the GGUF bytes away -- so the question "can the library serve this tensor" has to be answered for every M
-// at once. The library's inventory is per-M, so it is asked along a ladder from decode to a large prefill and all
-// of them must answer yes. This is a conservatism policy owned here, not a format policy: it can only refuse
-// tensors the library would have served, never admit one it would not.
-static const int    g_m_ladder[]  = { 1, 8, 64, 512, 4096 };
-static const size_t g_m_ladder_n  = sizeof(g_m_ladder) / sizeof(g_m_ladder[0]);
 
 struct qz_plane_sizes {
     int64_t low;
@@ -294,32 +285,17 @@ bool ggml_quactlize_can_serve(const ggml_tensor * weight, ggml_op op) {
     const int n       = (int) weight->ne[1];
     const int experts = (int) (weight->ne[2] * weight->ne[3]);
 
+    // The library answers for every runtime M at once. That is the only form of the question this function can
+    // ask -- it runs at load, before any M exists, and the GGUF bytes do not survive a yes -- and no shape policy is
+    // mirrored beside it: the handoff makes the library the admission authority, and a rule copied here would be a
+    // second source that drifts.
     if (op == GGML_OP_MUL_MAT_ID) {
-        if (experts <= 1) {
-            return false;
-        }
-        for (size_t i = 0; i < g_m_ladder_n; ++i) {
-            const int total_rows = g_m_ladder[i];
-            // max_rows is the largest per-expert row count; the load-time bound is "every row went to one expert".
-            if (ggml_quactlize_list_grouped_configs(qtype, nullptr, 0, total_rows, n, k, arr.group_size,
-                                                    experts, total_rows, &arr) <= 0) {
-                return false;
-            }
-        }
-        return true;
+        return experts > 1 && ggml_quactlize_grouped_any_m_valid(qtype, n, k, experts, &arr) == 1;
     }
 
     // Dense: one matrix, no expert axis. ggml hands src1 over as [k, m] with ne[0] contiguous, which is already
-    // the row-major [m, k] the dense entry wants, so the ladder is over the batch dimension and nothing else.
-    if (experts != 1) {
-        return false;
-    }
-    for (size_t i = 0; i < g_m_ladder_n; ++i) {
-        if (ggml_quactlize_list_dense_configs(qtype, nullptr, 0, g_m_ladder[i], n, k, arr.group_size, &arr) <= 0) {
-            return false;
-        }
-    }
-    return true;
+    // the row-major [m, k] the dense entry wants.
+    return experts == 1 && ggml_quactlize_dense_any_m_valid(qtype, n, k, &arr) == 1;
 }
 
 bool ggml_quactlize_artifact_for(const ggml_tensor * tensor, ggml_quactlize_artifact * out) {

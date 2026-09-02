@@ -46,12 +46,15 @@ int32_t ggml_quactlize_build_packed_format(int qtype);
 
 // ---- grouped (MoE): mirrors quactlize_ppu_*_grouped_fully_quantized_*_for_arrangement_v2 ----
 
-// Valid-tactic inventory. Pass (NULL, 0) to learn the count, then query again with room for that many. Returns a
-// negative count if no library is loaded. THIS is the capability oracle: a supports_op answering from a hand-written
-// table beside it would be a second source that can disagree with the kernels.
-int32_t ggml_quactlize_list_grouped_configs(
-    int qtype, quactlize_ppu_config_v3 * configs, int32_t capacity,
-    int total_rows, int n, int k, int group_size, int experts, int max_rows,
+// Load-time admission. 1 when the library's null-config device path has a compiled tactic for EVERY positive
+// runtime M -- for grouped, every legal ragged distribution with total_rows > 0 and 0 < max_rows <= total_rows,
+// zero-row experts included. This is the only form of the question supports_op can ask: it runs before any M
+// exists, and taking this buffer type discards the GGUF bytes. THIS is the capability oracle -- a shape rule
+// written beside it in llama.cpp would be a second source that drifts from the kernels (the handoff says so in as
+// many words). It is a tactic-capability query, not a promise that an arbitrary-size workspace allocation will
+// succeed; that is still answered per call. Negative when no library is loaded.
+int32_t ggml_quactlize_grouped_any_m_valid(
+    int qtype, int n, int k, int experts,
     const quactlize_ppu_placed_arrangement_v2 * arrangement);
 
 // Device scratch the chosen tactic needs; < 0 if unavailable.
@@ -73,9 +76,8 @@ int ggml_quactlize_grouped_dev(
 
 // ---- dense: mirrors quactlize_ppu_*_dense_fully_quantized_*_for_arrangement_v2 ----
 
-int32_t ggml_quactlize_list_dense_configs(
-    int qtype, quactlize_ppu_config_v3 * configs, int32_t capacity,
-    int m, int n, int k, int group_size,
+int32_t ggml_quactlize_dense_any_m_valid(
+    int qtype, int n, int k,
     const quactlize_ppu_placed_arrangement_v2 * arrangement);
 
 int64_t ggml_quactlize_dense_workspace_bytes(
@@ -93,29 +95,24 @@ int ggml_quactlize_dense_dev(
 
 // ---- host-side artifact production: descriptor + GGUF blocks -> resident planes ----
 //
-// NEITHER OF THESE IS IN THE CURRENTLY SHIPPING BUNDLE. Both are dlsym'd optionally and every caller treats their
-// absence as "this format cannot be served", so a build against today's .so is completely inert rather than wrong.
+// Both are in the bundle from source commit 2826cf1 on (docs/LLAMA_CPP_KPACK_HANDOFF.md in quactlize). They are
+// still dlsym'd optionally and their absence is a decline, so an older bundle leaves every tensor on the existing
+// path rather than half-converting it.
 //
-// (1) THE DESCRIPTOR. quactlize defines the canonical arrangement per format as constexpr (ppu_placed_arrangement
-//     .hpp: q4_kpack4_transpose_v1() and kquant_kpack_transpose_v1(qtype)), but exports no C entry returning it, so
-//     a loader can only get it by rebuilding the policy from ppu_format_config.inc -- a second source of the same
-//     decision, which is exactly what that registry's own header forbids. Wrapped here as one proposed entry:
+// (1) THE DESCRIPTOR: quactlize_ppu_canonical_arrangement_v2. The handoff is explicit that llama.cpp must obtain it
+//     from the selected library and never reconstruct it. What comes back is still checked against the registry
+//     copied beside these headers -- not to derive the descriptor, but so that a library and a registry that
+//     disagree stop the load instead of decoding with one of the two.
 //
-//         int quactlize_ppu_canonical_arrangement_v2(int qtype, quactlize_ppu_placed_arrangement_v2 * out);
-//
-//     returning 0 on success, non-zero for a qtype this library was not built for. What it returns is checked
-//     against the registry copied beside these headers: not to derive the descriptor, but so that a library and a
-//     registry that disagree stop the load instead of decoding with one of the two.
-//
-// (2) THE CONVERSION. quactlize_ppu_prepare/recover_fully_quantized_for_arrangement_v2, whose signatures are in
-//     quactlize/quactlize_ppu_packed.h. The legacy _v1 producer is NOT a fallback for these -- it emits Xplane
-//     bytes, a different resident format -- so it is deliberately not wrapped.
+// (2) THE CONVERSION: quactlize_ppu_prepare/recover_fully_quantized_for_arrangement_v2 (quactlize_ppu_packed.h).
+//     The legacy _v1 producer is NOT a fallback for these -- it emits Xplane bytes, a different resident format --
+//     so it is deliberately not wrapped.
 
 // The arrangement this library's kernels are compiled for. false when the entry is absent, when the library was not
 // built for this qtype, or when what it returned contradicts the format registry.
 bool ggml_quactlize_arrangement_for(int qtype, quactlize_ppu_placed_arrangement_v2 * out);
 
-// Can this build turn GGUF blocks into resident planes in process? False today for every format.
+// Can this build turn GGUF blocks into resident planes in process? True from bundle 2826cf1 on.
 bool ggml_quactlize_conversion_available(int qtype);
 
 // blocks is the raw GGUF byte image of the whole tensor (experts * n * k/256 records); low/high/units are host
