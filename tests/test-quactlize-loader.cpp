@@ -83,16 +83,26 @@ static const qz_case g_cases[] = {
       "the knob that makes the threaded-vs-serial load delta measurable" },
     { QZ_CONVERT, "convert-fallback", "QZ_STUB_INTERLEAVE=1",      GGML_TYPE_Q4_K, true,  false, true,  true, true,  false,
       "artifact is NOT a per-expert concatenation: the split must fail, be detected, and fall back to serial" },
+    // Every other format through the same threaded split -- the two-plane ones send the high plane through it too.
+    { QZ_CONVERT, "convert-q2k", "", GGML_TYPE_Q2_K, true,  true,  true,  true,  true,  false,
+      "Q2_K: 2-bit single plane, threaded round trip" },
+    { QZ_CONVERT, "convert-q3k", "", GGML_TYPE_Q3_K, true,  true,  true,  true,  true,  false,
+      "Q3_K: two planes (2+1 bits), threaded round trip" },
+    { QZ_CONVERT, "convert-q5k", "", GGML_TYPE_Q5_K, true,  true,  true,  true,  true,  false,
+      "Q5_K: two planes (4+1 bits), threaded round trip" },
+    { QZ_CONVERT, "convert-q6k", "", GGML_TYPE_Q6_K, true,  true,  true,  true,  true,  false,
+      "Q6_K: two planes (4+2 bits), threaded round trip" },
 };
 
 static const size_t g_ncases = sizeof(g_cases) / sizeof(g_cases[0]);
 
-// Shapes the byte-neutrality identity has to hold on. K is a multiple of 256 because that is a k-quant superblock;
-// the first row is the expert shape actually measured on the box.
+// Shapes the byte-neutrality identity has to hold on. N and K are multiples of 256 because the real library admits
+// nothing else (a k-quant superblock is 256 along K; the N rule is the library's); the first row is the expert shape
+// actually measured on the box.
 static const struct { int64_t n, k, experts; } g_shapes[] = {
     {   512, 3072, 256 },
     {  4096, 4096,   1 },
-    {     1,  256,   1 },
+    {   256,  512,   1 },   // 512 not 256: Q3_K/Q6_K take K in multiples of 512
     { 14336,  512,   8 },
 };
 
@@ -141,7 +151,7 @@ static int run_convert(const qz_case & c) {
         return 1;
     }
 
-    const int64_t n = 4, k = 512, experts = 8;
+    const int64_t n = 256, k = 512, experts = 8;   // N, K multiples of 256: the real library's admission rule
     const int64_t nbytes = (int64_t) ggml_row_size((ggml_type) c.qtype, k) * n * experts;
 
     int64_t low_b = 0, high_b = 0, units_b = 0;
@@ -242,6 +252,49 @@ int main(int argc, char ** argv) {
         }
         fprintf(stderr, "unknown case '%s'\n", argv[2]);
         return 2;
+    }
+
+    if (argc >= 2 && strcmp(argv[1], "--real") == 0) {
+        // Against a real bundle. QUACTLIZE_PPU_BUNDLE names its directory and the loader opens every format
+        // library by absolute path from it, so the stub directory and the LD_LIBRARY_PATH trick play no part. Only
+        // rows that do not lean on a stub knob apply: the five formats, the conversion round trips, the range
+        // guard. This is the first thing to run on a box with the published bundle, before any model: it exercises
+        // identity, descriptor-vs-registry, any-M admission, byte neutrality and the real packer's threaded round
+        // trip, all host-only, in seconds.
+        const char * bundle = getenv("QUACTLIZE_PPU_BUNDLE");
+        if (bundle == nullptr || *bundle == '\0') {
+            fprintf(stderr, "--real needs QUACTLIZE_PPU_BUNDLE=<directory holding libquactlize_ppu_fmt*.so>\n");
+            return 2;
+        }
+        char self[4096];
+        const ssize_t n = readlink("/proc/self/exe", self, sizeof(self) - 1);
+        if (n <= 0) {
+            fprintf(stderr, "cannot find my own path\n");
+            return 2;
+        }
+        self[n] = '\0';
+
+        int failures = 0, ran = 0;
+        for (size_t i = 0; i < g_ncases; ++i) {
+            if (g_cases[i].hide_bundle || strncmp(g_cases[i].env, "QZ_STUB_", 8) == 0) {
+                continue;
+            }
+            ran++;
+            printf("  [real] %-18s %s\n", g_cases[i].name, g_cases[i].why);
+            std::string cmd = "env ";
+            cmd += g_cases[i].env;
+            cmd += " '";
+            cmd += self;
+            cmd += "' --case ";
+            cmd += g_cases[i].name;
+            const int rc = system(cmd.c_str());
+            if (rc != 0) {
+                failures++;
+                printf("    -> case FAILED (rc=%d)\n", rc);
+            }
+        }
+        printf("test-quactlize-loader --real: %d cases against %s, %d failed\n", ran, bundle, failures);
+        return failures == 0 ? 0 : 1;
     }
 
     const char * stub_dir = getenv("QZ_STUB_DIR");
