@@ -80,6 +80,17 @@ typedef struct quactlize_ppu_placed_arrangement_v2 {
   uint64_t mapping_id;
 } quactlize_ppu_placed_arrangement_v2;
 
+// Return the one canonical resident K-pack descriptor owned by this loaded
+// library for qtype. This query is host-only and does not create a PPU context
+// or launch work. It succeeds only in a format-selected PPU_PACKED_FORMAT
+// build for that format's one qtype; the default/ScaleFirst build and every
+// other qtype return a nonzero status. `out` is zeroed before every such
+// failure so a caller cannot accidentally reuse a descriptor from a previous
+// library. A null `out` returns 23 without a write; an unknown qtype returns
+// 22; a known qtype not owned by the loaded format returns 29.
+int quactlize_ppu_canonical_arrangement_v2(
+    int qtype, quactlize_ppu_placed_arrangement_v2* out);
+
 // Host-only offline placement/recovery.  The v2 descriptor is checked by the
 // same library that produces the bytes; null/unknown/mismatched descriptors
 // fail closed.  Existing fixed/tile-aware symbols remain source and ABI
@@ -132,6 +143,42 @@ typedef struct quactlize_ppu_config_v4 {
 int32_t quactlize_ppu_list_configs(quactlize_ppu_config_v1 const** configs);
 int32_t quactlize_ppu_list_grouped_configs(quactlize_ppu_config_v1 const** configs);
 
+// Resolve the exact tactic that an arrangement-v2 launch would use for the
+// requested name. A null/empty name applies the library's automatic policy;
+// a known nonempty name is returned unchanged; an unknown or invalid name
+// fails closed. These host-only queries launch no work. They return 1 after
+// writing a record whose name has static library lifetime, otherwise 0 after
+// zeroing a non-null output record. Dense uses v4 because Q4 K-pack4 carries
+// fixed Split-K; grouped currently resolves only explicit/default policy.
+int32_t quactlize_ppu_dense_fully_quantized_selected_config_for_arrangement_v2(
+    quactlize_ppu_config_v4* config,
+    int m, int n, int k, int group_size, int qtype,
+    quactlize_ppu_placed_arrangement_v2 const* arrangement,
+    char const* requested_config_name);
+int32_t quactlize_ppu_grouped_fully_quantized_selected_config_for_arrangement_v2(
+    quactlize_ppu_config_v3* config,
+    int total_rows, int n, int k, int group_size, int experts, int max_rows,
+    int qtype, quactlize_ppu_placed_arrangement_v2 const* arrangement,
+    char const* requested_config_name);
+
+// Host-only admission for loaders that replace the source GGUF bytes with one
+// resident K-pack artifact before runtime M is known.  These queries describe
+// the null-config device path, not merely whether an unrelated explicit row is
+// present in the inventory.  They launch no work and return 1 only when that
+// path has a compiled tactic for every positive runtime M in its public domain.
+//
+// Dense covers every exact measured-M selector point and both unmeasured
+// fallback regions.  Grouped covers every legal ragged distribution with
+// total_rows > 0 and 0 < max_rows <= total_rows; zero-row experts remain legal.
+// This is a tactic-capability query, not a promise that an arbitrary-size
+// workspace allocation will succeed.
+int32_t quactlize_ppu_dense_fully_quantized_any_m_valid_for_arrangement_v2(
+    int n, int k, int qtype,
+    quactlize_ppu_placed_arrangement_v2 const* arrangement);
+int32_t quactlize_ppu_grouped_fully_quantized_any_m_valid_for_arrangement_v2(
+    int n, int k, int experts, int qtype,
+    quactlize_ppu_placed_arrangement_v2 const* arrangement);
+
 // Writes up to capacity valid records and returns the full valid-record count, so a caller may first pass
 // (NULL, 0), allocate exactly that many records, and query again. A negative capacity writes nothing. These are
 // host-only queries and require no CUDA/PPU context. Dense/grouped tensor records report the scheme-specific TileK
@@ -176,8 +223,11 @@ int32_t quactlize_ppu_list_valid_vecdot_moe_configs_v2(
 
 // Host-only per-problem validity predicates for the inventories above. They return 1 only when config_name names a
 // compiled tactic that the corresponding shipping entry can run for this problem, and 0 otherwise. For dense, a
-// null/empty name asks about the M<8 decode default or the M>=8 legacy default; grouped has one compiled default. No
-// CUDA/PPU context is required, and the launch entries enforce the same
+// null/empty name on canonical K-quant K-pack first selects an exact measured
+// `(qtype,m,n,k)` point and otherwise asks about the M<8 decode default or the
+// M>=8 legacy default. Xplane and legacy dense APIs retain the old shape
+// default; grouped has one compiled default. No CUDA/PPU context is required,
+// and the launch entries enforce the same
 // exact-type shared-memory/compact-A checks even when a caller neglects to query first.
 //
 // Both inventories contain tensor-core and CUDA-core families. Call the predicate matching enable_cuda_kernel;
@@ -222,7 +272,8 @@ int32_t quactlize_ppu_vecdot_moe_config_valid_v1(
 // Config-selecting host-pointer operator entries. config_name comes from the corresponding dense or grouped
 // inventory above. For non-arrangement dense entries, a null/empty name requests the shape-selected default (M<8
 // decode, M>=8 legacy); an unknown non-empty name reports the decline and retains the legacy fallback. Arrangement
-// entries remain strict: null/empty is shape-selected, but an unknown non-empty config name returns 39. Each tensor
+// entries remain strict: an unknown non-empty config name returns 39. Null/empty K-quant K-pack first selects an
+// exact measured point and otherwise uses the shape default; Xplane keeps the shape default directly. Each tensor
 // default is instantiated with compile-time assertions that its
 // exact shared storage fits ppu001 and that it uses the unrestricted ordinary-A path throughout the admitted domain.
 int quactlize_ppu_dense_lowbit_config_v1(

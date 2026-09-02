@@ -117,6 +117,13 @@ int quactlize_ppu_bc_gemv_for_arrangement_dev_v1(
 
 // Fully-quantized tensor-core GEMM uses caller-owned device workspace. The size queries return -1 when the
 // dimensions or qtype do not match this format-selected library. A successful device entry only enqueues work.
+//
+// Every canonical K-pack arrangement-v2 device consumer uses the exact expert-major artifact produced by
+// quactlize_ppu_prepare_fully_quantized_for_arrangement_v2.  Dense low/high/units each name the one experts=1 slice.
+// Grouped low/high/units each name experts independent contiguous slices, with the same expert index and byte offsets
+// documented by quactlize_ppu_packed.h; no plane interleaves experts.  For canonical K-pack, high must be null exactly
+// when arrangement->high_bits==0 and non-null otherwise.  Xplane v2 compatibility retains its legacy pointer contract
+// and is not a product of the arrangement-v2 complete producer.
 int64_t quactlize_ppu_dense_fully_quantized_workspace_bytes_v1(
     int m, int n, int k, int qtype);
 // Arrangement-aware query. It validates the exact v2 byte map before returning a bound shared by every compiled
@@ -137,8 +144,10 @@ int quactlize_ppu_dense_fully_quantized_dev_v2(
     char const* config_name);
 // Arrangement-aware successor.  Unlike v1/v2, this entry never infers the resident fold from qtype or tactic.
 // A null/unknown/mismatched descriptor fails before launch; an unknown non-empty config name returns 39 rather than
-// falling back. Null/empty config still selects the M-aware shipping default. The old entries keep their
-// registry-default behavior.
+// falling back.  For this device entry, a null or empty config_name delegates tactic selection to the loaded library:
+// v1/v2 Xplane uses the M-aware shipping default; canonical K-quant K-pack v2 first uses an exact measured
+// (qtype,m,n,k) selection and falls back to that same shipping default; Q4 K-pack4 retains its independent shape
+// policy.  A known non-empty name always requests that exact compiled tactic.
 int quactlize_ppu_dense_fully_quantized_dev_for_arrangement_v1(
     uint16_t const* act, uint8_t const* low, uint8_t const* high, uint8_t const* units, uint16_t* out,
     int m, int n, int k, int qtype, void* workspace, int64_t workspace_bytes, void* stream,
@@ -182,10 +191,11 @@ int quactlize_ppu_grouped_fully_quantized_dev_v2(
     int const* offsets, uint16_t* out,
     int total_rows, int n, int k, int experts, int max_rows, int qtype,
     void* workspace, int64_t workspace_bytes, void* stream, char const* config_name);
-// Arrangement-aware grouped successor. The descriptor is validated before
-// metadata setup or GEMM enqueue; layout=1 selects the canonical K-pack4
-// mainloop while retaining the existing ragged scheduler and ptr-array
-// epilogue. Unknown config names return 39 rather than falling back.
+// Arrangement-aware grouped successor. The descriptor is validated before metadata setup or GEMM enqueue; canonical
+// Q4 K-pack4 and K-quant K-pack descriptors select their respective physical mainloops while retaining the existing
+// ragged scheduler and ptr-array epilogue.  For this device entry, a null or empty config_name selects the one compiled
+// grouped default; grouped does not consult the dense exact-measurement table.  A known non-empty name requests that
+// exact compiled grouped tactic, and an unknown non-empty name returns 39 rather than falling back.
 int quactlize_ppu_grouped_fully_quantized_dev_for_arrangement_v2(
     uint16_t const* act, uint8_t const* low, uint8_t const* high,
     uint8_t const* units, int const* offsets, uint16_t* out,
