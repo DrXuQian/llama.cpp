@@ -14,11 +14,15 @@
 
 #include <dlfcn.h>
 #include <pthread.h>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <string>
 #include <thread>
 #include <vector>
+#ifdef __linux__
+#include <sched.h>
+#endif
 
 // quactlize numbers its formats with the same integers ggml does. Neither project derives the other's, so the
 // identity is asserted here: if either renumbers, this stops the build instead of decoding Q4_K as Q5_K.
@@ -381,6 +385,54 @@ extern "C" bool ggml_quactlize_plane_sizes(
     return true;
 }
 
+// CPUs this process may actually run on. hardware_concurrency() reports the machine (208 on a two-socket box)
+// even when the cgroup hands out 25; a thread count taken from it oversubscribes eightfold for nothing.
+// The cgroup CPU quota in whole CPUs, 0 when unlimited or unknown. A container is commonly given a quota without
+// a cpuset, so the affinity mask still lists every CPU on the machine while only a fraction of their time is ours.
+static int qz_cgroup_cpu_quota(void) {
+#ifdef __linux__
+    if (FILE * f = fopen("/sys/fs/cgroup/cpu.max", "r")) {   // v2: "<quota|max> <period>"
+        char q[64] = {0};
+        long long period = 0;
+        const int n = fscanf(f, "%63s %lld", q, &period);
+        fclose(f);
+        if (n == 2 && strcmp(q, "max") != 0 && period > 0 && atoll(q) > 0) {
+            return (int) ((atoll(q) + period - 1) / period);
+        }
+        return 0;
+    }
+    long long quota = -1, period = 0;                        // v1
+    if (FILE * f = fopen("/sys/fs/cgroup/cpu/cpu.cfs_quota_us", "r")) {
+        if (fscanf(f, "%lld", &quota) != 1) { quota = -1; }
+        fclose(f);
+    }
+    if (FILE * f = fopen("/sys/fs/cgroup/cpu/cpu.cfs_period_us", "r")) {
+        if (fscanf(f, "%lld", &period) != 1) { period = 0; }
+        fclose(f);
+    }
+    if (quota > 0 && period > 0) {
+        return (int) ((quota + period - 1) / period);
+    }
+#endif
+    return 0;
+}
+
+static int qz_cpu_count(void) {
+    int c = 0;
+#ifdef __linux__
+    cpu_set_t set;
+    if (sched_getaffinity(0, sizeof(set), &set) == 0) {
+        c = CPU_COUNT(&set);
+    }
+#endif
+    if (c <= 0) {
+        const unsigned hw = std::thread::hardware_concurrency();
+        c = hw ? (int) hw : 1;
+    }
+    const int quota = qz_cgroup_cpu_quota();
+    return quota > 0 && quota < c ? quota : c;
+}
+
 extern "C" int ggml_quactlize_convert_threads(int64_t experts) {
     if (experts <= 0) {
         return 1;
@@ -391,9 +443,33 @@ extern "C" int ggml_quactlize_convert_threads(int64_t experts) {
             return (int) (n < experts ? n : experts);
         }
     }
-    const unsigned hw = std::thread::hardware_concurrency();
-    const int64_t  t  = hw ? (int64_t) hw : 1;
+    const int64_t t = qz_cpu_count();
     return (int) (t < experts ? t : experts);
+}
+
+// Run fn(first, last) over the expert axis on nthreads threads; returns the first non-zero result.
+template <typename F>
+static int qz_for_experts(int64_t experts, int nthreads, F fn) {
+    std::vector<int>         rcs((size_t) nthreads, 0);
+    std::vector<std::thread> workers;
+    workers.reserve((size_t) nthreads);
+    for (int t = 0; t < nthreads; ++t) {
+        const int64_t first = experts * t       / nthreads;
+        const int64_t last  = experts * (t + 1) / nthreads;
+        if (first >= last) {
+            continue;
+        }
+        workers.emplace_back([&, t, first, last]() { rcs[(size_t) t] = fn(first, last); });
+    }
+    for (auto & w : workers) {
+        w.join();
+    }
+    for (const int r : rcs) {
+        if (r != 0) {
+            return r;
+        }
+    }
+    return 0;
 }
 
 // One pass: convert (optionally split across the expert axis) and round-trip. Returns 0 when the recovered bytes
@@ -406,59 +482,96 @@ static int qz_convert_once(
         int64_t low_bytes, int64_t high_bytes, int64_t units_bytes, int nthreads) {
     unsigned char * high_arg = high_bytes ? high : nullptr;
 
-    int rc = 0;
     if (nthreads <= 1 || experts <= 1) {
-        rc = ggml_quactlize_prepare(qtype, blocks, low, high_arg, units, (int) n, (int) k, (int) experts, arr);
-    } else {
-        // Every plane has to divide evenly by expert or the slice arithmetic is meaningless.
-        if (nbytes % experts || low_bytes % experts || high_bytes % experts || units_bytes % experts) {
-            return -2;
+        const int rc = ggml_quactlize_prepare(qtype, blocks, low, high_arg, units, (int) n, (int) k, (int) experts, arr);
+        if (rc != 0) {
+            return rc;
         }
-        const int64_t blk_e   = nbytes      / experts;
-        const int64_t low_e   = low_bytes   / experts;
-        const int64_t high_e  = high_bytes  / experts;
-        const int64_t units_e = units_bytes / experts;
-
-        std::vector<int>         rcs((size_t) nthreads, 0);
-        std::vector<std::thread> workers;
-        workers.reserve((size_t) nthreads);
-
-        for (int t = 0; t < nthreads; ++t) {
-            const int64_t first = experts * t       / nthreads;
-            const int64_t last  = experts * (t + 1) / nthreads;
-            if (first >= last) {
-                continue;
-            }
-            workers.emplace_back([&, t, first, last]() {
-                rcs[(size_t) t] = ggml_quactlize_prepare(
-                    qtype,
-                    blocks + first*blk_e,
-                    low    + first*low_e,
-                    high_arg ? high + first*high_e : nullptr,
-                    units  + first*units_e,
-                    (int) n, (int) k, (int) (last - first), arr);
-            });
+        const int rrc = ggml_quactlize_recover(qtype, low, high_arg, units, recovered, (int) n, (int) k, (int) experts, arr);
+        if (rrc != 0) {
+            return rrc;
         }
-        for (auto & w : workers) {
-            w.join();
-        }
-        for (const int r : rcs) {
-            if (r != 0) {
-                rc = r;
-                break;
-            }
-        }
+        return memcmp(recovered, blocks, (size_t) nbytes) == 0 ? 0 : -1;
     }
+
+    // Every plane has to divide evenly by expert or the slice arithmetic is meaningless.
+    if (nbytes % experts || low_bytes % experts || high_bytes % experts || units_bytes % experts) {
+        return -2;
+    }
+    const int64_t blk_e   = nbytes      / experts;
+    const int64_t low_e   = low_bytes   / experts;
+    const int64_t high_e  = high_bytes  / experts;
+    const int64_t units_e = units_bytes / experts;
+
+    // Both directions are split, and the compare with them: the measured cost is prepare and recover in roughly
+    // equal parts, so threading one of them buys a factor of two and no more.
+    const int rc = qz_for_experts(experts, nthreads, [&](int64_t first, int64_t last) {
+        return ggml_quactlize_prepare(qtype, blocks + first*blk_e, low + first*low_e,
+                                      high_arg ? high + first*high_e : nullptr, units + first*units_e,
+                                      (int) n, (int) k, (int) (last - first), arr);
+    });
     if (rc != 0) {
         return rc;
     }
+    return qz_for_experts(experts, nthreads, [&](int64_t first, int64_t last) {
+        const int rrc = ggml_quactlize_recover(qtype, low + first*low_e, high_arg ? high + first*high_e : nullptr,
+                                               units + first*units_e, recovered + first*blk_e,
+                                               (int) n, (int) k, (int) (last - first), arr);
+        if (rrc != 0) {
+            return rrc;
+        }
+        return memcmp(recovered + first*blk_e, blocks + first*blk_e, (size_t) ((last - first) * blk_e)) == 0 ? 0 : -1;
+    });
+}
 
-    const int rrc = ggml_quactlize_recover(qtype, low, high_arg, units, recovered,
-                                           (int) n, (int) k, (int) experts, arr);
-    if (rrc != 0) {
-        return rrc;
+// Whether splitting the expert axis across threads is valid for this library -- proven ONCE per format, on a
+// synthetic tensor: a per-expert threaded prepare, then the library's OWN whole-tensor recover. Were the planes not
+// a per-expert concatenation, the whole-tensor inverse of a sliced forward pass could not reproduce the input.
+//
+// The proof has to be separate from the per-tensor round trip, because that round trip now slices recover the
+// same way it slices prepare (both halves cost the same, so threading one of them buys a factor of two and no
+// more) -- and a split that is wrong but self-consistent survives a sliced inverse. It is done on synthetic data
+// so that no model tensor ever pays a serial recover for it: one megabyte, once per library, milliseconds.
+//   0 = not yet tested, 1 = proven, -1 = rejected (that format converts serially from then on)
+static int g_split_state[QZ_NFMT];
+
+static bool qz_split_proven(int qtype, const quactlize_ppu_placed_arrangement_v2 * arr) {
+    int & st = g_split_state[qtype - QZ_QTYPE_MIN];
+    if (st != 0) {
+        return st > 0;
     }
-    return memcmp(recovered, blocks, (size_t) nbytes) == 0 ? 0 : -1;
+    const int64_t n = 256, k = 512, experts = 8;   // inside every format's domain: K % 512 == 0 covers Q3_K/Q6_K
+    int64_t low_b = 0, high_b = 0, units_b = 0;
+    const int64_t nbytes = (int64_t) ggml_row_size((enum ggml_type) qtype, k) * n * experts;
+    if (!ggml_quactlize_plane_sizes(qtype, n, k, experts, arr, &low_b, &high_b, &units_b) ||
+        low_b + high_b + units_b != nbytes) {
+        st = -1;
+        return false;
+    }
+    std::vector<unsigned char> blocks((size_t) nbytes), rec((size_t) nbytes);
+    std::vector<unsigned char> low((size_t) low_b), high((size_t) (high_b ? high_b : 1)), units((size_t) units_b);
+    unsigned int seed = 0x9e3779b9u;
+    for (auto & x : blocks) { seed = seed*1103515245u + 12345u; x = (unsigned char) (seed >> 16); }
+    unsigned char * high_arg = high_b ? high.data() : nullptr;
+
+    const int64_t blk_e = nbytes/experts, low_e = low_b/experts, high_e = high_b/experts, units_e = units_b/experts;
+    int rc = qz_for_experts(experts, 4, [&](int64_t first, int64_t last) {
+        return ggml_quactlize_prepare(qtype, blocks.data() + first*blk_e, low.data() + first*low_e,
+                                      high_arg ? high.data() + first*high_e : nullptr, units.data() + first*units_e,
+                                      (int) n, (int) k, (int) (last - first), arr);
+    });
+    if (rc == 0) {
+        rc = ggml_quactlize_recover(qtype, low.data(), high_arg, units.data(), rec.data(),
+                                    (int) n, (int) k, (int) experts, arr);
+    }
+    const bool ok = rc == 0 && memcmp(rec.data(), blocks.data(), (size_t) nbytes) == 0;
+    st = ok ? 1 : -1;
+    if (!ok) {
+        GGML_LOG_WARN("[quactlize] %s: a per-expert split of the conversion does not survive the library's own "
+                      "whole-tensor inverse (rc=%d) -- this format converts in one thread\n",
+                      ggml_type_name((enum ggml_type) qtype), rc);
+    }
+    return ok;
 }
 
 extern "C" int ggml_quactlize_convert_verified(
@@ -468,14 +581,17 @@ extern "C" int ggml_quactlize_convert_verified(
         const quactlize_ppu_placed_arrangement_v2 * arrangement,
         int64_t low_bytes, int64_t high_bytes, int64_t units_bytes,
         int * threads_used) {
-    // Learned once per process, not per tensor: paying a failed parallel attempt on every expert tensor of a model
-    // would cost more than the threading saves.
-    static bool split_by_expert_rejected = false;
-
-    int nthreads = split_by_expert_rejected ? 1 : ggml_quactlize_convert_threads(experts);
+    if (qtype < QZ_QTYPE_MIN || qtype >= QZ_QTYPE_MIN + QZ_NFMT || !arrangement) {
+        return -3;
+    }
+    int nthreads = ggml_quactlize_convert_threads(experts);
+    if (nthreads > 1 && !qz_split_proven(qtype, arrangement)) {
+        nthreads = 1;
+    }
     int rc = qz_convert_once(qtype, blocks, low, high, units, recovered, nbytes, n, k, experts, arrangement,
                              low_bytes, high_bytes, units_bytes, nthreads);
 
+    // Second layer, for a tensor that fails only when split: retry serially so the log can say which side it is.
     if (rc != 0 && nthreads > 1) {
         GGML_LOG_WARN("[quactlize] conversion split across %d threads did not round-trip (rc=%d) -- retrying in "
                       "one thread to tell a bad split from a bad library\n", nthreads, rc);
@@ -483,12 +599,11 @@ extern "C" int ggml_quactlize_convert_verified(
         rc = qz_convert_once(qtype, blocks, low, high, units, recovered, nbytes, n, k, experts, arrangement,
                              low_bytes, high_bytes, units_bytes, 1);
         if (rc == 0) {
-            split_by_expert_rejected = true;
-            GGML_LOG_WARN("[quactlize] the serial conversion round-trips, so this format's artifact is not a "
-                          "per-expert concatenation -- staying single-threaded for the rest of this load\n");
+            g_split_state[qtype - QZ_QTYPE_MIN] = -1;
+            GGML_LOG_WARN("[quactlize] the serial conversion round-trips: staying single-threaded for %s\n",
+                          ggml_type_name((enum ggml_type) qtype));
         }
     }
-
     if (threads_used) {
         *threads_used = nthreads;
     }
