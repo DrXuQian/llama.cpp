@@ -15,8 +15,10 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <chrono>
 #include <cstring>
 #include <string>
+#include <thread>
 #include <vector>
 #include <unistd.h>
 
@@ -189,6 +191,102 @@ static int run_convert(const qz_case & c) {
     return failures;
 }
 
+// How long the in-process conversion takes, on shapes a real model has. This is the one cost the K-pack path adds
+// to a model load -- everything else it does, the load was going to do anyway -- and the number that decides whether
+// the design is "nobody notices" or "everybody waits". Host-only, so it runs wherever the libraries load.
+//
+// Three timings per shape: prepare alone, recover + compare alone (mandatory: the handoff requires the byte-exact
+// round trip before an artifact is admitted), and the production entry ggml_quactlize_convert_verified in one
+// thread and in as many as the machine has. Reported in wall-clock ms and MiB/s of source bytes.
+struct qz_bench_shape {
+    int          qtype;
+    int64_t      n, k, experts;
+    const char * what;
+};
+
+static const qz_bench_shape g_bench[] = {
+    { GGML_TYPE_Q4_K,  512, 3072, 256, "MoE gate/up  (A3B-class)" },
+    { GGML_TYPE_Q4_K, 3072,  512, 256, "MoE down     (A3B-class)" },
+    { GGML_TYPE_Q6_K,  512, 3072, 256, "MoE gate/up, two planes 4+2" },
+    { GGML_TYPE_Q3_K,  512, 3072, 256, "MoE gate/up, two planes 2+1" },
+    { GGML_TYPE_Q4_K, 4096, 4096,   1, "dense attention-class" },
+};
+
+static double qz_ms_since(std::chrono::steady_clock::time_point t0) {
+    return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+}
+
+static int run_bench() {
+    const unsigned hw = std::thread::hardware_concurrency();
+    printf("threads available: %u\n\n", hw);
+    printf("%-30s %-5s %8s | %9s %9s | %9s %8s | %9s %8s | %6s\n",
+           "shape", "type", "MiB", "prep 1T", "recov 1T", "verif 1T", "MiB/s", "verif NT", "MiB/s", "x");
+
+    int failures = 0;
+    for (const auto & b : g_bench) {
+        quactlize_ppu_placed_arrangement_v2 a;
+        memset(&a, 0, sizeof(a));
+        if (!ggml_quactlize_arrangement_for(b.qtype, &a)) {
+            printf("%-30s %-5s  -- no arrangement, skipped\n", b.what, ggml_type_name((ggml_type) b.qtype));
+            continue;
+        }
+        const int64_t nbytes = (int64_t) ggml_row_size((ggml_type) b.qtype, b.k) * b.n * b.experts;
+        int64_t low_b = 0, high_b = 0, units_b = 0;
+        if (!ggml_quactlize_plane_sizes(b.qtype, b.n, b.k, b.experts, &a, &low_b, &high_b, &units_b) ||
+            low_b + high_b + units_b != nbytes) {
+            printf("%-30s %-5s  -- plane sizes unavailable, skipped\n", b.what, ggml_type_name((ggml_type) b.qtype));
+            failures++;
+            continue;
+        }
+
+        std::vector<unsigned char> blocks((size_t) nbytes), recovered((size_t) nbytes);
+        std::vector<unsigned char> low((size_t) low_b), high((size_t) (high_b ? high_b : 1)), units((size_t) units_b);
+        unsigned int seed = 777;
+        for (auto & x : blocks) { seed = seed*1103515245u + 12345u; x = (unsigned char) (seed >> 16); }
+        unsigned char * high_p = high_b ? high.data() : nullptr;
+
+        // prepare alone, one thread
+        auto t0 = std::chrono::steady_clock::now();
+        int rc = ggml_quactlize_prepare(b.qtype, blocks.data(), low.data(), high_p, units.data(),
+                                        (int) b.n, (int) b.k, (int) b.experts, &a);
+        const double prep_ms = qz_ms_since(t0);
+        if (rc != 0) { printf("%-30s prepare rc=%d\n", b.what, rc); failures++; continue; }
+
+        // recover + compare alone, one thread
+        t0 = std::chrono::steady_clock::now();
+        rc = ggml_quactlize_recover(b.qtype, low.data(), high_p, units.data(), recovered.data(),
+                                    (int) b.n, (int) b.k, (int) b.experts, &a);
+        const bool same = rc == 0 && memcmp(recovered.data(), blocks.data(), (size_t) nbytes) == 0;
+        const double recov_ms = qz_ms_since(t0);
+        if (!same) { printf("%-30s recover rc=%d same=%d\n", b.what, rc, (int) same); failures++; continue; }
+
+        // the production entry, one thread
+        int used = 0;
+        setenv("GGML_QUACTLIZE_CONVERT_THREADS", "1", 1);
+        t0 = std::chrono::steady_clock::now();
+        rc = ggml_quactlize_convert_verified(b.qtype, blocks.data(), low.data(), high_p, units.data(),
+                                             recovered.data(), nbytes, b.n, b.k, b.experts, &a,
+                                             low_b, high_b, units_b, &used);
+        const double v1_ms = qz_ms_since(t0);
+        if (rc != 0 || used != 1) { printf("%-30s verified(1T) rc=%d used=%d\n", b.what, rc, used); failures++; continue; }
+
+        // the production entry, all threads
+        unsetenv("GGML_QUACTLIZE_CONVERT_THREADS");
+        t0 = std::chrono::steady_clock::now();
+        rc = ggml_quactlize_convert_verified(b.qtype, blocks.data(), low.data(), high_p, units.data(),
+                                             recovered.data(), nbytes, b.n, b.k, b.experts, &a,
+                                             low_b, high_b, units_b, &used);
+        const double vn_ms = qz_ms_since(t0);
+        if (rc != 0) { printf("%-30s verified(NT) rc=%d\n", b.what, rc); failures++; continue; }
+
+        const double mib = nbytes / 1048576.0;
+        printf("%-30s %-5s %8.1f | %9.0f %9.0f | %9.0f %8.0f | %9.0f %8.0f | %5.1fx  (%d thr)\n",
+               b.what, ggml_type_name((ggml_type) b.qtype), mib, prep_ms, recov_ms,
+               v1_ms, mib / (v1_ms / 1000.0), vn_ms, mib / (vn_ms / 1000.0), v1_ms / vn_ms, used);
+    }
+    return failures == 0 ? 0 : 1;
+}
+
 static int run_one(const qz_case & c) {
     int failures = 0;
 
@@ -252,6 +350,10 @@ int main(int argc, char ** argv) {
         }
         fprintf(stderr, "unknown case '%s'\n", argv[2]);
         return 2;
+    }
+
+    if (argc >= 2 && strcmp(argv[1], "--bench") == 0) {
+        return run_bench();
     }
 
     if (argc >= 2 && strcmp(argv[1], "--real") == 0) {
