@@ -325,11 +325,14 @@ extern "C" bool ggml_quactlize_conversion_available(int qtype) {
     if (!ggml_quactlize_arrangement_for(qtype, &a)) {
         return false;
     }
-    // An exported symbol is not an answer. One 256-code superblock is the smallest shape every k-quant format is
-    // defined on, so a library that cannot size its own metadata plane for it cannot convert anything -- and it is
-    // far better to learn that here, where the tensor simply does not take the buffer type, than in set_tensor,
-    // where the model is already half loaded and the only honest move left is to abort.
-    return L->units_bytes(1, 256, qtype) >= 0;
+    // An exported symbol is not an answer: a library that cannot size its own metadata plane cannot convert
+    // anything, and it is far better to learn that here, where the tensor simply does not take the buffer type,
+    // than in set_tensor, where the model is half loaded and the only honest move left is to abort.
+    //
+    // The probe shape has to be inside EVERY format's domain. The library takes N and K in multiples of 256, and
+    // Q3_K/Q6_K want K in multiples of 512 (their unit packs two superblocks). (256, 512) satisfies all five;
+    // (1, 256) did not, and the first run against the real bundle said so for all five formats at once.
+    return L->units_bytes(256, 512, qtype) >= 0;
 }
 
 extern "C" int ggml_quactlize_prepare(

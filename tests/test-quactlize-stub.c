@@ -124,7 +124,11 @@ int64_t quactlize_ppu_units_bytes(int n, int k, int qtype) {
     int per_sb = 0;
     switch (qtype) { case 10: per_sb=20; break; case 11: per_sb=14; break; case 12: per_sb=16; break;
                      case 13: per_sb=16; break; case 14: per_sb=18; break; default: return -1; }
-    if (n <= 0 || k <= 0 || k % 256 != 0) return -1;
+    // The real library's domain, mirrored so the double refuses what the real one refuses: N and K in multiples
+    // of 256, and K in multiples of 512 for Q3_K/Q6_K. Learned from the first run against the real bundle, where
+    // a probe at N=1 and a shape at K=256 were both outside it and this stub had happily accepted them.
+    if (n <= 0 || k <= 0 || n % 256 != 0 || k % 256 != 0) return -1;
+    if ((qtype == 11 || qtype == 14) && k % 512 != 0) return -1;
     // QZ_STUB_BAD_UNITS: one superblock's worth of metadata too much. The descriptor still matches the registry,
     // so nothing upstream fires -- only the byte-neutrality identity can catch this, which is the point.
     return (int64_t) n * (k / 256) * per_sb + (env_on("QZ_STUB_BAD_UNITS") ? per_sb : 0);
