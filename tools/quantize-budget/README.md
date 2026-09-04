@@ -37,6 +37,24 @@ at equal size). Measuring it — HAWQ-style curvature, or per-layer KL probes �
 and compare perplexity and KL-to-f16 for both. The claim is only "at equal bytes, not worse than the hand-tuned
 mixture"; a planner that cannot clear that bar has no business allocating anything finer.
 
+## First measurement (Qwen2.5-0.5B-Instruct, wikitext-2, 40×512 tokens, imatrix from the same text)
+
+At exactly `Q4_K_M`'s weight bytes (463 MiB; on this model that mixture is mostly `q5_0`, because hidden=896 is
+not a multiple of 256 and every k-quant falls back):
+
+| | mean KL vs f16 | ΔPPL | max KL | probe objective (SSE) |
+|---|---:|---:|---:|---:|
+| llama.cpp `Q4_K_M` | **0.0271** | **+0.47** | 2.6 | 383.5 |
+| budget plan, raw SSE objective | 0.0710 | +0.99 | 9.6 | **145.4** |
+
+The plan is 2.6× better by its own metric and 2.6× worse by the one that matters. It spent bits where they are
+cheap (every `attn_q`/`attn_k` at `q8_0`) and took them from `ffn_down` (`q3_K`/`q2_K`) and the tied
+`token_embd`/`output` (`q5_1` against llama.cpp's `q8_0` output). That is the cross-category comparability problem
+in the flesh: a unit of output perturbation in `attn_q` (before a softmax) is not a unit of perturbation in
+`ffn_down` (straight into the residual stream) or in the LM head. `sensitivity.py` measures the exchange rate per
+category (quantize one category, read mean KL, divide by that configuration's SSE) and the planner uses it as the
+weights; that is the phase-2 step, and this result is why it is not optional.
+
 ## Roadmap
 
 1. per-tensor allocation under a budget (this) — dense and MoE alike, since an `_exps` tensor is one tensor

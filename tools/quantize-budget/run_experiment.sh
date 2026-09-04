@@ -17,7 +17,9 @@ REF_FTYPE=${REF_FTYPE:-Q4_K_M}
 THREADS=${THREADS:-8}
 CTX=${CTX:-512}
 CHUNKS=${CHUNKS:-40}
-TYPES=${TYPES:-Q2_K,Q3_K,Q4_K,Q5_K,Q6_K,Q8_0}
+# k-quants need ne0 % 256 == 0; the block-32 family is what llama-quantize falls back to otherwise, so it is
+# a first-class candidate set, not a fallback, for models whose hidden size is not a multiple of 256 (Qwen2.5-0.5B: 896).
+TYPES=${TYPES:-Q2_K,Q3_K,Q4_K,Q5_K,Q6_K,Q8_0,Q4_0,Q4_1,Q5_0,Q5_1,IQ4_NL}
 TOOL=$(dirname "$0")/quantize_budget.py
 mkdir -p "$OUT"
 
@@ -36,9 +38,13 @@ log "3. reference: llama-quantize $REF_FTYPE"
 REF_BYTES=$(stat -c %s "$OUT/ref.gguf")
 echo "reference: $REF_BYTES bytes ($(du -h "$OUT/ref.gguf" | cut -f1))"
 python3 "$TOOL" import-llama --probe "$OUT/probe.json" --log "$OUT/ref.log" -o "$OUT/ref-recipe.txt" | tee "$OUT/ref-plan.txt"
+# plan at the reference's WEIGHT bytes, not its file size: the GGUF metadata (tokenizer etc.) is identical in both
+# files and must not become extra budget for the plan
+REF_WEIGHT_BYTES=$(grep '^BYTES_TOTAL=' "$OUT/ref-plan.txt" | cut -d= -f2)
+echo "reference weight bytes: $REF_WEIGHT_BYTES (file: $REF_BYTES)"
 
 log "4. plan at the reference size, apply"
-python3 "$TOOL" plan --probe "$OUT/probe.json" --budget "$REF_BYTES" --types "$TYPES" -o "$OUT/recipe.txt" --report "$OUT/plan.json" | tee "$OUT/plan.txt"
+python3 "$TOOL" plan --probe "$OUT/probe.json" --budget "$REF_WEIGHT_BYTES" --types "$TYPES" -o "$OUT/recipe.txt" --report "$OUT/plan.json" | tee "$OUT/plan.txt"
 [ -f "$OUT/plan.gguf" ] || python3 "$TOOL" apply --model "$MODEL" --recipe "$OUT/recipe.txt" --imatrix "$OUT/imatrix.gguf" --out "$OUT/plan.gguf" --quantize-bin "$BIN/bin/llama-quantize" --threads "$THREADS" > "$OUT/apply.log" 2>&1
 echo "plan: $(stat -c %s "$OUT/plan.gguf") bytes ($(du -h "$OUT/plan.gguf" | cut -f1))"
 

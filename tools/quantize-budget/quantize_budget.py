@@ -78,6 +78,13 @@ class Tensor:
                       for c in rec["candidates"]]
 
 
+# bits per weight including scales, for sizing a type the probe did not evaluate (ggml block sizes)
+BPW = {"F32": 32.0, "F16": 16.0, "BF16": 16.0, "Q8_0": 8.5, "Q8_1": 9.0, "Q4_0": 4.5, "Q4_1": 5.0, "Q5_0": 5.5, "Q5_1": 6.0,
+       "Q2_K": 2.625, "Q3_K": 3.4375, "Q4_K": 4.5, "Q5_K": 5.5, "Q6_K": 6.5625, "Q8_K": 8.5,
+       "IQ4_NL": 4.5, "IQ4_XS": 4.25, "IQ3_S": 3.4375, "IQ3_XXS": 3.0625, "IQ2_S": 2.5, "IQ2_XS": 2.3125,
+       "IQ2_XXS": 2.0625, "IQ1_S": 1.5625, "IQ1_M": 1.75, "TQ1_0": 1.6875, "TQ2_0": 2.0625}
+
+
 def load_probe(path: str):
     with open(path) as f:
         p = json.load(f)
@@ -98,8 +105,12 @@ def objective_of(t: Tensor, cand, objective: str, weight: float) -> float:
     return weight * e
 
 
-def category_weights(spec: list) -> dict:
+def category_weights(spec: list, weights_json: str = None) -> dict:
+    """Per-category objective weights: from sensitivity.py's JSON first, then explicit --weight cat=w on top."""
     w = {}
+    if weights_json:
+        with open(weights_json) as f:
+            w.update({k: float(v) for k, v in json.load(f)["weights"].items()})
     for item in spec or []:
         k, v = item.split("=")
         w[k] = float(v)
@@ -253,12 +264,13 @@ def print_summary(s):
 
 
 def write_recipe(path, tensors, choice, header: dict):
+    # llama-quantize's --tensor-type-file parser takes every line as "pattern=type" -- no comments, no blank lines --
+    # so the recipe is exactly that and the provenance goes next to it in <path>.meta.json instead.
     with open(path, "w") as f:
-        f.write("# quantize-budget recipe: one anchored pattern per tensor, for llama-quantize --tensor-type-file\n")
-        for k, v in header.items():
-            f.write(f"# {k}: {v}\n")
         for t, c in zip(tensors, choice):
             f.write(f"^{re.escape(t.name)}$={c[0]}\n")
+    with open(path + ".meta.json", "w") as f:
+        json.dump(header, f, indent=1)
 
 
 def read_recipe(path):
@@ -279,27 +291,33 @@ def read_recipe(path):
 
 def cmd_plan(a):
     p, tensors = load_probe(a.probe)
-    weights = category_weights(a.weight)
+    weights = category_weights(a.weight, getattr(a, 'weights_json', None))
     keep = dict(item.split("=", 1) for item in (a.keep or []))
     types = [t.upper() for t in a.types.split(",")] if a.types else None
     filter_candidates(tensors, types, keep, {}, {})
     budget = parse_bytes(a.budget) - parse_bytes(a.reserve) - p["bytes_other"]
     if budget <= 0:
         sys.exit(f"budget leaves nothing for weights after reserve and {fmt_bytes(p['bytes_other'])} of unquantized tensors")
-    solver = solve_dp if a.solver == "dp" else solve_lagrangian
-    choice = solver(tensors, budget, a.objective, weights, parse_bytes(a.unit)) if a.solver == "dp" else solver(tensors, budget, a.objective, weights)
-    if choice is None:
+    # DP granularity: each candidate's size is rounded UP to a unit, so the rounding waste is at most one unit per
+    # tensor; keep that under ~0.3% of the budget instead of a fixed 256 KiB, which on a 470 MB model wasted 9%.
+    unit = parse_bytes(a.unit) if a.unit else max(4096, min(1 << 20, budget // 50000))
+    unit = max(4096, unit)
+    lag = solve_lagrangian(tensors, budget, a.objective, weights)
+    dp  = solve_dp(tensors, budget, a.objective, weights, unit) if a.solver == "dp" else None
+    if lag is None and dp is None:
         smallest = sum(min(c[1] for c in t.cands) for t in tensors)
         sys.exit(f"infeasible: even the smallest candidates need {fmt_bytes(smallest + p['bytes_other'])} > budget")
+    def score(ch):
+        return sum(objective_of(t, c, a.objective, weights.get(t.category, 1.0)) for t, c in zip(tensors, ch))
+    cands_ = [(score(ch), name, ch) for name, ch in (("dp", dp), ("lagrangian", lag)) if ch is not None]
+    cands_.sort(key=lambda x: x[0])
+    _, used, choice = cands_[0]
     s = summarize(tensors, choice, a.objective, weights, p["bytes_other"], parse_bytes(a.budget) - parse_bytes(a.reserve))
-    print(f"plan for {p['model']}  (solver {a.solver}, imatrix {'yes' if p['imatrix'] else 'NO'})")
+    print(f"plan for {p['model']}  (imatrix {'yes' if p['imatrix'] else 'NO'}; dp unit {fmt_bytes(unit)})")
     print_summary(s)
-    if a.solver == "dp" and a.cross_check:
-        alt = solve_lagrangian(tensors, budget, a.objective, weights)
-        if alt is not None:
-            s2 = summarize(tensors, alt, a.objective, weights, p["bytes_other"])
-            print(f"  cross-check: lagrangian objective {s2['error']:.6e} at {fmt_bytes(s2['bytes_total'])}"
-                  f"  (dp is {'better' if s['error'] <= s2['error'] else 'WORSE -- report this'})")
+    if len(cands_) == 2:
+        print(f"  solvers: dp {cands_[0][0] if cands_[0][1]=='dp' else cands_[1][0]:.6e}  lagrangian "
+              f"{cands_[0][0] if cands_[0][1]=='lagrangian' else cands_[1][0]:.6e}  -> using {used}")
     write_recipe(a.out, tensors, choice, {"model": p["model"], "budget": a.budget, "objective": a.objective,
                                             "bytes_total": s["bytes_total"], "bpw": f"{s['bpw']:.3f}"})
     if a.report:
@@ -312,7 +330,7 @@ def cmd_plan(a):
 
 def cmd_pareto(a):
     p, tensors = load_probe(a.probe)
-    weights = category_weights(a.weight)
+    weights = category_weights(a.weight, getattr(a, 'weights_json', None))
     types = [t.upper() for t in a.types.split(",")] if a.types else None
     filter_candidates(tensors, types, {}, {}, {})
     lo, hi = parse_bytes(a.frm), parse_bytes(a.to)
@@ -332,26 +350,51 @@ def cmd_import_llama(a):
     probe table, so llama.cpp's own mixture can be compared with a budget plan at the same size."""
     p, tensors = load_probe(a.probe)
     by_name = {t.name: t for t in tensors}
-    pat = re.compile(r"^\[\s*\d+/\s*\d+\]\s+(\S+)\s+-\s+\[.*?\],\s+type\s*=\s*(\w+),\s+(?:converting to|size\s*=)\s*(\w+)?")
-    choice, matched = {}, 0
+    # llama-quantize prints one line per tensor: "[ n/N] name - [shape], type = f16, converting to q5_0 .. size = ..."
+    # or "..., type = f16, size = ... MB" for a tensor it copies. When a shape fallback fires it prints its warning
+    # in the MIDDLE of that line, so the tail "converting to X .. size = ..." lands on a later line of its own.
+    choice, matched, pending = {}, 0, None
     with open(a.log) as f:
         for line in f:
-            m = re.search(r"^\[\s*\d+/\s*\d+\]\s+(\S+)\s+-.*?type\s*=\s*(\w+),\s*(?:converting to\s+(\w+)|size)", line)
-            if not m:
+            m = re.search(r"^\[\s*\d+/\s*\d+\]\s+(\S+)\s+-.*?type\s*=\s*(\w+),\s*(.*)$", line)
+            if m:
+                name, src, rest = m.group(1), m.group(2), m.group(3)
+                mc = re.search(r"converting to\s+(\w+)", rest)
+                if mc:
+                    dst = mc.group(1)
+                elif re.search(r"size\s*=", rest):
+                    dst = src
+                else:
+                    pending = (name, src); continue
+                if name in by_name:
+                    choice[name] = dst; matched += 1
                 continue
-            name, src, dst = m.group(1), m.group(2), m.group(3) or m.group(2)
-            if name in by_name:
-                choice[name] = dst; matched += 1
-    weights = category_weights(a.weight)
-    picked = []
+            if pending is not None:
+                mc = re.search(r"^converting to\s+(\w+)", line)
+                if mc:
+                    name, src = pending; pending = None
+                    if name in by_name:
+                        choice[name] = mc.group(1); matched += 1
+    weights = category_weights(a.weight, getattr(a, 'weights_json', None))
+    picked, unprobed = [], {}
     for t in tensors:
         typ = choice.get(t.name, t.src_type)
         c = next((c for c in t.cands if c[0].lower() == typ.lower()), None)
         if c is None:
-            c = (typ, 0, float("nan"), 0.0, float("nan"))
+            # llama-quantize chose a type the probe did not evaluate: size it from the block table, error unknown
+            bpw = BPW.get(typ.upper())
+            nbytes = int(t.n_elements * bpw / 8) if bpw else 0
+            c = (typ.upper(), nbytes, float("nan"), 0.0, float("nan"))
+            unprobed[typ.upper()] = unprobed.get(typ.upper(), 0) + 1
         picked.append(c)
     s = summarize(tensors, picked, a.objective, weights, p["bytes_other"])
     print(f"llama-quantize's plan from {a.log}: {matched}/{len(tensors)} tensors matched")
+    # machine-readable, for a driver that wants to plan at exactly this many weight bytes (the file on disk is
+    # bigger by its metadata, which a budget should not be charged for)
+    print(f"BYTES_TOTAL={s['bytes_total']}")
+    if unprobed:
+        print("  WARNING: types chosen by llama-quantize but absent from the probe (objective is nan): "
+              + ", ".join(f"{k}:{v}" for k, v in unprobed.items()) + " -- re-run the probe with them in --types")
     print_summary(s)
     if a.out:
         write_recipe(a.out, tensors, picked, {"source": a.log})
@@ -363,8 +406,10 @@ def cmd_apply(a):
     hist = {}
     for typ in recipe.values():
         hist[typ] = hist.get(typ, 0) + 1
-    base = a.ftype or max(hist.items(), key=lambda kv: kv[1])[0]
-    # llama-quantize's ftype names: Q4_K -> Q4_K_M etc. is not automatic; a pure type name is accepted for most.
+    # llama-quantize's positional ftype is matched case-sensitively against its table (Q8_0, Q4_K_M, ...); the
+    # recipe carries ggml's lowercase names, so the default base ftype is uppercased. Q4_K/Q5_K/Q3_K are aliases
+    # for their _M mixtures there, which is fine: every planned tensor is overridden by the recipe anyway.
+    base = (a.ftype or max(hist.items(), key=lambda kv: kv[1])[0]).upper()
     cmd = [binary]
     if a.imatrix:
         cmd += ["--imatrix", a.imatrix]
@@ -394,9 +439,10 @@ def main():
     s.add_argument("--types", help="comma-separated allowed types, e.g. Q2_K,Q3_K,Q4_K,Q5_K,Q6_K,Q8_0")
     s.add_argument("--keep", action="append", help="pin a category or name regex to a type: output=Q6_K")
     s.add_argument("--weight", action="append", help="category weight in the objective: ffn_down=2.0")
+    s.add_argument("--weights-json", help="weights measured by sensitivity.py (explicit --weight overrides)")
     s.add_argument("--objective", choices=["sse", "rel", "mse"], default="sse")
     s.add_argument("--solver", choices=["dp", "lagrangian"], default="dp")
-    s.add_argument("--unit", default="256K", help="dp granularity")
+    s.add_argument("--unit", default=None, help="dp granularity (default: budget/50000, clamped to [4K, 1M])")
     s.add_argument("--no-cross-check", dest="cross_check", action="store_false")
     s.add_argument("-o", "--out", default="recipe.txt")
     s.add_argument("--report")
@@ -409,6 +455,7 @@ def main():
     s.add_argument("--steps", type=int, default=9)
     s.add_argument("--types")
     s.add_argument("--weight", action="append")
+    s.add_argument("--weights-json")
     s.add_argument("--objective", choices=["sse", "rel", "mse"], default="sse")
     s.set_defaults(fn=cmd_pareto)
 
@@ -416,6 +463,7 @@ def main():
     s.add_argument("--probe", required=True)
     s.add_argument("--log", required=True)
     s.add_argument("--weight", action="append")
+    s.add_argument("--weights-json")
     s.add_argument("--objective", choices=["sse", "rel", "mse"], default="sse")
     s.add_argument("-o", "--out")
     s.set_defaults(fn=cmd_import_llama)
