@@ -5835,6 +5835,21 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     if (strcmp(name, "ggml_backend_split_buffer_type") == 0) {
         return (void *)ggml_backend_cuda_split_buffer_type;
     }
+#ifdef GGML_NCP_QUACTLIZE
+    // K-pack sidecar seams (quactlize-buft.cuh). Reached by name so libllama does not link this backend.
+    if (strcmp(name, "ggml_quactlize_tensor_is_kpack") == 0) {
+        return (void *) ggml_quactlize_tensor_is_kpack;
+    }
+    if (strcmp(name, "ggml_quactlize_plane_layout") == 0) {
+        return (void *) ggml_quactlize_plane_layout;
+    }
+    if (strcmp(name, "ggml_quactlize_set_planes") == 0) {
+        return (void *) ggml_quactlize_set_planes;
+    }
+    if (strcmp(name, "ggml_quactlize_set_sink") == 0) {
+        return (void *) ggml_quactlize_set_sink;
+    }
+#endif
     if (strcmp(name, "ggml_backend_register_host_buffer") == 0) {
         return (void *)ggml_backend_cuda_register_host_buffer;
     }

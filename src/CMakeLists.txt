@@ -31,6 +31,7 @@ add_library(llama
             llama-memory-recurrent.cpp
             llama-mmap.cpp
             llama-model-loader.cpp
+            llama-kpack-sidecar.cpp
             llama-model-saver.cpp
             llama-model.cpp
             llama-quant.cpp
@@ -49,6 +50,7 @@ set_target_properties(llama PROPERTIES
 )
 
 target_include_directories(llama PRIVATE .)
+target_include_directories(llama PRIVATE ../vendor)   # nlohmann json, for the K-pack sidecar manifest
 target_include_directories(llama PUBLIC ../include)
 target_compile_features   (llama PRIVATE cxx_std_17) # don't bump
 

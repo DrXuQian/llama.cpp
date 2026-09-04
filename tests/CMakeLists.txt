@@ -295,6 +295,25 @@ if (GGML_NCP_QUACTLIZE)
         ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_CURRENT_BINARY_DIR}/quactlize-stub:$ENV{LD_LIBRARY_PATH};QZ_STUB_DIR=${CMAKE_CURRENT_BINARY_DIR}/quactlize-stub")
 endif()
 
+    # The persistent K-pack sidecar (quactlize kquant-kpack.bundle v3): reader, writer, and their negatives. Host-only
+    # -- the file format does not need a device -- so the module is compiled in directly and only ggml-base is linked;
+    # the planes come from the stub libraries above. Set KPACK_PY (a python with quactlize importable) and
+    # KPACK_PY_REPO to also run quactlize's own load_kpack_bundle on what the writer produced.
+    find_package(Threads REQUIRED)
+    add_executable(test-kpack-sidecar test-kpack-sidecar.cpp ${PROJECT_SOURCE_DIR}/src/llama-kpack-sidecar.cpp ${QUACTLIZE_LOADER_TU})
+    target_compile_definitions(test-kpack-sidecar PRIVATE GGML_USE_PPU GGML_NCP_QUACTLIZE)
+    target_include_directories(test-kpack-sidecar PRIVATE
+        ${PROJECT_SOURCE_DIR}/src
+        ${PROJECT_SOURCE_DIR}/vendor
+        ${PROJECT_SOURCE_DIR}/ggml/include
+        ${PROJECT_SOURCE_DIR}/ggml/src
+        ${PROJECT_SOURCE_DIR}/ggml/src/ggml-cuda)
+    target_link_libraries(test-kpack-sidecar PRIVATE ggml-base ${CMAKE_DL_LIBS} Threads::Threads)
+    add_dependencies(test-kpack-sidecar ${QUACTLIZE_STUB_TARGETS})
+    add_test(NAME test-kpack-sidecar COMMAND $<TARGET_FILE:test-kpack-sidecar>)
+    set_tests_properties(test-kpack-sidecar PROPERTIES
+        ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_CURRENT_BINARY_DIR}/quactlize-stub:$ENV{LD_LIBRARY_PATH};QZ_STUB_DIR=${CMAKE_CURRENT_BINARY_DIR}/quactlize-stub")
+
 llama_build_and_test(test-model-load-cancel.cpp LABEL "model")
 llama_build_and_test(test-autorelease.cpp       LABEL "model")
 llama_build_and_test(test-backend-sampler.cpp   LABEL "model")
