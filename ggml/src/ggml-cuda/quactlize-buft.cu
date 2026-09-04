@@ -65,6 +65,82 @@ static enum ggml_status qz_buffer_init_tensor(ggml_backend_buffer_t buffer, ggml
     return GGML_STATUS_SUCCESS;
 }
 
+static ggml_quactlize_sink_t g_sink     = nullptr;
+static void *                g_sink_ctx = nullptr;
+
+void ggml_quactlize_set_sink(ggml_quactlize_sink_t sink, void * ctx) {
+    g_sink     = sink;
+    g_sink_ctx = ctx;
+}
+
+// Upload three host planes into the tensor's own allocation and register the artifact. Shared by the conversion
+// path and the sidecar path, so the two cannot drift in what "resident" means.
+static void qz_install_planes(qz_buffer_context * ctx, ggml_tensor * tensor, const ggml_quactlize_planes & p,
+                              int qtype, int64_t n, int64_t k, int64_t experts) {
+    uint8_t * dst = (uint8_t *) tensor->data;
+    ggml_cuda_set_device(ctx->device);
+    CUDA_CHECK(cudaMemcpy(dst,                                 p.low,   p.low_bytes,   cudaMemcpyHostToDevice));
+    if (p.high_bytes) {
+        CUDA_CHECK(cudaMemcpy(dst + p.low_bytes,               p.high,  p.high_bytes,  cudaMemcpyHostToDevice));
+    }
+    CUDA_CHECK(cudaMemcpy(dst + p.low_bytes + p.high_bytes,    p.units, p.units_bytes, cudaMemcpyHostToDevice));
+
+    ggml_quactlize_artifact art;
+    art.low         = dst;
+    art.high        = p.high_bytes ? dst + p.low_bytes : nullptr;
+    art.units       = dst + p.low_bytes + p.high_bytes;
+    art.arrangement = p.arrangement;
+    art.qtype       = qtype;
+    art.n           = n;
+    art.k           = k;
+    art.experts     = experts;
+    ctx->artifacts[tensor] = art;
+}
+
+bool ggml_quactlize_tensor_is_kpack(const ggml_tensor * tensor) {
+    return tensor && tensor->buffer && ggml_backend_buft_is_cuda_quactlize(tensor->buffer->buft);
+}
+
+bool ggml_quactlize_plane_layout(const ggml_tensor * tensor, size_t * low_bytes, size_t * high_bytes,
+                                 size_t * units_bytes, quactlize_ppu_placed_arrangement_v2 * arrangement) {
+    quactlize_ppu_placed_arrangement_v2 arr;
+    if (!tensor || !ggml_quactlize_arrangement_for((int) tensor->type, &arr)) {
+        return false;
+    }
+    qz_plane_sizes ps;
+    if (!qz_plane_sizes_for(tensor, arr, &ps)) {
+        return false;
+    }
+    if (low_bytes)   { *low_bytes   = (size_t) ps.low; }
+    if (high_bytes)  { *high_bytes  = (size_t) ps.high; }
+    if (units_bytes) { *units_bytes = (size_t) ps.units; }
+    if (arrangement) { *arrangement = arr; }
+    return true;
+}
+
+void ggml_quactlize_set_planes(ggml_tensor * tensor, const ggml_quactlize_planes * planes) {
+    GGML_ASSERT(planes != nullptr);
+    if (!ggml_quactlize_tensor_is_kpack(tensor)) {
+        GGML_ABORT("[quactlize] %s: set_planes on a tensor that is not in the K-pack buffer type", tensor->name);
+    }
+    size_t low = 0, high = 0, units = 0;
+    quactlize_ppu_placed_arrangement_v2 arr;
+    if (!ggml_quactlize_plane_layout(tensor, &low, &high, &units, &arr)) {
+        GGML_ABORT("[quactlize] %s: no K-pack layout for %s", tensor->name, ggml_type_name(tensor->type));
+    }
+    // Sizes and descriptor are the sidecar's claims; they are checked against the library's here because a
+    // manifest that lies about either would otherwise put bytes under a reader that describes different ones.
+    if (planes->low_bytes != low || planes->high_bytes != high || planes->units_bytes != units ||
+        memcmp(&planes->arrangement, &arr, sizeof(arr)) != 0) {
+        GGML_ABORT("[quactlize] %s: sidecar planes (%zu/%zu/%zu) or descriptor disagree with the library's layout "
+                   "(%zu/%zu/%zu)", tensor->name, planes->low_bytes, planes->high_bytes, planes->units_bytes,
+                   low, high, units);
+    }
+    qz_buffer_context * ctx = (qz_buffer_context *) tensor->buffer->context;
+    qz_install_planes(ctx, tensor, *planes, (int) tensor->type, tensor->ne[1], tensor->ne[0],
+                      tensor->ne[2] * tensor->ne[3]);
+}
+
 static void qz_buffer_set_tensor(
         ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     qz_buffer_context * ctx = (qz_buffer_context *) buffer->context;
@@ -124,25 +200,19 @@ static void qz_buffer_set_tensor(
                    "round-trip check)\n", tensor->name, size / 1048576.0, ms, threads_used,
                    ms > 0.0 ? size / 1048576.0 / (ms / 1000.0) : 0.0);
 
-    uint8_t * dst = (uint8_t *) tensor->data;
-    ggml_cuda_set_device(ctx->device);
-    CUDA_CHECK(cudaMemcpy(dst,                        low.data(),   (size_t) ps.low,   cudaMemcpyHostToDevice));
-    if (ps.high) {
-        CUDA_CHECK(cudaMemcpy(dst + ps.low,           high.data(),  (size_t) ps.high,  cudaMemcpyHostToDevice));
+    ggml_quactlize_planes planes;
+    planes.low         = low.data();     planes.low_bytes   = (size_t) ps.low;
+    planes.high        = ps.high ? high.data() : nullptr;
+    planes.high_bytes  = (size_t) ps.high;
+    planes.units       = units.data();   planes.units_bytes = (size_t) ps.units;
+    planes.arrangement = arr;
+
+    // A loader writing a sidecar gets the planes now, while they are still on the host.
+    if (g_sink) {
+        g_sink(g_sink_ctx, tensor, data, size, &planes);
     }
-    CUDA_CHECK(cudaMemcpy(dst + ps.low + ps.high,     units.data(), (size_t) ps.units, cudaMemcpyHostToDevice));
 
-    ggml_quactlize_artifact art;
-    art.low         = dst;
-    art.high        = ps.high ? dst + ps.low : nullptr;
-    art.units       = dst + ps.low + ps.high;
-    art.arrangement = arr;
-    art.qtype       = qtype;
-    art.n           = n;
-    art.k           = k;
-    art.experts     = experts;
-
-    ctx->artifacts[tensor] = art;
+    qz_install_planes(ctx, tensor, planes, qtype, n, k, experts);
 }
 
 static void qz_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value) {
