@@ -3,8 +3,10 @@
 #   1. an imatrix from calibration text
 #   2. the probe table
 #   3. llama-quantize's own Q4_K_M as the reference, and its size as the budget
-#   4. a budget plan at exactly that size, applied
-#   5. perplexity (and KL vs the f16 source) for both
+#   4. per-category sensitivity (quantize one category at a time, mean KL on the CALIBRATION text) -> weights
+#   5. a budget plan at exactly that size with those weights, applied
+#   6. perplexity and KL vs the f16 source for both, on EVAL -- which should be a text DISJOINT from CALIB, since the
+#      imatrix and the sensitivity weights are both fitted on CALIB
 # The claim under test: at equal bytes, the planned mixture is at least as good as llama.cpp's hand-tuned mixture.
 set -euo pipefail
 
@@ -43,16 +45,22 @@ python3 "$TOOL" import-llama --probe "$OUT/probe.json" --log "$OUT/ref.log" -o "
 REF_WEIGHT_BYTES=$(grep '^BYTES_TOTAL=' "$OUT/ref-plan.txt" | cut -d= -f2)
 echo "reference weight bytes: $REF_WEIGHT_BYTES (file: $REF_BYTES)"
 
-log "4. plan at the reference size, apply"
-python3 "$TOOL" plan --probe "$OUT/probe.json" --budget "$REF_WEIGHT_BYTES" --types "$TYPES" -o "$OUT/recipe.txt" --report "$OUT/plan.json" | tee "$OUT/plan.txt"
+log "4. sensitivity: KL per unit of probe error, per category (on the calibration text)"
+[ -f "$OUT/calib-f16.kld" ] || "$BIN/bin/llama-perplexity" -m "$MODEL" -f "$CALIB" -c "$CTX" --chunks "$CHUNKS" -t "$THREADS" --kl-divergence-base "$OUT/calib-f16.kld" > "$OUT/ppl-calib-f16.log" 2>&1
+[ -f "$OUT/weights.json" ] || python3 "$(dirname "$0")/sensitivity.py" --probe "$OUT/probe.json" --model "$MODEL" --imatrix "$OUT/imatrix.gguf" \
+    --f16-logits "$OUT/calib-f16.kld" --eval "$CALIB" --bin "$BIN" --types "${SENS_TYPES:-Q4_0}" --ctx "$CTX" --chunks "$CHUNKS" --threads "$THREADS" -o "$OUT/weights.json" | tee "$OUT/sensitivity.txt"
+
+log "5. plan at the reference size with the measured weights, apply"
+python3 "$TOOL" plan --probe "$OUT/probe.json" --budget "$REF_WEIGHT_BYTES" --types "$TYPES" --weights-json "$OUT/weights.json" -o "$OUT/recipe.txt" --report "$OUT/plan.json" | tee "$OUT/plan.txt"
 [ -f "$OUT/plan.gguf" ] || python3 "$TOOL" apply --model "$MODEL" --recipe "$OUT/recipe.txt" --imatrix "$OUT/imatrix.gguf" --out "$OUT/plan.gguf" --quantize-bin "$BIN/bin/llama-quantize" --threads "$THREADS" > "$OUT/apply.log" 2>&1
 echo "plan: $(stat -c %s "$OUT/plan.gguf") bytes ($(du -h "$OUT/plan.gguf" | cut -f1))"
 
-log "5. perplexity + KL vs f16"
+log "6. perplexity + KL vs f16, on EVAL ($EVAL)"
+[ "$EVAL" != "$CALIB" ] || echo "WARNING: EVAL is the calibration text; imatrix and sensitivity weights were fitted on it -- set EVAL to a disjoint text"
 [ -f "$OUT/f16.kld" ] || "$BIN/bin/llama-perplexity" -m "$MODEL" -f "$EVAL" -c "$CTX" --chunks "$CHUNKS" -t "$THREADS" --kl-divergence-base "$OUT/f16.kld" > "$OUT/ppl-f16.log" 2>&1
 for v in ref plan; do
   "$BIN/bin/llama-perplexity" -m "$OUT/$v.gguf" -f "$EVAL" -c "$CTX" --chunks "$CHUNKS" -t "$THREADS" --kl-divergence-base "$OUT/f16.kld" --kl-divergence > "$OUT/ppl-$v.log" 2>&1 || true
   echo "--- $v ($(stat -c %s "$OUT/$v.gguf") bytes)"
-  grep -E 'Mean PPL|Mean KLD|Maximum KLD|Same top p' "$OUT/ppl-$v.log" | head -6
+  grep -E 'Mean PPL\(Q\) |Mean PPL\(Q\)-PPL|Mean +KLD|Maximum KLD|99.9% +KLD' "$OUT/ppl-$v.log" | head -6
 done
 grep -E 'Final estimate|estimate' "$OUT/ppl-f16.log" | tail -1 | sed 's/^/f16: /'
