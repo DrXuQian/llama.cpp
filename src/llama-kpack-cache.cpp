@@ -182,6 +182,10 @@ llama_kpack_cache::~llama_kpack_cache() {
     }
 }
 
+bool llama_kpack_cache::has_cached_tensors() const {
+    return pimpl->reader && pimpl->reader->size() > 0;
+}
+
 bool llama_kpack_cache::load(ggml_tensor * tensor) {
     auto & I = *pimpl;
     if (!I.reader) { return false; }
