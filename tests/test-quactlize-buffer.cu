@@ -2,6 +2,7 @@
 #include "common.cuh"
 #include "quactlize-lib.h"
 #include <functional>
+#include <map>
 #include <set>
 
 static void require(bool ok) {
@@ -14,9 +15,13 @@ struct test_stream {
 };
 struct test_event { test_stream * stream = nullptr; size_t end = 0; };
 static std::set<void *> allocations, pinned;
+static std::map<const void *, size_t> upload_allocations;
+static std::set<const void *> uploads_pending;
 static bool allow_d2h = false;
 static bool plant_copy_wait = false;
+static bool plant_upload_wait = false, plant_upload_reuse = false, testing_upload = false;
 static int host_waits = 0, copies = 0, pack_calls = 0, stream_waits = 0;
+static int upload_submissions = 0;
 
 static test_stream * ts(cudaStream_t stream) { return (test_stream *) stream; }
 static test_event * te(cudaEvent_t event) { return (test_event *) event; }
@@ -32,6 +37,20 @@ static cudaError_t test_malloc(void ** out, size_t bytes) {
 }
 static cudaError_t test_free(void * ptr) {
     require(allocations.erase(ptr) == 1);
+    free(ptr);
+    return cudaSuccess;
+}
+static cudaError_t test_malloc_host(void ** out, size_t bytes) {
+    require(bytes == 8 * 1024 * 1024 && upload_allocations.size() < 2);
+    *out = malloc(bytes);
+    require(*out != nullptr);
+    upload_allocations[*out] = bytes;
+    pinned.insert(*out);
+    return cudaSuccess;
+}
+static cudaError_t test_free_host(void * ptr) {
+    require(uploads_pending.count(ptr) == 0 && upload_allocations.erase(ptr) == 1);
+    require(pinned.erase(ptr) == 1);
     free(ptr);
     return cudaSuccess;
 }
@@ -67,6 +86,7 @@ static cudaError_t test_event_record(cudaEvent_t event, cudaStream_t stream) {
 }
 static cudaError_t test_event_sync(cudaEvent_t event) {
     ++host_waits;
+    if (testing_upload && plant_upload_reuse) { return cudaSuccess; }
     drain(te(event)->stream, te(event)->end);
     return cudaSuccess;
 }
@@ -83,7 +103,14 @@ static cudaError_t test_wait(cudaStream_t stream, cudaEvent_t event, unsigned fl
     return cudaSuccess;
 }
 static cudaError_t test_copy(void * dst, const void * src, size_t bytes, cudaMemcpyKind kind, cudaStream_t stream) {
+    const bool staged_upload = kind == cudaMemcpyHostToDevice && upload_allocations.count(src);
+    if (staged_upload) {
+        require(bytes <= upload_allocations.at(src) && uploads_pending.insert(src).second);
+        require(uploads_pending.size() <= 2);
+        ++upload_submissions;
+    }
     ts(stream)->work.push_back([=]() {
+        if (staged_upload) { require(uploads_pending.erase(src) == 1); }
         if (kind == cudaMemcpyDeviceToHost) {
             if (!allow_d2h) fprintf(stderr, "D2H ran while compute must remain launchable\n");
             require(allow_d2h);
@@ -94,6 +121,10 @@ static cudaError_t test_copy(void * dst, const void * src, size_t bytes, cudaMem
         memcpy(dst, src, bytes);
     });
     if (kind == cudaMemcpyDeviceToHost && plant_copy_wait) {
+        drain(ts(stream), ts(stream)->work.size());
+    }
+    if (staged_upload && plant_upload_wait) {
+        ++host_waits;
         drain(ts(stream), ts(stream)->work.size());
     }
     return cudaSuccess;
@@ -131,6 +162,8 @@ static int test_prepare(int qtype, const uint8_t * raw, uint8_t * low, uint8_t *
 // helper and asynchronous copy function below are the actual implementation.
 #define cudaMalloc test_malloc
 #define cudaFree test_free
+#define cudaMallocHost test_malloc_host
+#define cudaFreeHost test_free_host
 #define cudaStreamCreateWithFlags test_stream_create
 #define cudaStreamDestroy test_stream_destroy
 #define cudaStreamSynchronize test_stream_sync
@@ -236,10 +269,73 @@ static void run_case(int qtype, int experts) {
     allow_d2h = false;
 }
 
+static void run_upload_case(int qtype, int experts, bool teardown_pending) {
+    ggml_init_params init = {1 << 20, nullptr, true};
+    ggml_context * gctx = ggml_init(init);
+    auto * first = ggml_new_tensor_3d(gctx, (ggml_type) qtype, 512, 256, experts);
+    auto * second = ggml_dup_tensor(gctx, first);
+    const size_t bytes = ggml_nbytes(first);
+    const size_t chunks = (bytes + qz_upload_chunk_bytes - 1) / qz_upload_chunk_bytes;
+    qz_buft_context buft_ctx = {0, "test-kpack-upload"};
+    ggml_backend_buffer_type buft = {qz_buft_interface, nullptr, &buft_ctx};
+    auto * buffer = qz_buft_alloc_buffer(&buft, bytes * 2);
+    require(buffer != nullptr);
+    first->buffer = second->buffer = buffer;
+    first->data = qz_buffer_get_base(buffer);
+    second->data = (uint8_t *) first->data + bytes;
+    memset(first->data, 0xa5, bytes * 2);
+    std::vector<uint8_t> expected(bytes);
+    for (size_t i = 0; i < bytes; ++i) { expected[i] = (i * 13 + qtype) % 251; }
+    ggml_quactlize_planes p{};
+    require(ggml_quactlize_plane_layout(first, &p.low_bytes, &p.high_bytes, &p.units_bytes, &p.arrangement));
+    std::vector<uint8_t> low(expected.begin(), expected.begin() + p.low_bytes);
+    std::vector<uint8_t> high(expected.begin() + p.low_bytes, expected.begin() + p.low_bytes + p.high_bytes);
+    std::vector<uint8_t> units(expected.end() - p.units_bytes, expected.end());
+    p.low = low.data(); p.high = p.high_bytes ? high.data() : nullptr; p.units = units.data();
+    const int before = host_waits, submitted = upload_submissions, packs = pack_calls;
+    testing_upload = true;
+    ggml_quactlize_set_planes(first, &p);
+    ggml_quactlize_set_planes(second, &p);
+    testing_upload = false;
+    // The final two chunks remain in flight even across tensor boundaries.
+    require(upload_submissions - submitted == (int) (2 * chunks));
+    require(host_waits - before == (int) (2 * chunks - 2));
+    require(uploads_pending.size() == 2 && upload_allocations.size() == 2 && pack_calls == packs);
+    memset(low.data(), 0xdf, low.size());
+    if (!high.empty()) { memset(high.data(), 0xdf, high.size()); }
+    memset(units.data(), 0xdf, units.size());
+    if (!teardown_pending) {
+        cudaStream_t compute;
+        CUDA_CHECK(cudaStreamCreateWithFlags(&compute, cudaStreamNonBlocking));
+        const int waits = host_waits;
+        for (auto * tensor : {first, second}) {
+            ggml_quactlize_artifact art{};
+            require(ggml_quactlize_artifact_for(tensor, &art));
+            ggml_quactlize_wait_ready(art, compute);
+            ts(compute)->work.push_back([&, tensor]() { require(memcmp(tensor->data, expected.data(), bytes) == 0); });
+        }
+        require(host_waits == waits);
+        CUDA_CHECK(cudaStreamSynchronize(compute));
+        CUDA_CHECK(cudaStreamDestroy(compute));
+        require(uploads_pending.empty());
+    }
+    ggml_backend_buffer_free(buffer);
+    require(uploads_pending.empty() && upload_allocations.empty() && allocations.empty() && pinned.empty());
+    ggml_free(gctx);
+}
+
 int main(int argc, char ** argv) {
     plant_copy_wait = argc == 2 && strcmp(argv[1], "--plant-copy-wait") == 0;
+    plant_upload_wait = argc == 2 && strcmp(argv[1], "--plant-upload-wait") == 0;
+    plant_upload_reuse = argc == 2 && strcmp(argv[1], "--plant-upload-reuse") == 0;
     for (int qtype = 10; qtype <= 14; ++qtype) run_case(qtype, 3);
     run_case(14, 1000);
+    for (int qtype = 10; qtype <= 14; ++qtype) {
+        run_upload_case(qtype, 1, false);
+        run_upload_case(qtype, 257, false);
+    }
+    run_upload_case(12, 257, true);
+    printf("KPACK_UPLOAD_HOST PASS formats=5 slots=2 slot_MiB=8 source_reuse=PASS tail_async=PASS teardown=PASS device_validation=0\n");
     printf("KPACK_BUFFER_HOST PASS formats=5 chunked_experts=1000 delayed_D2H_compute=PASS device_validation=0\n");
     return 0;
 }

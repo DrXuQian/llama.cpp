@@ -4,6 +4,7 @@
 
 #include "ggml-backend-impl.h"
 
+#include <array>
 #include <cinttypes>
 #include <cstdlib>
 #include <cstring>
@@ -44,6 +45,14 @@ static bool qz_plane_sizes_for(
 
 // ---- the buffer ----
 
+static constexpr size_t qz_upload_chunk_bytes = 8 * 1024 * 1024;
+
+struct qz_upload_slot {
+    uint8_t * host = nullptr;
+    cudaEvent_t reusable = nullptr;
+    bool pending = false;
+};
+
 struct qz_buffer_context {
     int    device;
     void * dev_ptr;
@@ -55,6 +64,8 @@ struct qz_buffer_context {
     uint8_t * scratch = nullptr;
     size_t scratch_bytes = 0;
     std::vector<void *> scratch_allocations;
+    std::array<qz_upload_slot, 2> upload_slots;
+    unsigned upload_slot = 0;
 };
 
 static void qz_init_streams(qz_buffer_context * ctx) {
@@ -88,6 +99,10 @@ static void qz_buffer_free_buffer(ggml_backend_buffer_t buffer) {
         for (void * scratch : ctx->scratch_allocations) {
             CUDA_CHECK(cudaFree(scratch));
         }
+        for (auto & slot : ctx->upload_slots) {
+            if (slot.reusable) { CUDA_CHECK(cudaEventDestroy(slot.reusable)); }
+            if (slot.host) { CUDA_CHECK(cudaFreeHost(slot.host)); }
+        }
         if (ctx->pack_stream) {
             CUDA_CHECK(cudaEventDestroy(ctx->upload_done));
             CUDA_CHECK(cudaStreamDestroy(ctx->pack_stream));
@@ -109,21 +124,49 @@ static enum ggml_status qz_buffer_init_tensor(ggml_backend_buffer_t buffer, ggml
     return GGML_STATUS_SUCCESS;
 }
 
-// Upload three host planes into the tensor's own allocation and register the artifact. Shared by the conversion
-// path and the sidecar path, so the two cannot drift in what "resident" means.
+// Fill one owned slot while the other uploads. The caller's pageable inputs are
+// consumed before return; only the reusable pinned slots remain in flight.
+static void qz_upload_planes(qz_buffer_context * ctx, uint8_t * dst, const ggml_quactlize_planes & p) {
+    if (!ctx->upload_slots[0].host) {
+        for (auto & slot : ctx->upload_slots) {
+            CUDA_CHECK(cudaMallocHost((void **) &slot.host, qz_upload_chunk_bytes));
+            CUDA_CHECK(cudaEventCreateWithFlags(&slot.reusable, cudaEventDisableTiming));
+        }
+        GGML_LOG_DEBUG("[quactlize] cache H2D pipeline: device=%d slots=2 slot_MiB=8 pinned_MiB=16\n", ctx->device);
+    }
+    const uint8_t * sources[] = {p.low, p.high, p.units};
+    const size_t sizes[] = {p.low_bytes, p.high_bytes, p.units_bytes};
+    const size_t total = p.low_bytes + p.high_bytes + p.units_bytes;
+    size_t plane = 0, plane_offset = 0;
+    for (size_t offset = 0; offset < total; ) {
+        auto & slot = ctx->upload_slots[ctx->upload_slot];
+        if (slot.pending) { CUDA_CHECK(cudaEventSynchronize(slot.reusable)); }
+        const size_t bytes = std::min(qz_upload_chunk_bytes, total - offset);
+        size_t copied = 0;
+        while (copied < bytes) {
+            if (plane_offset == sizes[plane]) { ++plane; plane_offset = 0; continue; }
+            const size_t part = std::min(bytes - copied, sizes[plane] - plane_offset);
+            memcpy(slot.host + copied, sources[plane] + plane_offset, part);
+            copied += part;
+            plane_offset += part;
+        }
+        CUDA_CHECK(cudaMemcpyAsync(dst + offset, slot.host, bytes, cudaMemcpyHostToDevice, ctx->pack_stream));
+        CUDA_CHECK(cudaEventRecord(slot.reusable, ctx->pack_stream));
+        slot.pending = true;
+        ctx->upload_slot ^= 1;
+        offset += bytes;
+    }
+}
+
+// Install cached host planes into the tensor's resident allocation. Ready is
+// recorded after all chunks and retained for both eager and graph consumers.
 static void qz_install_planes(qz_buffer_context * ctx, ggml_tensor * tensor, const ggml_quactlize_planes & p,
                               int qtype, int64_t n, int64_t k, int64_t experts) {
     uint8_t * dst = (uint8_t *) tensor->data;
     GGML_ASSERT(ctx->artifacts.count(tensor) == 0);
     ggml_cuda_set_device(ctx->device);
     qz_init_streams(ctx);
-    CUDA_CHECK(cudaMemcpyAsync(dst, p.low, p.low_bytes, cudaMemcpyHostToDevice, ctx->pack_stream));
-    if (p.high_bytes) {
-        CUDA_CHECK(cudaMemcpyAsync(dst + p.low_bytes, p.high, p.high_bytes,
-                                   cudaMemcpyHostToDevice, ctx->pack_stream));
-    }
-    CUDA_CHECK(cudaMemcpyAsync(dst + p.low_bytes + p.high_bytes, p.units, p.units_bytes,
-                               cudaMemcpyHostToDevice, ctx->pack_stream));
+    qz_upload_planes(ctx, dst, p);
 
     ggml_quactlize_artifact art;
     art.low         = dst;
@@ -135,8 +178,6 @@ static void qz_install_planes(qz_buffer_context * ctx, ggml_tensor * tensor, con
     art.k           = k;
     art.experts     = experts;
     art.ready       = qz_record_ready(ctx);
-    // set_planes borrows its CPU inputs only until return.
-    CUDA_CHECK(cudaEventSynchronize(art.ready));
     ctx->artifacts[tensor] = art;
 }
 
@@ -173,7 +214,8 @@ void ggml_quactlize_set_planes(ggml_tensor * tensor, const ggml_quactlize_planes
     }
     // Sizes and descriptor are the sidecar's claims; they are checked against the library's here because a
     // manifest that lies about either would otherwise put bytes under a reader that describes different ones.
-    if (planes->low_bytes != low || planes->high_bytes != high || planes->units_bytes != units ||
+    if (!planes->low || !planes->units || (high && !planes->high) ||
+        planes->low_bytes != low || planes->high_bytes != high || planes->units_bytes != units ||
         memcmp(&planes->arrangement, &arr, sizeof(arr)) != 0) {
         GGML_ABORT("[quactlize] %s: sidecar planes (%zu/%zu/%zu) or descriptor disagree with the library's layout "
                    "(%zu/%zu/%zu)", tensor->name, planes->low_bytes, planes->high_bytes, planes->units_bytes,
