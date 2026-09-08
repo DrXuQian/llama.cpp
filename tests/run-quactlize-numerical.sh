@@ -13,6 +13,7 @@ if [[ ${1:-} == --help ]]; then
         'Optional: EVAL_BATCHES="128 1" ASYS=<SDK asys executable>' \
         'Use --extended after the short numerical gate: 8x1024 tokens, cache/reference only.' \
         'Extended mode: short device proofs, untraced numerical checks, separate untraced ABBA timings.' \
+        'Use --performance-only to repeat only ABBA timings; EVAL_BATCHES may select one batch.' \
         'Requires an existing configured PPU build and a complete cache from the cache smoke.' \
         'Only llama-perplexity is incrementally built. No Quactlize library rebuild.' \
         'Default: two 256-token chunks per mode. All numerical admissions require review.'
@@ -23,8 +24,10 @@ set -Ee -o pipefail
 MODE=smoke
 if [[ ${1:-} == --extended && $# == 1 ]]; then
     MODE=extended
+elif [[ ${1:-} == --performance-only && $# == 1 ]]; then
+    MODE=performance
 elif [[ $# != 0 ]]; then
-    printf 'Usage: bash tests/run-quactlize-numerical.sh [--extended|--help]\n' >&2
+    printf 'Usage: bash tests/run-quactlize-numerical.sh [--extended|--performance-only|--help]\n' >&2
     exit 2
 fi
 stage=precheck
@@ -106,7 +109,7 @@ stage=corpus
 if [[ -n ${GSM8K_FILE:-} ]]; then
     mkdir "$RUN/corpus"
     CORPUS_RECORDS=32
-    if [[ $MODE == extended ]]; then CORPUS_RECORDS=256; fi
+    if [[ $MODE != smoke ]]; then CORPUS_RECORDS=256; fi
     sha256sum "$GSM8K_FILE" > "$RUN/results/corpus-source.sha256"
     python3 tests/quactlize_numerical.py gsm8k "$GSM8K_FILE" --limit "$CORPUS_RECORDS" > "$RUN/corpus/gsm8k.txt"
     EVAL_FILE="$RUN/corpus/gsm8k.txt"
@@ -144,8 +147,8 @@ run_phase() {
         -c "$context" -b "$batch" -ub "$batch" -t 16 -tb 32 --chunks "$chunks"
         --log-colors off -f "$EVAL_FILE")
     if [[ $phase == *-perf ]]; then
-        # Warmup resets the model timers. Suppress per-launch debug output.
-        ARGS+=(--verbosity 3)
+        # Library INFO callbacks map to TRACE (4); DEBUG (5) stays disabled.
+        ARGS+=(--verbosity 4)
     else
         # A device proof must cover evaluation, not a dummy model warmup.
         ARGS+=(--no-warmup -v)
@@ -219,10 +222,12 @@ for batch in "${BATCHES[@]}"; do
         done
         cmp "$RUN/results/b$batch-reference-tokens.json" "$RUN/results/b$batch-kpack-tokens.json"
     else
-        run_phase "$batch" cache-proof 256 2 "b$batch-cache-proof"
-        for phase in reference-save reference-self cache-reference; do
-            run_phase "$batch" "$phase" 1024 8 "b$batch-$phase"
-        done
+        if [[ $MODE == extended ]]; then
+            run_phase "$batch" cache-proof 256 2 "b$batch-cache-proof"
+            for phase in reference-save reference-self cache-reference; do
+                run_phase "$batch" "$phase" 1024 8 "b$batch-$phase"
+            done
+        fi
         # Model-only timers from separate processes: no profiler, logits file or debug trace.
         trial=0
         for arm in reference cache cache reference; do
@@ -262,6 +267,8 @@ if perf:
 PY
 if [[ $MODE == extended ]]; then
     printf 'KPACK_MODEL_EXTENDED COMPLETE short_kernel_proofs=PASS full_runs=UNTRACED accuracy=PENDING_REVIEW perf=PENDING_REVIEW\n'
+elif [[ $MODE == performance ]]; then
+    printf 'KPACK_MODEL_PERFORMANCE COMPLETE kernel_execution=NOT_COLLECTED accuracy=NOT_RUN perf=PENDING_REVIEW\n'
 else
     printf 'KPACK_MODEL_NUMERICAL COMPLETE kernel_execution=PASS accuracy=PENDING_REVIEW perf=NOT_MEASURED\n'
 fi | tee "$RUN/results/verdict.log"
