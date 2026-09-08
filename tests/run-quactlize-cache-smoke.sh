@@ -8,6 +8,8 @@ if [[ ${1:-} == --help ]]; then
     printf '%s\n' \
         'Required environment: MODEL, PPU_SDK, QUACTLIZE_PPU_BUNDLE, QUACTLIZE_PPU_PACK_LIBRARY' \
         'Optional: BUILD_DIR=build-ppu RESULT_ROOT=/workspace JOBS=192 CUDA_VISIBLE_DEVICES=0' \
+        'Optional numerical comparison: EVAL_FILE=<text corpus, at least 512 tokens>' \
+        'EVAL_BATCH=128 for prefill or 1 for teacher-forced decode; results require review.' \
         'Run with bash from the llama.cpp checkout. Existing build artifacts are reused.'
     exit 0
 fi
@@ -47,6 +49,9 @@ BUILD_DIR=${BUILD_DIR:-build-ppu}
 RESULT_ROOT=${RESULT_ROOT:-/workspace}
 JOBS=${JOBS:-192}
 [[ $JOBS =~ ^[1-9][0-9]*$ ]]
+EVAL_BATCH=${EVAL_BATCH:-128}
+[[ $EVAL_BATCH == 128 || $EVAL_BATCH == 1 ]]
+if [[ -n ${EVAL_FILE:-} ]]; then [[ -r $EVAL_FILE && -s $EVAL_FILE ]]; fi
 [[ -d $RESULT_ROOT ]]
 [[ -f ggml/src/ggml-cuda/quactlize-buft.cu ]]
 git diff --quiet
@@ -101,7 +106,9 @@ cmake -S . -B "$BUILD_DIR" \
     -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_OPENSSL=OFF \
     2>&1 | tee "$RUN/results/configure.log"
 stage=build
-cmake --build "$BUILD_DIR" --target test-quactlize-ready llama-completion -j "$JOBS" \
+TARGETS=(test-quactlize-ready llama-completion)
+if [[ -n ${EVAL_FILE:-} ]]; then TARGETS+=(llama-perplexity); fi
+cmake --build "$BUILD_DIR" --target "${TARGETS[@]}" -j "$JOBS" \
     2>&1 | tee "$RUN/results/build.log"
 
 stage=readiness
@@ -128,11 +135,69 @@ stage=check-cache
 [[ -s $RUN/cache/manifest.json ]]
 grep -q 'GPU pack queued' "$RUN/results/cold.log"
 grep -q 'background write started:' "$RUN/results/cold.log"
+grep -q 'slots_per_device=2 content_checks=disabled' "$RUN/results/cold.log"
+grep -q 'published: total_seconds=' "$RUN/results/cold.log"
+grep -q 'ready: tensors=.* content_checks=disabled' "$RUN/results/hit.log"
 grep -qE 'cache_uploads=[1-9][0-9]* resident_misses=0' "$RUN/results/hit.log"
 if grep -q 'GPU pack queued' "$RUN/results/hit.log"; then
     printf 'FAIL: cache-hit run repacked weights\n' >&2
     false
 fi
 cp "$RUN/cache/manifest.json" "$RUN/results/cache-manifest.json"
+for phase in baseline cold hit; do
+    {
+        printf '\nKPACK_TIMING phase=%s\n' "$phase"
+        grep -E 'Elapsed \(wall clock\)|User time|System time' "$RUN/results/$phase.time"
+        grep -E 'llama_perf_context_print:|\[kpack-cache\]' "$RUN/results/$phase.log"
+    } >> "$RUN/results/timing-summary.log"
+done
+
+if [[ -n ${EVAL_FILE:-} ]]; then
+    # Use the existing GPU reference route, not a CPU model or CPU packer.
+    # No-cache vs cache isolates persistence; ordinary weights vs K-pack measures
+    # the compute-route difference. PPL/KLD are diagnostics, not an automatic
+    # numerical admission threshold. Log-probability payloads stay on the box.
+    EVAL_ARGS=(-m "$MODEL" -ngl 99 --split-mode none --fit off
+        -c 256 -b "$EVAL_BATCH" -ub "$EVAL_BATCH" -t 16 -tb 32
+        --chunks 2 --color off -f "$EVAL_FILE" -v)
+    for phase in kpack-eval cache-eval reference-eval kpack-reference-eval; do
+        stage=$phase
+        case "$phase" in
+            kpack-eval) EXTRA=(-ot 'ffn_.*_exps=CUDA0_KPACK' --save-all-logits "$RUN/kpack.logprobs");;
+            cache-eval) EXTRA=(-ot 'ffn_.*_exps=CUDA0_KPACK' --kpack-cache "$RUN/cache"
+                --kl-divergence --kl-divergence-base "$RUN/kpack.logprobs");;
+            reference-eval) EXTRA=(-ot 'ffn_.*_exps=CUDA0' --save-all-logits "$RUN/reference.logprobs");;
+            kpack-reference-eval) EXTRA=(-ot 'ffn_.*_exps=CUDA0_KPACK' --kpack-cache "$RUN/cache"
+                --kl-divergence --kl-divergence-base "$RUN/reference.logprobs");;
+        esac
+        printf '\nKPACK_NUMERICAL_RUN phase=%s batch=%s\n' "$phase" "$EVAL_BATCH"
+        /usr/bin/time -v -o "$RUN/results/$phase.time" \
+            "$BUILD_DIR/bin/llama-perplexity" "${EVAL_ARGS[@]}" "${EXTRA[@]}" </dev/null \
+            2>&1 | tee "$RUN/results/$phase.log"
+        if [[ $phase == reference-eval ]]; then
+            if grep -q 'so-quactlize-kpack' "$RUN/results/$phase.log"; then false; fi
+        else
+            grep -q 'so-quactlize-kpack' "$RUN/results/$phase.log"
+        fi
+        if [[ $phase == cache-eval || $phase == kpack-reference-eval ]]; then
+            grep -q 'Mean    KLD:' "$RUN/results/$phase.log"
+            grep -qE 'cache_uploads=[1-9][0-9]* resident_misses=0' "$RUN/results/$phase.log"
+            if grep -q 'GPU pack queued' "$RUN/results/$phase.log"; then false; fi
+        else
+            grep -q 'Final estimate: PPL = ' "$RUN/results/$phase.log"
+        fi
+        if grep -qiE '(Final estimate: PPL =|Mean +KLD:|Maximum KLD:|Mean PPL\(Q\)/PPL\(base\)).*(nan|inf)' "$RUN/results/$phase.log"; then
+            printf 'FAIL: nonfinite numerical metric\n' >&2
+            false
+        fi
+        {
+            printf '\nKPACK_NUMERICAL phase=%s batch=%s\n' "$phase" "$EVAL_BATCH"
+            grep -E 'Final estimate:|Mean PPL|KLD:|Same top|llama_perf_context_print:' "$RUN/results/$phase.log"
+        } >> "$RUN/results/numerical-summary.log"
+    done
+    printf 'KPACK_NUMERICAL_COMPARISON COMPLETE admission=PENDING_REVIEW\n' | tee -a "$RUN/results/numerical-summary.log"
+else
+    printf 'KPACK_NUMERICAL_COMPARISON NOT_RUN reason=EVAL_FILE_NOT_SET\n' > "$RUN/results/numerical-summary.log"
+fi
 stage=done
 printf 'KPACK_MODEL_CACHE_SMOKE PASS\n' | tee "$RUN/results/verdict.log"

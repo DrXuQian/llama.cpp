@@ -315,9 +315,9 @@ extern "C" {
         // override key-value pairs of the model meta data
         const struct llama_model_kv_override * kv_overrides;
 
-        // Optional K-pack sidecar directory for a single GGUF. Verified cache
-        // hits skip repacking; misses write asynchronously after model loading.
-        // The source file must stay unchanged until the cache is published.
+        // Optional local K-pack cache for a single GGUF. Hits trust cached bytes
+        // without content checksums; misses write asynchronously after loading.
+        // Keep the source unchanged while loading/writing and when reusing it.
         const char * kpack_cache_path;
 
         // Keep the booleans together to avoid misalignment during copy-by-value.

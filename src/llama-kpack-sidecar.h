@@ -1,21 +1,11 @@
 #pragma once
 
-// Persistent K-pack sidecar: quactlize's "kquant-kpack.bundle" schema v3, read and written from llama.cpp.
-//
-// WHAT IT IS. One directory next to the model -- manifest.json + weights.bin -- holding, for every k-quant tensor
-// that lives in the K-pack buffer type, the three resident planes (low / high / units) exactly as the kernels read
-// them, plus enough identity to prove they were built from THIS GGUF: the source file's size and whole-file SHA-256,
-// each source tensor's byte range and digest, and each plane's digest. The format, every field, every check and the
-// alignment rule are quactlize's (quactlize/pack_gguf.py is the authority and its load_kpack_bundle is the oracle a
-// bundle written here has to pass); nothing about the layout is decided in this file.
-//
-// The GPU producer creates the planes once. Later loads verify and upload the
-// persisted bytes without repeating conversion; source identity is not an mtime-only check.
-//
-// TWO ROLES, ONE FORMAT. The reader validates a bundle and hands planes to the buffer type; the writer captures the
-// planes set_tensor just produced and publishes a bundle atomically (never over an existing one). Both are host-only
-// and know nothing about devices; llama-model-loader wires them to the K-pack buffer type through the backend's
-// proc-address seams.
+// Persistent K-pack planes in manifest.json + weights.bin, published atomically.
+// Verified offline bundles retain quactlize.kquant-kpack.bundle v3 and its hashes.
+// Runtime caches use llama.kpack-cache v1: the same plane layout, but NO content
+// hashes. They bind to local source stat identity and tensor metadata instead.
+// Runtime loading trusts payload bytes; corruption is not detected. Neither
+// writing nor loading a runtime cache reads raw GGUF payloads to validate them.
 
 #include "ggml.h"
 
@@ -59,7 +49,7 @@ struct llama_kpack_sidecar_record {
     int64_t     n = 0, k = 0, experts = 0;
     uint64_t    region_offset = 0, region_size = 0;
     struct span { uint64_t offset = 0, size = 0; std::vector<int64_t> shape; std::string sha256; } low, high, units;
-    llama_kpack_planes planes;          // pointers resolve into the mapped weights.bin once verified
+    llama_kpack_planes planes;          // resolved after verification or explicit unchecked loading
 };
 
 class llama_kpack_sidecar_reader {
@@ -67,9 +57,13 @@ public:
     llama_kpack_sidecar_reader();
     ~llama_kpack_sidecar_reader();
 
-    // Parse and structurally validate manifest.json (exact field sets, canonical shapes, ordered contiguous
-    // regions, binding digests) and map weights.bin. Nothing is trusted yet: call verify_source and verify_storage.
+    // Parse metadata, validate sizes/layout/bounds, and map weights.bin.
     bool open(const std::string & dir, std::string & error);
+
+    // Runtime path: check source metadata, then expose mapped planes WITHOUT
+    // hashing source or storage. Accepts both offline bundles and local caches.
+    bool load_unchecked(const std::string & gguf_path, const std::vector<llama_kpack_source_tensor> & inventory,
+                        std::string & error);
 
     // Prove the bundle is about THIS GGUF: size and whole-file SHA-256 match manifest.source, every recorded
     // tensor exists in `inventory` with the same index / offset / size / type / shape, and every source byte range
@@ -86,6 +80,8 @@ public:
     const std::string & dir() const { return root; }
 
 private:
+    bool check_source_metadata(const std::vector<llama_kpack_source_tensor> & inventory, std::string & error);
+    void resolve_planes();
     struct impl;
     std::unique_ptr<impl> pimpl;
     std::string root;
@@ -97,14 +93,14 @@ private:
 
 class llama_kpack_sidecar_writer {
 public:
-    llama_kpack_sidecar_writer();
+    explicit llama_kpack_sidecar_writer(bool local_cache = false);
     ~llama_kpack_sidecar_writer();
 
     // Create the staging directory `<dir>.partial.<pid>` and open its weights.bin. `dir` itself must not exist.
     bool begin(const std::string & dir, std::string & error);
 
-    // Capture file identity, not loader-owned data. Source hashes are filled at
-    // publication, separately from copying the packed planes.
+    // Capture file identity, not loader-owned data. Only verified offline bundles
+    // hash source data at publication; runtime caches never read it.
     bool bind_source(const std::string & path, std::string & error, int loader_fd = -1);
 
     // Append one tensor's planes as the next region. Records MUST arrive in increasing gguf_index order with
@@ -126,8 +122,8 @@ public:
     void skip(const std::string & name, const std::string & type_name, const std::string & reason);
 
     // Write manifest.json, fsync everything, and publish the staging directory to `dir` with a no-replace rename.
-    // model_label is what the manifest calls the model (the GGUF path); gguf_path is hashed whole for
-    // manifest.source. On any failure the staging directory is removed and nothing is published.
+    // Only offline bundles hash gguf_path; local caches inspect its stat identity.
+    // On any failure the staging directory is removed and nothing is published.
     bool finish(const std::string & model_label, const std::string & gguf_path, std::string & error,
                 const cancelled & cancel = {});
 
