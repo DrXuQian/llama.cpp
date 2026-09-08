@@ -51,7 +51,11 @@ bool ggml_quactlize_artifact_for(const ggml_tensor * tensor, ggml_quactlize_arti
 inline void ggml_quactlize_wait_ready(const ggml_quactlize_artifact & art, cudaStream_t stream) {
     // Recorded once by the pack/upload stream, outside any inference capture.
     // Retained with the weights for all graph replays; no dependency on backcopy.
-    CUDA_CHECK(cudaStreamWaitEvent(stream, art.ready, cudaEventWaitExternal));
+    cudaStreamCaptureStatus status;
+    CUDA_CHECK(cudaStreamIsCapturing(stream, &status));
+    // PPU rejects the external flag outside capture, including eager warmup.
+    const unsigned int flags = status == cudaStreamCaptureStatusNone ? 0 : cudaEventWaitExternal;
+    CUDA_CHECK(cudaStreamWaitEvent(stream, art.ready, flags));
 }
 #endif
 
