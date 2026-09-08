@@ -9,11 +9,8 @@
 // alignment rule are quactlize's (quactlize/pack_gguf.py is the authority and its load_kpack_bundle is the oracle a
 // bundle written here has to pass); nothing about the layout is decided in this file.
 //
-// WHY. In-process conversion permutes every k-quant byte on the host at load, and the library's producer runs at
-// 25-35 MB/s per core -- minutes for a large model even with every core busy. The planes are a pure function of the
-// source bytes, so converting once and keeping the result is the same artifact without the work; what a later load
-// pays instead is verification, and the schema makes that verification a byte-exact one rather than a trust in a
-// path or an mtime.
+// The GPU producer creates the planes once. Later loads verify and upload the
+// persisted bytes without repeating conversion; source identity is not an mtime-only check.
 //
 // TWO ROLES, ONE FORMAT. The reader validates a bundle and hands planes to the buffer type; the writer captures the
 // planes set_tensor just produced and publishes a bundle atomically (never over an existing one). Both are host-only
@@ -24,6 +21,7 @@
 
 #include <cstdint>
 #include <cstddef>
+#include <functional>
 #include <map>
 #include <memory>
 #include <string>
@@ -105,11 +103,24 @@ public:
     // Create the staging directory `<dir>.partial.<pid>` and open its weights.bin. `dir` itself must not exist.
     bool begin(const std::string & dir, std::string & error);
 
+    // Capture file identity, not loader-owned data. Source hashes are filled at
+    // publication, separately from copying the packed planes.
+    bool bind_source(const std::string & path, std::string & error, int loader_fd = -1);
+
     // Append one tensor's planes as the next region. Records MUST arrive in increasing gguf_index order with
-    // disjoint, ascending byte ranges -- the schema requires it and the reader rejects anything else -- so the
-    // loader iterates K-pack tensors in file order while a writer is active. source_data is hashed here.
+    // disjoint, ascending byte ranges. The background writer sorts its jobs;
+    // synchronous callers must supply this order themselves. source_data is hashed here.
     bool add(const llama_kpack_source_tensor & src, const void * source_data, const llama_kpack_planes & planes,
              std::string & error);
+
+    using read_chunk = std::function<const uint8_t *(size_t offset, size_t bytes, std::string & error)>;
+    using cancelled = std::function<bool()>;
+
+    // Worker-only streaming append. Offsets address contiguous [low][high][units],
+    // not the padded file region. The returned span lives until the next read.
+    // No full-tensor host allocation or raw GGUF access in this operation.
+    bool add_stream(const llama_kpack_source_tensor & src, const llama_kpack_planes & planes,
+                    const read_chunk & read, size_t chunk_bytes, const cancelled & cancel, std::string & error);
 
     // Record a tensor that was NOT packed and why. The schema wants the full inventory of what was left out.
     void skip(const std::string & name, const std::string & type_name, const std::string & reason);
@@ -117,12 +128,41 @@ public:
     // Write manifest.json, fsync everything, and publish the staging directory to `dir` with a no-replace rename.
     // model_label is what the manifest calls the model (the GGUF path); gguf_path is hashed whole for
     // manifest.source. On any failure the staging directory is removed and nothing is published.
-    bool finish(const std::string & model_label, const std::string & gguf_path, std::string & error);
+    bool finish(const std::string & model_label, const std::string & gguf_path, std::string & error,
+                const cancelled & cancel = {});
 
     // Abandon: remove the staging directory.
     void abort();
 
     size_t packed() const;
+
+private:
+    bool add_record(const llama_kpack_source_tensor & src, const std::string & source_sha,
+                    const llama_kpack_planes & planes, const read_chunk & read, size_t chunk_bytes,
+                    const cancelled & cancel, std::string & error);
+    struct impl;
+    std::unique_ptr<impl> pimpl;
+};
+
+struct llama_kpack_write_job {
+    llama_kpack_source_tensor source;
+    llama_kpack_planes planes;
+    llama_kpack_sidecar_writer::read_chunk read;
+};
+
+// One bounded streaming writer per model. start() only transfers metadata and
+// starts the worker. Device weights and read callback resources must outlive wait()
+// or cancel(). Neither operation belongs in the compute submission path.
+class llama_kpack_background_writer {
+public:
+    llama_kpack_background_writer();
+    ~llama_kpack_background_writer();
+    bool prepare(const std::string & dir, const std::string & source_path, std::string & error, int loader_fd = -1);
+    bool start(std::vector<llama_kpack_write_job> jobs,
+               const std::vector<llama_kpack_source_tensor> & inventory,
+               size_t chunk_bytes, std::string & error);
+    bool wait(std::string & error);
+    void cancel();
 
 private:
     struct impl;

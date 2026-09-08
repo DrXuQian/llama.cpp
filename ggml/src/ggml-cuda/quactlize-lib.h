@@ -27,6 +27,7 @@
 // Inert unless built with -DGGML_NCP_QUACTLIZE=ON: every entry below then reports unavailable and returns a decline.
 
 #include "quactlize/quactlize_ppu_device.h"   // brings quactlize_ppu_config.h: the arrangement and config structs
+#include "quactlize/quactlize_ppu_pack.h"
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -114,6 +115,15 @@ bool ggml_quactlize_arrangement_for(int qtype, quactlize_ppu_placed_arrangement_
 
 // Can this build turn GGUF blocks into resident planes in process? True from bundle 2826cf1 on.
 bool ggml_quactlize_conversion_available(int qtype);
+
+// Independent GPU producer. Missing/incompatible libraries decline without CPU fallback.
+bool ggml_quactlize_device_pack_available(int qtype);
+int ggml_quactlize_device_pack_sizes(
+    int qtype, int n, int k, int experts,
+    const quactlize_ppu_placed_arrangement_v2 * arrangement, quactlize_ppu_kpack_sizes_v1 * sizes);
+int ggml_quactlize_prepare_device(
+    int qtype, const uint8_t * blocks, uint8_t * low, uint8_t * high, uint8_t * units,
+    int n, int k, int experts, const quactlize_ppu_placed_arrangement_v2 * arrangement, void * stream);
 
 // blocks is the raw GGUF byte image of the whole tensor (experts * n * k/256 records); low/high/units are host
 // buffers of the sizes documented in quactlize_ppu_packed.h. 0 on success.

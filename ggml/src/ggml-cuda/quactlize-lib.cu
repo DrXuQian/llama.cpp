@@ -74,6 +74,36 @@ struct qz_lib {
 
 static qz_lib g_libs[QZ_NFMT];
 
+static struct {
+    void * handle;
+    decltype(&quactlize_ppu_kpack_sizes_for_arrangement_v1) sizes;
+    decltype(&quactlize_ppu_prepare_fully_quantized_dev_for_arrangement_v2) prepare;
+} g_pack = {};
+
+static void qz_load_pack(void) {
+    std::string path = "libquactlize_ppu_pack.so";
+    const char * override_path = getenv("QUACTLIZE_PPU_PACK_LIBRARY");
+    const char * bundle = getenv("QUACTLIZE_PPU_BUNDLE");
+    if (override_path && *override_path) {
+        path = override_path;
+    } else if (bundle && *bundle) {
+        path = std::string(bundle) + "/" + path;
+    }
+    void * handle = dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
+    if (!handle) {
+        GGML_LOG_INFO("[quactlize] GPU producer %s unavailable (%s)\n", path.c_str(), dlerror());
+        return;
+    }
+    auto sizes = (decltype(g_pack.sizes)) dlsym(handle, "quactlize_ppu_kpack_sizes_for_arrangement_v1");
+    auto prepare = (decltype(g_pack.prepare)) dlsym(handle, "quactlize_ppu_prepare_fully_quantized_dev_for_arrangement_v2");
+    if (!sizes || !prepare) {
+        GGML_LOG_WARN("[quactlize] GPU producer %s has an incomplete ABI\n", path.c_str());
+        dlclose(handle);
+        return;
+    }
+    g_pack = { handle, sizes, prepare };
+}
+
 // The bundle's format table. Not derivable from the qtype -- fmt0 is Q4_K, not Q2_K -- and each library is asked to
 // confirm it after load, so a reshuffled bundle fails to arm instead of decoding with the wrong reader.
 static const struct { int qtype; int fmt; const char * soname; } g_fmt_table[QZ_NFMT] = {
@@ -177,6 +207,7 @@ static void qz_init(void) {
     for (int i = 0; i < QZ_NFMT; ++i) {
         qz_load_one(&g_libs[i], g_fmt_table[i].qtype, g_fmt_table[i].fmt, g_fmt_table[i].soname);
     }
+    qz_load_pack();
 }
 
 static pthread_once_t g_once = PTHREAD_ONCE_INIT;
@@ -337,6 +368,45 @@ extern "C" bool ggml_quactlize_conversion_available(int qtype) {
     // Q3_K/Q6_K want K in multiples of 512 (their unit packs two superblocks). (256, 512) satisfies all five;
     // (1, 256) did not, and the first run against the real bundle said so for all five formats at once.
     return L->units_bytes(256, 512, qtype) >= 0;
+}
+
+extern "C" int ggml_quactlize_device_pack_sizes(
+        int qtype, int n, int k, int experts,
+        const quactlize_ppu_placed_arrangement_v2 * arrangement, quactlize_ppu_kpack_sizes_v1 * sizes) {
+    if (!qz_get(qtype) || !g_pack.sizes || !arrangement || !sizes || n <= 0 || k <= 0 || experts <= 0) {
+        return -1;
+    }
+    if ((int64_t) k > INT64_MAX / experts / n / 8) return -2;
+    quactlize_ppu_kpack_sizes_v1 out = {};
+    const int rc = g_pack.sizes(n, k, experts, qtype, arrangement, &out);
+    if (rc != 0) {
+        return rc;
+    }
+    int64_t low = 0, high = 0, units = 0;
+    if (!ggml_quactlize_plane_sizes(qtype, n, k, experts, arrangement, &low, &high, &units) ||
+        out.low_bytes != (uint64_t) low || out.high_bytes != (uint64_t) high ||
+        out.units_bytes != (uint64_t) units ||
+        out.raw_bytes != out.low_bytes + out.high_bytes + out.units_bytes) {
+        return -2;
+    }
+    *sizes = out;
+    return 0;
+}
+
+extern "C" bool ggml_quactlize_device_pack_available(int qtype) {
+    quactlize_ppu_placed_arrangement_v2 arrangement;
+    quactlize_ppu_kpack_sizes_v1 sizes;
+    return ggml_quactlize_arrangement_for(qtype, &arrangement) && g_pack.prepare &&
+           ggml_quactlize_device_pack_sizes(qtype, 256, 512, 1, &arrangement, &sizes) == 0;
+}
+
+extern "C" int ggml_quactlize_prepare_device(
+        int qtype, const uint8_t * blocks, uint8_t * low, uint8_t * high, uint8_t * units,
+        int n, int k, int experts, const quactlize_ppu_placed_arrangement_v2 * arrangement, void * stream) {
+    if (!qz_get(qtype) || !g_pack.prepare) {
+        return -1;
+    }
+    return g_pack.prepare(blocks, low, high, units, n, k, experts, qtype, arrangement, stream);
 }
 
 extern "C" int ggml_quactlize_prepare(
@@ -635,6 +705,11 @@ extern "C" int ggml_quactlize_dense_dev(
 
 extern "C" bool ggml_quactlize_arrangement_for(int, quactlize_ppu_placed_arrangement_v2 *) { return false; }
 extern "C" bool ggml_quactlize_conversion_available(int) { return false; }
+extern "C" bool ggml_quactlize_device_pack_available(int) { return false; }
+extern "C" int ggml_quactlize_device_pack_sizes(int, int, int, int,
+        const quactlize_ppu_placed_arrangement_v2 *, quactlize_ppu_kpack_sizes_v1 *) { return -1; }
+extern "C" int ggml_quactlize_prepare_device(int, const uint8_t *, uint8_t *, uint8_t *, uint8_t *,
+        int, int, int, const quactlize_ppu_placed_arrangement_v2 *, void *) { return -1; }
 extern "C" int  ggml_quactlize_prepare(int, const uint8_t *, uint8_t *, uint8_t *, uint8_t *, int, int, int,
                                        const quactlize_ppu_placed_arrangement_v2 *) { return -1; }
 extern "C" int  ggml_quactlize_recover(int, const uint8_t *, const uint8_t *, const uint8_t *, uint8_t *,

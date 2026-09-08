@@ -82,6 +82,7 @@ void ggml_cuda_mul_mat_id_quactlize(ggml_backend_cuda_context & ctx,
     GGML_ASSERT((size_t) n_tokens*sizeof(int32_t) <= smpbo && n_tokens < (1 << 22) && n_expert_used < (1 << 10));
 
     cudaStream_t stream = ctx.stream();
+    ggml_quactlize_wait_ready(art, stream);
 
     // Device-side permutation, ggml's own helper (the one mmq/mmf use): no D2H, no H2D, no stream sync, so the path
     // stays CUDA-graph capturable. expert_bounds is exactly what the grouped entry calls `offsets` -- cumulative

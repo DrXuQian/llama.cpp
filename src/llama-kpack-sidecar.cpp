@@ -288,14 +288,14 @@ struct mapped_file {
     size_t   size = 0;
     struct stat st_before{};
 
-    bool open(const std::string & path, bool nofollow, std::string & error) {
+    bool open(const std::string & path, bool nofollow, std::string & error, bool map_data = true) {
         fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC | (nofollow ? O_NOFOLLOW : 0));
         if (fd < 0) { error = path + ": " + strerror(errno); return false; }
         if (fstat(fd, &st_before) != 0 || !S_ISREG(st_before.st_mode)) {
             error = path + ": not a regular file"; ::close(fd); fd = -1; return false;
         }
         size = (size_t) st_before.st_size;
-        if (size) {
+        if (size && map_data) {
             void * m = mmap(nullptr, size, PROT_READ, MAP_PRIVATE, fd, 0);
             if (m == MAP_FAILED) { error = path + ": mmap: " + strerror(errno); ::close(fd); fd = -1; return false; }
             ptr = (uint8_t *) m;
@@ -783,12 +783,14 @@ struct llama_kpack_sidecar_writer::impl {
     int64_t     prev_index = -1;
     uint64_t    prev_end = 0;
     std::set<std::string> names;
+    mapped_file source;
+    std::string source_path;
 
     bool write_all(const void * data, size_t size, std::string & error) {
         const uint8_t * p = (const uint8_t *) data;
         while (size) {
             const ssize_t n = ::write(fd, p, size);
-            if (n < 0) { if (errno == EINTR) { continue; } error = std::string("weights.bin: write: ") + strerror(errno); return false; }
+            if (n <= 0) { if (n < 0 && errno == EINTR) { continue; } error = std::string("weights.bin: write: ") + (n == 0 ? "no progress" : strerror(errno)); return false; }
             whole.update(p, (size_t) n);
             p += n; size -= (size_t) n; pos += (uint64_t) n;
         }
@@ -816,15 +818,38 @@ llama_kpack_sidecar_writer::~llama_kpack_sidecar_writer() { abort(); }
 
 size_t llama_kpack_sidecar_writer::packed() const { return pimpl->tensors.size(); }
 
-void llama_kpack_sidecar_writer::abort() { pimpl->remove_staging(); }
+void llama_kpack_sidecar_writer::abort() {
+    pimpl->remove_staging();
+    pimpl->source.close();
+}
+
+bool llama_kpack_sidecar_writer::bind_source(const std::string & path, std::string & error, int loader_fd) {
+    if (pimpl->source.fd >= 0) { error = "source is already bound"; return false; }
+    if (!pimpl->source.open(path, false, error, false)) { return false; }
+    if (loader_fd >= 0) {
+        struct stat st{};
+        const auto & bound = pimpl->source.st_before;
+        if (fstat(loader_fd, &st) != 0 || st.st_dev != bound.st_dev || st.st_ino != bound.st_ino ||
+            st.st_size != bound.st_size || st.st_mtim.tv_sec != bound.st_mtim.tv_sec ||
+            st.st_mtim.tv_nsec != bound.st_mtim.tv_nsec || st.st_ctim.tv_sec != bound.st_ctim.tv_sec ||
+            st.st_ctim.tv_nsec != bound.st_ctim.tv_nsec) {
+            error = "source path is not the loader's file"; pimpl->source.close(); return false;
+        }
+    }
+    pimpl->source_path = path;
+    return true;
+}
 
 bool llama_kpack_sidecar_writer::begin(const std::string & dir, std::string & error) {
+    if (pimpl->fd >= 0 || !pimpl->staging.empty()) { error = "writer is already open"; return false; }
     struct stat st{};
     if (lstat(dir.c_str(), &st) == 0) { error = "refusing to overwrite existing output " + dir; return false; }
+    if (errno != ENOENT) { error = dir + ": lstat: " + strerror(errno); return false; }
+    const std::string staging = dir + ".partial." + std::to_string((long) getpid());
+    if (mkdir(staging.c_str(), 0755) != 0) { error = staging + ": mkdir: " + strerror(errno); return false; }
+    // Cleanup may only own a directory this writer created successfully.
     pimpl->final_dir = dir;
-    pimpl->staging   = dir + ".partial." + std::to_string((long) getpid());
-    if (lstat(pimpl->staging.c_str(), &st) == 0) { error = "refusing to reuse partial output " + pimpl->staging; return false; }
-    if (mkdir(pimpl->staging.c_str(), 0755) != 0) { error = pimpl->staging + ": mkdir: " + strerror(errno); pimpl->staging.clear(); return false; }
+    pimpl->staging   = staging;
     pimpl->fd = ::open((pimpl->staging + "/weights.bin").c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0644);
     if (pimpl->fd < 0) { error = std::string("weights.bin: ") + strerror(errno); pimpl->remove_staging(); return false; }
     return true;
@@ -836,9 +861,40 @@ void llama_kpack_sidecar_writer::skip(const std::string & name, const std::strin
 
 bool llama_kpack_sidecar_writer::add(const llama_kpack_source_tensor & src, const void * source_data,
                                      const llama_kpack_planes & planes, std::string & error) {
+    if (!source_data) { error = "source data is null"; return false; }
+    const read_chunk read = [&](size_t offset, size_t, std::string & why) -> const uint8_t * {
+        const uint8_t * ptrs[] = { planes.low, planes.high, planes.units };
+        const size_t sizes[] = { planes.low_bytes, planes.high_bytes, planes.units_bytes };
+        for (int j = 0; j < 3; ++j) {
+            if (offset < sizes[j]) {
+                if (!ptrs[j]) { why = "plane is null"; return nullptr; }
+                return ptrs[j] + offset;
+            }
+            offset -= sizes[j];
+        }
+        why = "plane offset is out of range";
+        return nullptr;
+    };
+    return add_record(src, sha256_range((const uint8_t *) source_data, src.size_bytes), planes,
+                      read, 8 * 1024 * 1024, {}, error);
+}
+
+bool llama_kpack_sidecar_writer::add_stream(const llama_kpack_source_tensor & src, const llama_kpack_planes & planes,
+        const read_chunk & read, size_t chunk_bytes, const cancelled & cancel, std::string & error) {
+    const auto & source = pimpl->source;
+    if (source.fd < 0 || src.data_offset > source.size || src.size_bytes > source.size - src.data_offset) {
+        error = "source range is outside the bound file"; return false;
+    }
+    return add_record(src, "", planes, read, chunk_bytes, cancel, error);
+}
+
+bool llama_kpack_sidecar_writer::add_record(const llama_kpack_source_tensor & src, const std::string & src_sha,
+        const llama_kpack_planes & planes, const read_chunk & read, size_t chunk_bytes,
+        const cancelled & cancel, std::string & error) {
     auto & I = *pimpl;
     const std::string pre = src.name + ": ";
     if (I.fd < 0) { error = "writer is not open"; return false; }
+    if (!read || chunk_bytes == 0) { error = pre + "invalid chunk reader"; return false; }
     const char * tname = kquant_type_name(src.ggml_type);
     if (!tname) { error = pre + "not a K-pack format"; return false; }
     const bool grouped = src.rank == 3;
@@ -862,33 +918,35 @@ bool llama_kpack_sidecar_writer::add(const llama_kpack_source_tensor & src, cons
     // region
     const uint64_t region_offset = align_up(I.pos);
     if (!I.pad_to(region_offset, error)) { return false; }
-    const uint8_t * ptrs[3]  = { planes.low, planes.high, planes.units };
     const uint64_t  sizes[3] = { planes.low_bytes, planes.high_bytes, planes.units_bytes };
     const std::vector<int64_t> * shapes[3] = { &g.low_shape, &g.high_shape, &g.units_shape };
     const char * span_names[3] = { "low", "high", "units" };
     ojson spans = ojson::object();
     uint64_t cursor = 0;
+    size_t resident_offset = 0;
     for (int j = 0; j < 3; ++j) {
         const uint64_t off = align_up(cursor);
         if (!I.pad_to(region_offset + off, error)) { return false; }
-        std::string sha;
-        if (sizes[j]) {
-            if (!ptrs[j]) { error = pre + std::string(span_names[j]) + " plane is null"; return false; }
-            sha = sha256_range(ptrs[j], sizes[j]);
-            if (!I.write_all(ptrs[j], sizes[j], error)) { return false; }
-        } else {
-            sha = sha256_range(nullptr, 0);
+        sha256_ctx span_hash;
+        for (size_t copied = 0; copied < sizes[j];) {
+            if (cancel && cancel()) { error = "cache write cancelled"; return false; }
+            const size_t count = std::min<size_t>(chunk_bytes, sizes[j] - copied);
+            const uint8_t * data = read(resident_offset + copied, count, error);
+            if (!data) { return false; }
+            span_hash.update(data, count);
+            if (!I.write_all(data, count, error)) { return false; }
+            copied += count;
         }
         ojson shape = ojson::array();
         for (auto d : *shapes[j]) { shape.push_back(d); }
-        spans[span_names[j]] = ojson{ { "offset_bytes", off }, { "size_bytes", sizes[j] }, { "shape", shape }, { "sha256", sha } };
+        spans[span_names[j]] = ojson{ { "offset_bytes", off }, { "size_bytes", sizes[j] }, { "shape", shape }, { "sha256", span_hash.hex() } };
+        resident_offset += sizes[j];
         cursor = off + sizes[j];
     }
     const uint64_t region_size = align_up(cursor);
     if (!I.pad_to(region_offset + region_size, error)) { return false; }
     if (region_size != raw_bytes) { error = pre + "resident region is not byte-neutral with the GGUF tensor"; return false; }
 
-    const std::string src_sha = sha256_range((const uint8_t *) source_data, (size_t) src.size_bytes);
     const std::string bind = binding_digest(src.name, src.ggml_type, src.rank, src.n, src.k, grouped ? src.experts : 0,
                                             src.gguf_index, src.data_offset, src.size_bytes, src_sha);
     ojson arr = ojson{
@@ -923,7 +981,8 @@ static bool fsync_path(const std::string & path, std::string & error) {
     return ok;
 }
 
-bool llama_kpack_sidecar_writer::finish(const std::string & model_label, const std::string & gguf_path, std::string & error) {
+bool llama_kpack_sidecar_writer::finish(const std::string & model_label, const std::string & gguf_path,
+                                      std::string & error, const cancelled & cancel) {
     auto & I = *pimpl;
     if (I.fd < 0) { error = "writer is not open"; return false; }
     if (I.tensors.empty()) { error = "refusing to create an empty artifact bundle"; abort(); return false; }
@@ -933,11 +992,56 @@ bool llama_kpack_sidecar_writer::finish(const std::string & model_label, const s
     // The source authority: the whole file, hashed now so that a file rewritten during the load is caught.
     std::string src_sha; uint64_t src_size = 0;
     {
-        mapped_file mf;
-        if (!mf.open(gguf_path, false, error)) { abort(); return false; }
-        src_sha = sha256_range(mf.ptr, mf.size);
+        mapped_file temporary;
+        if (I.source.fd < 0 && !temporary.open(gguf_path, false, error, false)) { abort(); return false; }
+        const mapped_file & mf = I.source.fd >= 0 ? I.source : temporary;
+        struct stat current{};
+        if (stat(gguf_path.c_str(), &current) != 0 || current.st_dev != mf.st_before.st_dev ||
+            current.st_ino != mf.st_before.st_ino || (I.source.fd >= 0 && gguf_path != I.source_path)) {
+            error = "source path changed since load"; abort(); return false;
+        }
         src_size = mf.size;
         if (!mf.still_same(error)) { abort(); return false; }
+        // Legacy v3 source authority, independent of D2H. Read once and hash
+        // whole-file and tensor ranges together; never retain raw tensor data.
+        std::vector<uint8_t> chunk(1024 * 1024);
+        std::vector<sha256_ctx> tensor_hashes(I.tensors.size());
+        sha256_ctx file_hash;
+        size_t first_tensor = 0;
+        for (uint64_t off = 0; off < src_size;) {
+            if (cancel && cancel()) { error = "cache write cancelled"; abort(); return false; }
+            const size_t count = std::min<uint64_t>(chunk.size(), src_size - off);
+            const ssize_t got = pread(mf.fd, chunk.data(), count, off);
+            if (got < 0 && errno == EINTR) { continue; }
+            if (got <= 0) { error = "source read failed or truncated"; abort(); return false; }
+            const uint64_t end = off + (size_t) got;
+            file_hash.update(chunk.data(), (size_t) got);
+            for (size_t j = first_tensor; j < I.tensors.size(); ++j) {
+                const auto & s = I.tensors[j]["source_tensor"];
+                const uint64_t begin = s["data_offset"].get<uint64_t>();
+                const uint64_t last = begin + s["size_bytes"].get<uint64_t>();
+                if (last <= off) { first_tensor = j + 1; continue; }
+                if (begin >= end) { break; }
+                const uint64_t from = std::max(off, begin), to = std::min(end, last);
+                tensor_hashes[j].update(chunk.data() + from - off, to - from);
+            }
+            off = end;
+        }
+        if (!mf.still_same(error)) { abort(); return false; }
+        src_sha = file_hash.hex();
+        for (size_t j = 0; j < I.tensors.size(); ++j) {
+            auto & r = I.tensors[j];
+            auto & s = r["source_tensor"];
+            const uint64_t off = s["data_offset"].get<uint64_t>(), bytes = s["size_bytes"].get<uint64_t>();
+            if (off > src_size || bytes > src_size - off) { error = "source range is outside file"; abort(); return false; }
+            const std::string digest = tensor_hashes[j].hex();
+            if (!s["sha256"].get<std::string>().empty() && s["sha256"] != digest) {
+                error = "source bytes differ from the supplied tensor"; abort(); return false;
+            }
+            s["sha256"] = digest;
+            s["binding_sha256"] = binding_digest(r["name"], r["ggml_type"], r["rank"], r["n"], r["k"],
+                r["experts"].is_null() ? 0 : r["experts"].get<int64_t>(), s["index"], off, bytes, digest);
+        }
     }
     if (src_size == 0) { error = "source GGUF must not be empty"; abort(); return false; }
 
@@ -964,6 +1068,7 @@ bool llama_kpack_sidecar_writer::finish(const std::string & model_label, const s
         ::close(mfd);
     }
     if (!fsync_path(I.staging, error)) { abort(); return false; }
+    if (cancel && cancel()) { error = "cache write cancelled"; abort(); return false; }
 
     // Publish without ever replacing: the kernel's RENAME_NOREPLACE, not a racy existence check.
 #ifndef RENAME_NOREPLACE
@@ -974,6 +1079,7 @@ bool llama_kpack_sidecar_writer::finish(const std::string & model_label, const s
         abort(); return false;
     }
     I.staging.clear();
+    I.source.close();
     std::string parent = I.final_dir;
     const size_t slash = parent.find_last_of('/');
     parent = slash == std::string::npos ? "." : (slash == 0 ? "/" : parent.substr(0, slash));
@@ -981,4 +1087,82 @@ bool llama_kpack_sidecar_writer::finish(const std::string & model_label, const s
     error.clear();
     GGML_LOG_INFO("[kpack] wrote %zu artifact(s) to %s\n", I.tensors.size(), I.final_dir.c_str());
     return true;
+}
+
+struct llama_kpack_background_writer::impl {
+    llama_kpack_sidecar_writer writer;
+    std::string source_path, error;
+    std::thread worker;
+    std::atomic<bool> cancelled{false};
+    bool prepared = false, started = false, success = false;
+};
+
+llama_kpack_background_writer::llama_kpack_background_writer() : pimpl(new impl) {}
+llama_kpack_background_writer::~llama_kpack_background_writer() { cancel(); }
+
+bool llama_kpack_background_writer::prepare(const std::string & dir, const std::string & source_path,
+                                            std::string & error, int loader_fd) {
+    auto & I = *pimpl;
+    if (I.prepared || I.started) { error = "background writer is already prepared"; return false; }
+    if (!I.writer.bind_source(source_path, error, loader_fd) || !I.writer.begin(dir, error)) {
+        I.writer.abort(); return false;
+    }
+    I.source_path = source_path;
+    I.prepared = true;
+    return true;
+}
+
+bool llama_kpack_background_writer::start(std::vector<llama_kpack_write_job> jobs,
+        const std::vector<llama_kpack_source_tensor> & inventory, size_t chunk_bytes, std::string & error) {
+    auto & I = *pimpl;
+    if (!I.prepared || I.started || I.cancelled || jobs.empty() || chunk_bytes == 0) {
+        error = "background writer cannot start"; return false;
+    }
+    std::sort(jobs.begin(), jobs.end(), [](const llama_kpack_write_job & a, const llama_kpack_write_job & b) {
+        return a.source.gguf_index < b.source.gguf_index;
+    });
+    std::set<std::string> names;
+    for (const auto & job : jobs) {
+        if (!job.read || !names.insert(job.source.name).second) { error = "invalid or duplicate snapshot"; return false; }
+    }
+    for (const auto & src : inventory) {
+        if (!names.count(src.name)) {
+            I.writer.skip(src.name, ggml_type_name((ggml_type) src.ggml_type), "not resident in a K-pack buffer");
+        }
+    }
+    try {
+        I.worker = std::thread([&I, jobs = std::move(jobs), chunk_bytes]() {
+            const auto cancel = [&I]() { return I.cancelled.load(); };
+            try {
+                for (const auto & job : jobs) {
+                    if (!I.writer.add_stream(job.source, job.planes, job.read, chunk_bytes, cancel, I.error)) {
+                        I.writer.abort(); return;
+                    }
+                }
+                I.success = I.writer.finish(I.source_path, I.source_path, I.error, cancel);
+            } catch (const std::exception & e) {
+                I.error = e.what();
+            } catch (...) {
+                I.error = "unknown background cache failure";
+            }
+            if (!I.success) { I.writer.abort(); }
+        });
+    } catch (const std::exception & e) {
+        error = e.what(); I.writer.abort(); return false;
+    }
+    I.started = true;
+    return true;
+}
+
+bool llama_kpack_background_writer::wait(std::string & error) {
+    auto & I = *pimpl;
+    if (I.worker.joinable()) { I.worker.join(); }
+    error = I.error;
+    return I.started && I.success;
+}
+
+void llama_kpack_background_writer::cancel() {
+    pimpl->cancelled = true;
+    if (pimpl->worker.joinable()) { pimpl->worker.join(); }
+    pimpl->writer.abort();
 }

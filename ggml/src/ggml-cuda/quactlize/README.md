@@ -9,6 +9,15 @@ built against, so a drifted ABI is a one-line `sha256sum -c` away rather than a 
 
     sha256sum -c ABI_SHA256
 
+`quactlize_ppu_pack.h` is an additional verbatim copy of
+`quactlize/packing/api.h` at `7fbe892e2d774049437e9aa771f421cf633474ab`.
+It describes the separate, five-format GPU producer `libquactlize_ppu_pack.so`;
+it does not change the six-library consumer ABI above. Set
+`QUACTLIZE_PPU_PACK_LIBRARY` to its absolute path, or place it in
+`QUACTLIZE_PPU_BUNDLE`. A missing/incompatible GPU producer declines K-pack
+intake rather than falling back to CPU conversion. No build manifest is read
+by this runtime binding.
+
 `ppu_format_config.inc` is quactlize's per-format registry, whose own header says shipping code must consume it or
 make divergence fail loudly. It is used here ONLY as a cross-check on the arrangement descriptor the library hands
 back -- llama.cpp does not construct an arrangement from it, because that would be a second source of the same
