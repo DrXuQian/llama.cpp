@@ -58,6 +58,7 @@ void ggml_cuda_mul_mat_quactlize(ggml_backend_cuda_context & ctx,
     GGML_ASSERT(M <= INT32_MAX && N <= INT32_MAX && K <= INT32_MAX);
 
     cudaStream_t stream = ctx.stream();
+    ggml_quactlize_wait_ready(art, stream);
 
     constexpr int block_dim = 256;
 

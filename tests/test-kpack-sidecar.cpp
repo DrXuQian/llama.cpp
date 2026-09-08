@@ -4,7 +4,11 @@
 // load_kpack_bundle is run on the same bundle -- the interoperability check that matters, since the format is theirs.
 
 #include "llama-kpack-sidecar.h"
+#include "llama-kpack-cache.h"
+#include "llama-impl.h"
 #include "quactlize-lib.h"
+#include "quactlize-sidecar.h"
+#include "ggml-backend-impl.h"
 
 #include "ggml.h"
 #include "gguf.h"
@@ -13,12 +17,93 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <atomic>
+#include <chrono>
+#include <future>
+#include <cstdarg>
+#include <thread>
 #include <string>
 #include <sys/stat.h>
+#include <fcntl.h>
 #include <unistd.h>
 #include <vector>
 
 static int g_failures = 0;
+
+// libllama's logging seam, without loading a GPU backend in this host test.
+void llama_log_internal(ggml_log_level, const char * format, ...) {
+    va_list args;
+    va_start(args, format); vfprintf(stderr, format, args); va_end(args);
+}
+
+namespace cache_mock {
+struct event { const uint8_t * src = nullptr; void * dst = nullptr; size_t bytes = 0; };
+static ggml_backend_reg reg{};
+static ggml_backend_device dev{};
+static ggml_backend_buffer_type device_buft{}, host_buft{};
+static std::thread::id owner;
+static std::promise<void> entered, release;
+static std::shared_future<void> released;
+static std::atomic<int> waits{0};
+static int uploads = 0, host_allocations = 0;
+static bool descriptor_mismatch = false;
+
+static ggml_backend_buffer_t allocate(ggml_backend_buffer_type_t buft, size_t bytes) {
+    if (buft == &host_buft) { ++host_allocations; }
+    ggml_backend_buffer_i iface{};
+    iface.get_base = [](ggml_backend_buffer_t b) { return b->context; };
+    iface.free_buffer = [](ggml_backend_buffer_t b) { free(b->context); };
+    return ggml_backend_buffer_init(buft, iface, malloc(bytes), bytes);
+}
+static bool is_kpack(const ggml_tensor * t) { return t->buffer && t->buffer->buft == &device_buft; }
+static bool layout(const ggml_tensor * t, size_t * lo, size_t * hi, size_t * un,
+                   quactlize_ppu_placed_arrangement_v2 * arr) {
+    int64_t l, h, u;
+    if (!ggml_quactlize_arrangement_for(t->type, arr) ||
+        !ggml_quactlize_plane_sizes(t->type, t->ne[1], t->ne[0], t->ne[2], arr, &l, &h, &u)) { return false; }
+    *lo = l; *hi = h; *un = u;
+    if (descriptor_mismatch) { ++arr->mapping_id; }
+    return true;
+}
+static void set(ggml_tensor * t, const ggml_quactlize_planes * p) {
+    auto * dst = (uint8_t *) t->data;
+    memcpy(dst, p->low, p->low_bytes);
+    if (p->high_bytes) { memcpy(dst + p->low_bytes, p->high, p->high_bytes); }
+    memcpy(dst + p->low_bytes + p->high_bytes, p->units, p->units_bytes);
+    ++uploads;
+}
+static bool copy(const ggml_tensor * t, void * dst, size_t off, size_t bytes, ggml_backend_event_t ev) {
+    auto * e = (event *) ev->context;
+    *e = {(const uint8_t *) t->data + off, dst, bytes};
+    return true;
+}
+static bool wait(ggml_backend_event_t ev) {
+    if (std::this_thread::get_id() == owner) { return false; }
+    if (waits.fetch_add(1) == 0) { entered.set_value(); released.wait(); }
+    const auto * e = (const event *) ev->context;
+    memcpy(e->dst, e->src, e->bytes);
+    return true;
+}
+static void init() {
+    owner = std::this_thread::get_id();
+    released = release.get_future().share();
+    reg.api_version = GGML_BACKEND_API_VERSION;
+    reg.iface.get_proc_address = [](ggml_backend_reg_t, const char * name) -> void * {
+        if (!strcmp(name, "ggml_quactlize_tensor_is_kpack")) { return (void *) is_kpack; }
+        if (!strcmp(name, "ggml_quactlize_plane_layout")) { return (void *) layout; }
+        if (!strcmp(name, "ggml_quactlize_set_planes")) { return (void *) set; }
+        if (!strcmp(name, "ggml_quactlize_copy_range_async")) { return (void *) copy; }
+        if (!strcmp(name, "ggml_quactlize_copy_range_wait")) { return (void *) wait; }
+        return nullptr;
+    };
+    dev.reg = &reg;
+    dev.iface.get_host_buffer_type = [](ggml_backend_dev_t) { return &host_buft; };
+    dev.iface.event_new = [](ggml_backend_dev_t d) { return new ggml_backend_event{d, new event}; };
+    dev.iface.event_free = [](ggml_backend_dev_t, ggml_backend_event_t ev) { delete (event *) ev->context; delete ev; };
+    device_buft.device = host_buft.device = &dev;
+    host_buft.iface.alloc_buffer = allocate;
+}
+} // namespace cache_mock
 
 #define CHECK(cond, ...) do { \
     const bool ok_ = (cond); \
@@ -160,6 +245,130 @@ int main() {
         llama_kpack_sidecar_writer w2;
         CHECK(!w2.begin(bundle, err), "a second writer must refuse the existing bundle");
     }
+    {
+        const std::string target = dir + "/in-progress";
+        const std::string staging = target + ".partial." + std::to_string((long) getpid());
+        const std::vector<uint8_t> original = { 1, 2, 3, 4 };
+        CHECK(mkdir(staging.c_str(), 0755) == 0, "create another writer's staging directory");
+        write_file(staging + "/weights.bin", original);
+        {
+            llama_kpack_sidecar_writer w;
+            CHECK(!w.begin(target, err), "existing staging directory must be refused");
+        }
+        CHECK(read_file(staging + "/weights.bin") == original, "a rejected writer must not remove another writer's files");
+        rm_bundle(staging);
+    }
+    {
+        const std::string target = dir + "/active-writer";
+        const std::string staging = target + ".partial." + std::to_string((long) getpid());
+        llama_kpack_sidecar_writer w;
+        CHECK(w.begin(target, err), "%s", err.c_str());
+        CHECK(!w.begin(dir + "/second-output", err), "begin twice must preserve the active writer");
+        CHECK(stat((staging + "/weights.bin").c_str(), &st) == 0, "active staging file must remain owned");
+        w.abort();
+        CHECK(stat(staging.c_str(), &st) != 0, "abort must clean up the owned staging directory");
+    }
+    {
+        const std::string replacement = dir + "/same-bytes-other-inode.gguf";
+        write_file(replacement, read_file(gguf_path));
+        const int original_fd = open(gguf_path.c_str(), O_RDONLY);
+        CHECK(original_fd >= 0, "open loader source");
+        llama_kpack_sidecar_writer writer;
+        CHECK(!writer.bind_source(replacement, err, original_fd), "bind must reject a different file even with identical bytes");
+        CHECK(writer.bind_source(gguf_path, err, original_fd), "bind exact loader descriptor");
+        close(original_fd);
+        unlink(replacement.c_str());
+    }
+
+    // ---- reader ----
+    printf("  [background streaming]\n");
+    const std::string streamed = dir + "/streamed";
+    {
+        llama_kpack_background_writer writer;
+        CHECK(writer.prepare(streamed, gguf_path, err), "%s", err.c_str());
+        std::promise<void> entered, release;
+        auto ready = entered.get_future();
+        auto released = release.get_future().share();
+        std::atomic<bool> first{true};
+        std::atomic<size_t> calls{0};
+        std::vector<uint8_t> staging(4093);
+        const auto job_for = [&](const made_tensor & tensor) {
+            llama_kpack_write_job job{tensor.src, tensor.planes, {}};
+            job.planes.low = job.planes.high = job.planes.units = nullptr;
+            job.read = [&, tensor_ptr = &tensor](size_t offset, size_t bytes, std::string & why) -> const uint8_t * {
+                if (first.exchange(false)) { entered.set_value(); released.wait(); }
+                if (bytes > staging.size()) { why = "unbounded request"; return nullptr; }
+                const auto & p = tensor_ptr->planes;
+                const uint8_t * ptrs[] = {p.low, p.high, p.units};
+                const size_t sizes[] = {p.low_bytes, p.high_bytes, p.units_bytes};
+                for (int j = 0; j < 3; ++j) {
+                    if (offset < sizes[j]) {
+                        if (bytes > sizes[j] - offset) { why = "cross-plane request"; return nullptr; }
+                        memcpy(staging.data(), ptrs[j] + offset, bytes);
+                        ++calls;
+                        return staging.data();
+                    }
+                    offset -= sizes[j];
+                }
+                why = "invalid offset"; return nullptr;
+            };
+            return job;
+        };
+        // Loading order is not file order. Neither the jobs nor their reader
+        // contain the raw GGUF data pointer.
+        CHECK(writer.start({job_for(grouped), job_for(dense)}, inventory, staging.size(), err), "%s", err.c_str());
+        CHECK(ready.wait_for(std::chrono::seconds(2)) == std::future_status::ready, "worker reached delayed copy");
+        CHECK(stat((streamed + "/manifest.json").c_str(), &st) != 0, "no publication while a copy is pending");
+        CHECK(calls == 0, "start returned before any D2H completion");
+        release.set_value();
+        CHECK(writer.wait(err), "%s", err.c_str());
+        CHECK(calls > 3, "bounded stream uses multiple chunks");
+        CHECK(read_file(streamed + "/weights.bin") == read_file(bundle + "/weights.bin"), "streamed bytes match synchronous writer");
+        llama_kpack_sidecar_reader reader;
+        CHECK(reader.open(streamed, err) && reader.verify_source(gguf_path, inventory, 2, err) && reader.verify_storage(2, err), "%s", err.c_str());
+    }
+    for (int variant = 0; variant < 3; ++variant) {
+        const std::string target = dir + "/stream-fail-" + std::to_string(variant);
+        const std::string source = dir + "/stream-source-" + std::to_string(variant);
+        write_file(source, read_file(gguf_path));
+        llama_kpack_background_writer writer;
+        CHECK(writer.prepare(target, source, err), "%s", err.c_str());
+        std::promise<void> entered, release;
+        auto ready = entered.get_future();
+        auto released = release.get_future().share();
+        std::atomic<bool> first{true};
+        llama_kpack_write_job job{dense.src, dense.planes, {}};
+        job.read = [&](size_t offset, size_t, std::string & why) -> const uint8_t * {
+            if (first.exchange(false)) { entered.set_value(); released.wait(); }
+            if (variant == 0) { why = "planted D2H rejection"; return nullptr; }
+            return offset < dense.planes.low_bytes ? dense.planes.low + offset :
+                dense.planes.units + offset - dense.planes.low_bytes;
+        };
+        CHECK(writer.start({job}, inventory, 4093, err), "%s", err.c_str());
+        CHECK(ready.wait_for(std::chrono::seconds(2)) == std::future_status::ready, "copy entered");
+        if (variant == 1) {
+            // Same content, different inode: a replaced source is not the file
+            // whose identity was captured before loading.
+            const std::string replaced = source + ".old";
+            CHECK(rename(source.c_str(), replaced.c_str()) == 0, "replace source");
+            write_file(source, read_file(gguf_path));
+            unlink(replaced.c_str());
+        }
+        if (variant == 2) {
+            auto cancelled = std::async(std::launch::async, [&]() { writer.cancel(); });
+            CHECK(cancelled.wait_for(std::chrono::milliseconds(30)) == std::future_status::timeout,
+                  "cancellation must not release an in-flight copy destination");
+            release.set_value();
+            cancelled.get();
+        } else {
+            release.set_value();
+        }
+        CHECK(!writer.wait(err), "copy failure, changed source and cancellation must not publish");
+        CHECK(stat(target.c_str(), &st) != 0, "no final directory after failure");
+        const std::string staging = target + ".partial." + std::to_string((long) getpid());
+        CHECK(stat(staging.c_str(), &st) != 0, "no owned partial directory after failure");
+        unlink(source.c_str());
+    }
 
     // ---- reader ----
     printf("  [reader]\n");
@@ -181,6 +390,50 @@ int main() {
             CHECK(rd->low.shape == std::vector<int64_t>({ 1, 256, 256 }), "dense low shape [1, N, K/2]");
         }
     }
+
+    printf("  [model cache integration]\n");
+    const std::string model_cache = dir + "/model-cache";
+    {
+        cache_mock::init();
+        auto ready = cache_mock::entered.get_future();
+        auto * tensor = ggml_dup_tensor(gctx, t_dense);
+        ggml_set_name(tensor, dense.name.c_str());
+        tensor->buffer = cache_mock::allocate(&cache_mock::device_buft, ggml_nbytes(tensor));
+        tensor->data = ggml_backend_buffer_get_base(tensor->buffer);
+        // A finished GPU pack is represented by resident plane bytes here.
+        auto * data = (uint8_t *) tensor->data;
+        memcpy(data, dense.low.data(), dense.planes.low_bytes);
+        memcpy(data + dense.planes.low_bytes, dense.units.data(), dense.planes.units_bytes);
+        {
+            llama_kpack_cache cache(model_cache, gguf_path, inventory);
+            CHECK(!cache.load(tensor), "cache miss uses the normal GPU producer");
+            cache.capture(tensor);
+            cache.capture(tensor); // aliases must not create duplicate records
+            cache.start();
+            CHECK(ready.wait_for(std::chrono::seconds(2)) == std::future_status::ready, "writer reached async completion");
+            CHECK(cache_mock::host_allocations == 1, "one bounded pinned slot per device");
+            CHECK(memcmp(tensor->data, dense.low.data(), dense.planes.low_bytes) == 0,
+                  "compute can read resident weights while D2H is held");
+            CHECK(stat(model_cache.c_str(), &st) != 0, "cache remains unpublished until copies finish");
+            cache_mock::release.set_value();
+        } // waits before tensor->buffer is freed
+        CHECK(stat((model_cache + "/manifest.json").c_str(), &st) == 0, "normal model teardown completes persistence");
+        memset(tensor->data, 0xA5, ggml_nbytes(tensor));
+        {
+            llama_kpack_cache cache(model_cache, gguf_path, inventory);
+            cache_mock::descriptor_mismatch = true;
+            CHECK(!cache.load(tensor), "a changed registry cannot consume cached bytes");
+            cache_mock::descriptor_mismatch = false;
+            CHECK(cache.load(tensor), "second model load consumes verified planes without repacking");
+            CHECK(cache_mock::uploads == 1, "one direct plane upload on cache hit");
+            CHECK(memcmp(tensor->data, dense.low.data(), dense.planes.low_bytes) == 0, "cached low bytes match");
+            CHECK(memcmp(data + dense.planes.low_bytes, dense.units.data(), dense.planes.units_bytes) == 0, "cached unit bytes match");
+            cache.start(); // a cache hit must not start a replacement writer
+        }
+        ggml_backend_buffer_free(tensor->buffer);
+        tensor->buffer = nullptr;
+    }
+    rm_bundle(model_cache);
 
     // ---- negatives: one wrong thing each ----
     printf("  [negatives]\n");
@@ -229,6 +482,7 @@ int main() {
             return system(cmd.c_str());
         };
         CHECK(run(bundle, gguf_path) == 0, "quactlize load_kpack_bundle must accept the bundle");
+        CHECK(run(streamed, gguf_path) == 0, "quactlize must accept the background writer's bundle");
         const std::string c = dir + "/c4"; copy_bundle(bundle, c);
         auto w = read_file(c + "/weights.bin"); w[2000] ^= 0x01; write_file(c + "/weights.bin", w);
         CHECK(run(c, gguf_path) != 0, "quactlize must reject the flipped-byte copy (the oracle can say no)");
@@ -237,6 +491,7 @@ int main() {
         printf("    (KPACK_PY / KPACK_PY_REPO not set: quactlize cross-check skipped)\n");
     }
 
+    rm_bundle(streamed);
     rm_bundle(bundle);
     unlink(gguf_path.c_str()); rmdir(dir.c_str());
     gguf_free(g); ggml_free(gctx);
