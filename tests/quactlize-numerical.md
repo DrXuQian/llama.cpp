@@ -7,6 +7,17 @@ Use `--help` for optional variables. The runner downloads the usual WikiText-2
 test corpus with the repository's existing script unless `EVAL_FILE` is set.
 Corpus download requires network access, wget/curl and unzip.
 
+For an offline GSM8K dataset, set `GSM8K_FILE=/path/to/test.jsonl` instead of
+`EVAL_FILE`. JSONL, JSON arrays and Parquet with `question`/`answer` columns
+are supported; Parquet requires an already installed `pyarrow`. No package
+is installed by this runner. Prefer the test split; no split is selected
+implicitly from a dataset directory. The first 32 records are rendered as
+fixed question/answer text and all routes consume that same text. The source
+file is left unchanged, and source/text SHA-256 receipts are saved. This
+bypasses the download entirely. It measures likelihood differences on the
+sample, **not GSM8K generated-answer accuracy**. Scored coverage remains two
+256-token chunks, not necessarily all 32 questions.
+
 Only the existing `llama-perplexity` target is built incrementally. The
 Quactlize libraries, weights, cache format and compute implementation do not
 change. A complete cache is reused; no new background cache write is needed.

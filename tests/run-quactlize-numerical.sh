@@ -9,6 +9,7 @@ if [[ ${1:-} == --help ]]; then
         'Required: MODEL PPU_SDK QUACTLIZE_PPU_BUNDLE QUACTLIZE_PPU_PACK_LIBRARY CACHE_DIR' \
         'Optional: BUILD_DIR=build-ppu RESULT_ROOT=/workspace JOBS=192 CUDA_VISIBLE_DEVICES=0' \
         'Optional: EVAL_FILE=<text corpus>; otherwise download the standard WikiText-2 test corpus.' \
+        'Offline alternative: GSM8K_FILE=<local JSONL/JSON/Parquet file>, exclusive with EVAL_FILE.' \
         'Optional: EVAL_BATCHES="128 1" ASYS=<SDK asys executable>' \
         'Requires an existing configured PPU build and a complete cache from the cache smoke.' \
         'Only llama-perplexity is incrementally built. No Quactlize library rebuild.' \
@@ -42,6 +43,10 @@ BUILD_DIR=${BUILD_DIR:-build-ppu}
 RESULT_ROOT=${RESULT_ROOT:-/workspace}
 JOBS=${JOBS:-192}
 [[ $JOBS =~ ^[1-9][0-9]*$ ]]
+if [[ -n ${GSM8K_FILE:-} ]]; then
+    [[ -z ${EVAL_FILE:-} ]] || { printf 'Set only one of GSM8K_FILE and EVAL_FILE.\n' >&2; false; }
+    [[ -f $GSM8K_FILE && -s $GSM8K_FILE && -r $GSM8K_FILE ]]
+fi
 read -ra BATCHES <<< "${EVAL_BATCHES:-128 1}"
 [[ ${#BATCHES[@]} -gt 0 && ${#BATCHES[@]} -le 2 ]]
 for batch in "${BATCHES[@]}"; do [[ $batch == 1 || $batch == 128 ]]; done
@@ -79,10 +84,26 @@ cp "$QUACTLIZE_PPU_BUNDLE/manifest.json" "$RUN/results/bundle-manifest.json"
 grep -E '^GGML_(USE_PPU|NCP_|CUDA_GRAPH)' "$BUILD_DIR/CMakeCache.txt" > "$RUN/results/build-options.txt"
 "$ASYS" --version > "$RUN/results/asys-version.txt" 2>&1
 stage=corpus
-if [[ -z ${EVAL_FILE:-} ]]; then
+if [[ -n ${GSM8K_FILE:-} ]]; then
     mkdir "$RUN/corpus"
-    (cd "$RUN/corpus" && timeout 180s bash "$REPO/scripts/get-wikitext-2.sh") > "$RUN/results/corpus-download.log" 2>&1
+    sha256sum "$GSM8K_FILE" > "$RUN/results/corpus-source.sha256"
+    python3 tests/quactlize_numerical.py gsm8k "$GSM8K_FILE" > "$RUN/corpus/gsm8k.txt"
+    EVAL_FILE="$RUN/corpus/gsm8k.txt"
+    printf 'KPACK_CORPUS source=local-gsm8k sample=first-32 purpose=likelihood-comparison answer_accuracy=NOT_MEASURED\n' \
+        | tee "$RUN/results/corpus-source.log"
+elif [[ -z ${EVAL_FILE:-} ]]; then
+    mkdir "$RUN/corpus"
+    if (cd "$RUN/corpus" && timeout 180s bash "$REPO/scripts/get-wikitext-2.sh") > "$RUN/results/corpus-download.log" 2>&1; then
+        printf 'KPACK_CORPUS source=wikitext-2\n' | tee "$RUN/results/corpus-source.log"
+    else
+        download_rc=$?
+        tail -n 25 "$RUN/results/corpus-download.log" >&2
+        printf 'Corpus download failed; set EVAL_FILE or GSM8K_FILE to use existing local data.\n' >&2
+        exit "$download_rc"
+    fi
     EVAL_FILE="$RUN/corpus/wikitext-2-raw/wiki.test.raw"
+else
+    printf 'KPACK_CORPUS source=local-text\n' | tee "$RUN/results/corpus-source.log"
 fi
 [[ -s $EVAL_FILE && -r $EVAL_FILE ]]
 sha256sum "$EVAL_FILE" > "$RUN/results/corpus.sha256"

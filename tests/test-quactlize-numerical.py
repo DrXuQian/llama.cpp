@@ -2,13 +2,14 @@
 """Host checks for the numerical runner's evidence parser, not a model oracle."""
 
 import copy
+import json
 from pathlib import Path
 import sqlite3
 import struct
 import tempfile
 import unittest
 
-from quactlize_numerical import activity, analyze, logprobs
+from quactlize_numerical import activity, analyze, gsm8k_corpus, logprobs
 
 
 class NumericalEvidence(unittest.TestCase):
@@ -123,6 +124,36 @@ class NumericalEvidence(unittest.TestCase):
         path.write_bytes(payload[:-2])
         with self.assertRaisesRegex(ValueError, 'truncated'):
             logprobs(path)
+
+    def test_gsm8k_jsonl_sample(self):
+        path = self.root / 'test.jsonl'
+        rows = [{'question': f'question {i}', 'answer': f'answer {i}\n#### {i}'} for i in range(33)]
+        source = '\n' + '\n'.join(json.dumps(row) for row in rows)
+        path.write_text(source)
+        text = gsm8k_corpus(path)
+        self.assertEqual(text.count('Question: '), 32)
+        self.assertIn('answer 31\n#### 31', text)
+        self.assertNotIn('question 32', text)
+        self.assertEqual(path.read_text(), source)
+
+    def test_gsm8k_json_and_schema_negatives(self):
+        path = self.root / 'test.json'
+        path.write_text(json.dumps([{'question': 'How many?', 'answer': 'Two.\n#### 2'}]))
+        self.assertEqual(gsm8k_corpus(path), 'Question: How many?\nAnswer: Two.\n#### 2\n\n')
+        for value in ([], {'test': []}, [{'question': 'Q'}], [{'question': 'Q', 'answer': None}]):
+            path.write_text(json.dumps(value))
+            with self.assertRaises(ValueError):
+                gsm8k_corpus(path)
+
+    def test_gsm8k_parquet(self):
+        try:
+            import pyarrow as pa
+            import pyarrow.parquet as pq
+        except ImportError:
+            self.skipTest('optional pyarrow is not installed')
+        path = self.root / 'test.parquet'
+        pq.write_table(pa.table({'question': ['How many?'], 'answer': ['Two.\n#### 2']}), path)
+        self.assertEqual(gsm8k_corpus(path), 'Question: How many?\nAnswer: Two.\n#### 2\n\n')
 
 
 if __name__ == '__main__':
