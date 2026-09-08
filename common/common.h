@@ -330,6 +330,7 @@ struct common_params_speculative_draft {
     float p_min   = 0.0f; // minimum speculative decoding probability (greedy)
 
     bool backend_sampling = true; // offload draft sampling to the backend (default: on)
+    bool gpu_pipeline = true;
 
     common_params_model mparams;
 

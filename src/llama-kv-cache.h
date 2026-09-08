@@ -157,6 +157,7 @@ public:
 
     uint32_t get_size()     const;
     uint32_t get_n_stream() const;
+    bool set_fixed_size(bool value);
 
     bool get_has_shift() const;
 
@@ -267,7 +268,6 @@ private:
     // required padding
     const uint32_t n_pad = 1;
 
-    // env: LLAMA_KV_CACHE_FIXED_SIZE
     bool fixed_size = false;
 
     // SWA

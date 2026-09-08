@@ -1701,6 +1701,37 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
         mparams.kv_overrides = params.kv_overrides.data();
     }
 
+    if (common_speculative_gpu_pipeline(params) && params.n_gpu_layers != 0) {
+        std::vector<ggml_backend_dev_t> devices;
+        if (!params.devices.empty()) {
+            for (auto * dev : params.devices) {
+                if (dev) {
+                    devices.push_back(dev);
+                }
+            }
+        } else {
+            for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+                auto * dev = ggml_backend_dev_get(i);
+                if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+                    devices.push_back(dev);
+                }
+            }
+        }
+        if (devices.size() == 1 && strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(devices[0])), "CUDA") == 0) {
+            auto & overrides = params.tensor_buft_overrides;
+            const bool explicit_input = std::any_of(overrides.begin(), overrides.end(), [](const auto & entry) {
+                return entry.pattern && std::regex_search("token_embd.weight", std::regex(entry.pattern));
+            });
+            if (!explicit_input) {
+                const auto end = std::find_if(overrides.begin(), overrides.end(), [](const auto & entry) { return !entry.pattern; });
+                overrides.insert(end, {"token_embd[.]weight", ggml_backend_dev_buffer_type(devices[0])});
+                if (overrides.back().pattern) {
+                    overrides.push_back({nullptr, nullptr});
+                }
+            }
+        }
+    }
+
     if (params.tensor_buft_overrides.empty()) {
         mparams.tensor_buft_overrides = NULL;
     } else {

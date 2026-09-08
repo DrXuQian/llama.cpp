@@ -362,12 +362,8 @@ static ggml_cuda_device_info ggml_cuda_init() {
             turing_devices_without_mma.push_back({ id, device_name });
         }
 
-        // Temporary performance fix:
-        // Setting device scheduling strategy for iGPUs with cc121 to "spinning" to avoid delays in cuda synchronize calls.
-        // TODO: Check for future drivers the default scheduling strategy and
-        // remove this call again when cudaDeviceScheduleSpin is default.
-        const char * spin = getenv("GGML_CUDA_SCHEDULE_SPIN");
-        if ((prop.major == 12 && prop.minor == 1) || (spin && atoi(spin) != 0)) {
+        // Avoid scheduler wakeup delays between short decode graphs.
+        {
             CUDA_CHECK(cudaSetDevice(physical_id));
             unsigned int flags;
             CUDA_CHECK(cudaGetDeviceFlags(&flags));
@@ -5868,8 +5864,7 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
         return (void *) ggml_backend_cuda_set_inputs;
     }
     if (strcmp(name, "ggml_backend_set_inputs_async") == 0) {
-        const char * env = getenv("GGML_CUDA_ASYNC_INPUTS");
-        return env && atoi(env) != 0 ? (void *) ggml_backend_cuda_set_inputs_async : nullptr;
+        return (void *) ggml_backend_cuda_set_inputs_async;
     }
     if (strcmp(name, "ggml_backend_get_tensors_async") == 0) {
         return (void *) ggml_backend_cuda_get_tensors_async;

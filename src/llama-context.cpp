@@ -1259,6 +1259,28 @@ void llama_context::set_embeddings_layer_inp(uint32_t lid, bool enable) {
     sched_need_reserve = true;
 }
 
+void llama_context::set_nextn_prefetch(bool enabled) {
+    synchronize();
+    nextn_prefetch_enabled = enabled;
+    nextn_prefetch_reported = false;
+    auto * hybrid = dynamic_cast<llama_memory_hybrid *>(memory.get());
+    auto * kv = hybrid ? hybrid->get_mem_attn() : dynamic_cast<llama_kv_cache *>(memory.get());
+    if (!kv) {
+        return;
+    }
+    const bool supported = model.arch == LLM_ARCH_QWEN3 || model.arch == LLM_ARCH_QWEN3MOE ||
+        model.arch == LLM_ARCH_QWEN35 || model.arch == LLM_ARCH_QWEN35MOE || model.arch == LLM_ARCH_EAGLE3;
+    const bool fixed = enabled && supported && cparams.n_seq_max == 1 && cparams.flash_attn &&
+        !cparams.pipeline_parallel && !model.hparams.n_swa && kv->get_size() <= 8192 &&
+        !ggml_is_quantized(kv->type_k()) && !ggml_is_quantized(kv->type_v()) &&
+        model.devices.size() == 1 && model.n_gpu_layers() > model.hparams.n_layer_all &&
+        model.tok_embd && !ggml_backend_buffer_is_host(model.tok_embd->buffer) &&
+        strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(model.devices[0].dev)), "CUDA") == 0;
+    if (kv->set_fixed_size(fixed)) {
+        sched_need_reserve = true;
+    }
+}
+
 void llama_context::set_nextn_layer_offset(int32_t offset) {
     cparams.nextn_layer_offset = offset;
 }
@@ -2200,20 +2222,13 @@ int llama_context::decode(const llama_batch & batch_inp) {
 }
 
 bool llama_context::prefetch_nextn_target(llama_context & source) {
-    static const bool enabled = []() {
-        const char * value = getenv("LLAMA_NEXTN_TARGET_PREFETCH");
-        if (!value) {
-            value = getenv("LLAMA_MTP_TARGET_PREFETCH");
-        }
-        return value && atoi(value) != 0;
-    }();
     const bool eagle = source.model.arch == LLM_ARCH_EAGLE3;
     auto * hybrid = dynamic_cast<llama_memory_hybrid *>(memory.get());
     auto * mctx = nextn_mctx.get();
     auto * hctx = dynamic_cast<llama_memory_hybrid_context *>(mctx);
     auto * kv = hybrid ? hybrid->get_mem_attn() : dynamic_cast<llama_kv_cache *>(memory.get());
     auto * kctx = hctx ? hctx->get_attn() : dynamic_cast<llama_kv_cache_context *>(mctx);
-    if (!enabled || !kv || !kctx || !source.nextn_graph || !source.nextn_graph->prefetched ||
+    if (!nextn_prefetch_enabled || !kv || !kctx || !source.nextn_graph || !source.nextn_graph->prefetched ||
             !nextn_readback || nextn_target_pending >= 0 || sched_need_reserve || graph_reuse_disable ||
             cparams.n_seq_max != 1 || cparams.pipeline_parallel || cparams.cb_eval || opt_ctx ||
             !cparams.flash_attn || !cparams.causal_attn || cparams.embeddings ||
@@ -2461,6 +2476,10 @@ bool llama_context::prefetch_nextn_target(llama_context & source) {
     state.previous_pos = ubatch.pos[0];
     state.n = n;
     nextn_target_pending = index;
+    if (!nextn_prefetch_reported) {
+        LLAMA_LOG_INFO("%s: GPU NextN pipeline active; target submitted before CPU acceptance\n", __func__);
+        nextn_prefetch_reported = true;
+    }
     LLAMA_LOG_DEBUG("%s: queued GPU target before CPU acceptance (%d rows)\n", __func__, n);
     return true;
 }
@@ -2723,7 +2742,8 @@ void llama_context::synchronize_nextn_catchup() {
 
 bool llama_context::decode_nextn_prefetch(llama_context & source, const llama_batch & batch) {
     const int n = batch.n_tokens;
-    if (&source == this || !source.nextn_readback || !nextn_handoff || n < 3 || n > 9 ||
+    if (!nextn_prefetch_enabled || !source.nextn_prefetch_enabled ||
+            &source == this || !source.nextn_readback || !nextn_handoff || n < 3 || n > 9 ||
             cparams.n_seq_max != 1 || !batch.token || !batch.embd || !batch.pos || !batch.seq_id ||
             !batch.n_seq_id || !source.nextn_last_ubatch.token || model.hparams.n_swa || model.hparams.use_alibi ||
             model.vocab.n_tokens() > (1u << 24) || batch.pos[0] < 0 || batch.pos[0] > (1 << 24) - 2*n ||
@@ -5016,6 +5036,10 @@ float * llama_get_embeddings_seq(llama_context * ctx, llama_seq_id seq_id) {
 
 void llama_set_embeddings_nextn(llama_context * ctx, bool value, bool masked) {
     ctx->set_embeddings_nextn(value, masked);
+}
+
+void llama_set_nextn_prefetch(llama_context * ctx, bool enabled) {
+    ctx->set_nextn_prefetch(enabled);
 }
 
 bool llama_decode_nextn(llama_context * ctx, llama_batch batch, int32_t n_draft) {

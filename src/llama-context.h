@@ -160,6 +160,7 @@ struct llama_context {
 
     void set_embeddings (bool value);
     void set_embeddings_nextn(bool value, bool masked);
+    void set_nextn_prefetch(bool enabled);
     void set_embeddings_layer_inp(uint32_t lid, bool enable);
     void set_nextn_layer_offset(int32_t offset);
     void set_causal_attn(bool value);
@@ -416,6 +417,8 @@ private:
     int nextn_target_active = -1;
     int nextn_target_pending = -1;
     bool nextn_target_consume = false;
+    bool nextn_prefetch_enabled = true;
+    bool nextn_prefetch_reported = false;
 
     bool sched_need_reserve = true;
 

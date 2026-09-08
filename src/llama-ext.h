@@ -95,6 +95,9 @@ LLAMA_API llama_memory_breakdown llama_get_memory_breakdown(const struct llama_c
 // If masked == false, output the embeddings for all tokens in the batch regardless of batch.logits
 LLAMA_API void llama_set_embeddings_nextn(struct llama_context * ctx, bool value, bool masked);
 
+// Configure NextN prefetch before decoding. Supported single-GPU contexts use fixed KV graph sizes.
+LLAMA_API void llama_set_nextn_prefetch(struct llama_context * ctx, bool enabled);
+
 // Decode a single-sequence, greedy NextN chain. Only backend top-10 sampling outputs are returned.
 // Returns false when unsupported or on failure; the caller can use regular decode instead.
 LLAMA_API bool llama_decode_nextn(struct llama_context * ctx, struct llama_batch batch, int32_t n_draft);

@@ -518,7 +518,9 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3, n_seq, params.draft.n_max)
         , params(params.draft)
     {
-        allow_prefetch = n_seq == 1 && !params.has_synth() && params.draft.p_min == 0.0f;
+        allow_prefetch = params.draft.gpu_pipeline && params.draft.backend_sampling &&
+            params.draft.n_max >= 2 && params.draft.n_max <= 8 &&
+            n_seq == 1 && !params.has_synth() && params.draft.p_min == 0.0f;
         SPC_TRC("%s", "adding speculative implementation 'draft-eagle3'\n");
         SPC_TRC("- n_max=%d, n_min=%d, p_min=%f, backend_sampling=%d\n", params.draft.n_max, params.draft.n_min, params.draft.p_min, (int) params.draft.backend_sampling);
 
@@ -586,6 +588,9 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
         // turn on extraction of the draft model's pre-norm hidden state
         // (used both for the encoder output g_embd and the decoder pre-norm output).
         llama_set_embeddings_nextn(ctx_dft, true, /*masked*/ true);
+
+        llama_set_nextn_prefetch(ctx_tgt, allow_prefetch);
+        llama_set_nextn_prefetch(ctx_dft, allow_prefetch);
 
         pending_g_last.assign(n_seq, std::vector<float>(n_embd_dec, 0.0f));
         pending_pos_last.assign(n_seq, -1);
@@ -1497,7 +1502,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_MTP, n_seq, params.draft.n_max)
         , params(params.draft)
     {
-        allow_prefetch = n_seq == 1 && !params.has_synth() && params.draft.p_min == 0.0f;
+        allow_prefetch = params.draft.gpu_pipeline && params.draft.backend_sampling &&
+            params.draft.n_max >= 2 && params.draft.n_max <= 8 &&
+            n_seq == 1 && !params.has_synth() && params.draft.p_min == 0.0f;
         auto * ctx_tgt = this->params.ctx_tgt;
         auto * ctx_dft = this->params.ctx_dft;
         GGML_ASSERT(ctx_tgt && ctx_dft && "MTP requires ctx_tgt and ctx_dft to be set");
@@ -1550,6 +1557,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         llama_set_embeddings_nextn(ctx_tgt, true, /*masked*/ false);
         llama_set_embeddings_nextn(ctx_dft, true, /*masked*/ true);
+
+        llama_set_nextn_prefetch(ctx_tgt, allow_prefetch);
+        llama_set_nextn_prefetch(ctx_dft, allow_prefetch);
 
         is_mem_shared = llama_get_ctx_other(ctx_dft) == ctx_tgt;
         chain_heads   = n_mtp_layers > 1 && !is_mem_shared;
@@ -2631,6 +2641,20 @@ std::vector<double> common_speculative_synth_rates_resolve(const common_params_s
 const std::vector<double> & common_speculative_get_synth_probs(const common_speculative * spec) {
     GGML_ASSERT(spec);
     return spec->synth_probs;
+}
+
+bool common_speculative_gpu_pipeline(const common_params & params) {
+    const auto & spec = params.speculative;
+    return spec.draft.gpu_pipeline && params.n_parallel == 1 && !spec.has_synth() &&
+        spec.draft.backend_sampling && spec.draft.p_min == 0.0f &&
+        spec.draft.n_max >= 2 && spec.draft.n_max <= 8 &&
+        params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED &&
+        std::any_of(spec.types.begin(), spec.types.end(), [](auto type) {
+            return type == COMMON_SPECULATIVE_TYPE_DRAFT_MTP || type == COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3;
+        }) &&
+        std::all_of(spec.types.begin(), spec.types.end(), [](auto type) {
+            return type == COMMON_SPECULATIVE_TYPE_NONE || type == COMMON_SPECULATIVE_TYPE_DRAFT_MTP || type == COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3;
+        });
 }
 
 common_params common_base_params_to_speculative(const common_params & params) {

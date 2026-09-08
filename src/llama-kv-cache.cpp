@@ -365,11 +365,6 @@ llama_kv_cache::llama_kv_cache(
     const char * LLAMA_KV_CACHE_DEBUG = getenv("LLAMA_KV_CACHE_DEBUG");
     debug = LLAMA_KV_CACHE_DEBUG ? atoi(LLAMA_KV_CACHE_DEBUG) : 0;
 
-    const char * LLAMA_KV_CACHE_FIXED_SIZE = getenv("LLAMA_KV_CACHE_FIXED_SIZE");
-    fixed_size = LLAMA_KV_CACHE_FIXED_SIZE && atoi(LLAMA_KV_CACHE_FIXED_SIZE) != 0;
-    if (fixed_size) {
-        LLAMA_LOG_INFO("%s: fixed KV graph size = %u\n", __func__, get_size());
-    }
 }
 
 void llama_kv_cache::clear(bool data) {
@@ -1210,6 +1205,15 @@ uint32_t llama_kv_cache::get_size() const {
 
 uint32_t llama_kv_cache::get_n_stream() const {
     return n_stream;
+}
+
+bool llama_kv_cache::set_fixed_size(bool value) {
+    if (fixed_size == value) {
+        return false;
+    }
+    fixed_size = value;
+    LLAMA_LOG_INFO("%s: %s KV graph size (capacity = %u)\n", __func__, value ? "fixed" : "dynamic", get_size());
+    return true;
 }
 
 bool llama_kv_cache::get_has_shift() const {

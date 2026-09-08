@@ -1781,6 +1781,11 @@ private:
 
         // initialize samplers
         if (task.need_sampling()) {
+            const bool auto_backend_sampling = common_speculative_gpu_pipeline(params_base) &&
+                task.params.sampling.temp <= 0.0f && task.params.sampling.mirostat == 0 &&
+                llama_model_n_devices(model_tgt) == 1 &&
+                strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(llama_model_get_device(model_tgt, 0))), "CUDA") == 0;
+            task.params.sampling.backend_sampling |= auto_backend_sampling;
             try {
                 slot.smpl.reset(common_sampler_init(model_tgt, task.params.sampling));
             } catch (std::exception & e) {

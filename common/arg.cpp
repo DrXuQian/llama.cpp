@@ -4155,6 +4155,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_N_CPU_MOE"));
 
     add_opt(common_arg(
+        {"--no-spec-gpu-pipeline"},
+        "disable automatic GPU acceptance and prefetch for MTP and EAGLE3",
+        [](common_params & params) {
+            params.speculative.draft.gpu_pipeline = false;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
         {"--spec-draft-n-max"}, "N",
         string_format("number of tokens to draft for speculative decoding (default: %d)", params.speculative.draft.n_max),
         [](common_params & params, int value) {

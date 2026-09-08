@@ -37,6 +37,8 @@ const std::vector<double> & common_speculative_get_synth_probs(const common_spec
 
 common_params common_base_params_to_speculative(const common_params & params);
 
+bool common_speculative_gpu_pipeline(const common_params & params);
+
 struct common_speculative_output_limits {
     int32_t total;
     int32_t per_seq;

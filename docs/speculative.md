@@ -4,6 +4,29 @@ llama.cpp supports speculative decoding, a technique that can significantly acce
 
 [Speculative decoding](https://en.wikipedia.org/wiki/Transformer_(deep_learning)#Speculative_decoding) leverages the fact that computing n tokens in a batch (as in prompt processing) is more efficient than computing n sequentially (as in response generation). By generating draft tokens quickly and then verifying them with the target model in a single batch, this approach can achieve substantial speedups when the draft predictions are frequently correct.
 
+## Automatic GPU pipeline
+
+MTP and EAGLE3 use GPU acceptance and draft/target prefetch automatically when supported. No optimization environment variables are needed. The server places input embeddings on the selected CUDA device unless a tensor override specifies otherwise, and enables target backend sampling for greedy requests. CUDA input transfers use asynchronous staging and CUDA waits use spin scheduling by default.
+
+The complete pipeline currently supports Qwen3.5/Qwen3.6 MTP and Qwen3 dense/MoE EAGLE3 targets on one CUDA device, with full GPU offload, one slot, 2 to 8 draft tokens, greedy sampling, Flash Attention, and unquantized KV. Eligible contexts up to 8192 tokens use a fixed KV graph size automatically. Other configurations keep the applicable optimizations and fall back when a stage cannot be prefetched. Temperature, parallelism, context size, explicit tensor placement, and Flash Attention settings remain under user control. The default `-fa auto` is sufficient when the backend supports FA; the server's automatic slot count is four, so select `-np 1` for this pipeline.
+
+For example:
+
+```bash
+llama-server -m Qwen3.6-35B-A3B-MTP.gguf --spec-type draft-mtp \
+    -ngl 99 -np 1 -c 8192 --temp 0 --spec-draft-n-max 4
+
+llama-server -m Qwen3-30B-A3B.gguf -md Qwen3-30B-A3B-eagle3.gguf \
+    --spec-type draft-eagle3 -ngl 99 -ngld 99 -np 1 -c 8192 \
+    --temp 0 --spec-draft-n-max 4
+```
+
+Request-level sampling settings also apply: a nonzero temperature or grammar can prevent the full pipeline. Once target prefetch succeeds, the log reports `GPU NextN pipeline active; target submitted before CPU acceptance` at the normal log level. CPU acceptance and output bookkeeping still run after GPU work has been submitted.
+
+Use `--no-spec-gpu-pipeline` to disable automatic target sampling, input placement, fixed KV sizing, and acceptance prefetch. Explicit `--backend-sampling` and tensor overrides still apply, and the CUDA transfer and scheduling improvements remain enabled. The former `LLAMA_NEXTN_TARGET_PREFETCH`, `LLAMA_MTP_TARGET_PREFETCH`, `LLAMA_KV_CACHE_FIXED_SIZE`, `GGML_CUDA_ASYNC_INPUTS`, and `GGML_CUDA_SCHEDULE_SPIN` environment variables are no longer read.
+
+Fixed KV sizing and prefetch have memory and compute costs; reducing CPU-wait gaps does not guarantee higher token throughput. Spin scheduling can increase CPU use while waiting for the GPU.
+
 ## Implementations
 
 The `llama-server` application supports several implementations of speculative decoding. An implementation with draft model can be mixed with an implementation without draft model.
