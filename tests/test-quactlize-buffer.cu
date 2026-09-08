@@ -16,7 +16,7 @@ struct test_event { test_stream * stream = nullptr; size_t end = 0; };
 static std::set<void *> allocations, pinned;
 static bool allow_d2h = false;
 static bool plant_copy_wait = false;
-static int host_waits = 0, copies = 0, pack_calls = 0, external_waits = 0;
+static int host_waits = 0, copies = 0, pack_calls = 0, stream_waits = 0;
 
 static test_stream * ts(cudaStream_t stream) { return (test_stream *) stream; }
 static test_event * te(cudaEvent_t event) { return (test_event *) event; }
@@ -50,6 +50,11 @@ static cudaError_t test_stream_sync(cudaStream_t stream) {
     drain(ts(stream), ts(stream)->work.size());
     return cudaSuccess;
 }
+static cudaError_t test_stream_capture_status(cudaStream_t stream, cudaStreamCaptureStatus * status) {
+    require(stream != nullptr && status != nullptr);
+    *status = cudaStreamCaptureStatusNone;
+    return cudaSuccess;
+}
 static cudaError_t test_event_create(cudaEvent_t * out, unsigned flags) {
     require(flags == cudaEventDisableTiming);
     *out = (cudaEvent_t) new test_event;
@@ -70,8 +75,8 @@ static cudaError_t test_event_destroy(cudaEvent_t event) {
     return cudaSuccess;
 }
 static cudaError_t test_wait(cudaStream_t stream, cudaEvent_t event, unsigned flags) {
-    require((flags == 0 || flags == cudaEventWaitExternal) && event != nullptr);
-    external_waits += flags == cudaEventWaitExternal;
+    require(flags == 0 && event != nullptr);
+    ++stream_waits;
     test_stream * dependency = te(event)->stream;
     const size_t end = te(event)->end;
     ts(stream)->work.push_back([=]() { drain(dependency, end); });
@@ -129,6 +134,7 @@ static int test_prepare(int qtype, const uint8_t * raw, uint8_t * low, uint8_t *
 #define cudaStreamCreateWithFlags test_stream_create
 #define cudaStreamDestroy test_stream_destroy
 #define cudaStreamSynchronize test_stream_sync
+#define cudaStreamIsCapturing test_stream_capture_status
 #define cudaEventCreateWithFlags test_event_create
 #define cudaEventRecord test_event_record
 #define cudaEventSynchronize test_event_sync
@@ -187,10 +193,10 @@ static void run_case(int qtype, int experts) {
     cudaStream_t compute;
     CUDA_CHECK(cudaStreamCreateWithFlags(&compute, cudaStreamNonBlocking));
     const int before_launch = host_waits;
-    const int before_external = external_waits;
+    const int before_stream_waits = stream_waits;
     ggml_quactlize_wait_ready(art, compute);
     require(host_waits == before_launch);
-    require(external_waits == before_external + 1);
+    require(stream_waits == before_stream_waits + 1);
     CUDA_CHECK(cudaStreamSynchronize(compute));
     require(copies == copied);
 

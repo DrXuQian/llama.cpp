@@ -1,6 +1,23 @@
 // Real stream/capture/replay coverage for the production readiness helper.
 // Synthetic bytes isolate synchronization; no PPU pack or GEMM is called.
+#include "common.cuh"
+
+// Enforce PPU's flag contract on NVIDIA too, then forward to the real runtime.
+static cudaError_t checked_wait_event(cudaStream_t stream, cudaEvent_t event, unsigned int flags) {
+    cudaStreamCaptureStatus status;
+    cudaError_t rc = cudaStreamIsCapturing(stream, &status);
+    if (rc != cudaSuccess) { return rc; }
+    const unsigned int expected = status == cudaStreamCaptureStatusNone ? 0 : cudaEventWaitExternal;
+    if (flags != expected) {
+        fprintf(stderr, "KPACK_READY FLAG_CONTRACT capture=%d flags=%u expected=%u\n", (int) status, flags, expected);
+        return cudaErrorIllegalState;
+    }
+    return cudaStreamWaitEvent(stream, event, flags);
+}
+
+#define cudaStreamWaitEvent checked_wait_event
 #include "quactlize-buft.cuh"
+#undef cudaStreamWaitEvent
 
 #include <chrono>
 #include <condition_variable>
@@ -56,7 +73,7 @@ static void require_pending(cudaEvent_t event) {
     require(last == cudaSuccess || last == cudaErrorNotReady);
 }
 
-static void run_case(bool pending_pack, bool stalled_copy) {
+static void run_case(bool capture_first, bool pending_pack, bool stalled_copy) {
     constexpr int bytes = 4096;
     constexpr uint8_t packed = 0x5a;
     constexpr uint8_t want = packed ^ 0x33;
@@ -104,44 +121,59 @@ static void run_case(bool pending_pack, bool stalled_copy) {
 
     ggml_quactlize_artifact art{};
     art.ready = ready;
-    cudaGraph_t graph;
-    CUDA_CHECK(cudaStreamBeginCapture(compute, cudaStreamCaptureModeRelaxed));
-    ggml_quactlize_wait_ready(art, compute);
-    read_weights<<<1, 128, 0, compute>>>(weights, output, bytes);
-    CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(cudaStreamEndCapture(compute, &graph));
-    cudaGraphNode_t nodes[8];
-    size_t count = 8;
-    CUDA_CHECK(cudaGraphGetNodes(graph, nodes, &count));
-    require(count <= 8);
-    int waits = 0;
-    for (size_t i = 0; i < count; ++i) {
-        cudaGraphNodeType type;
-        CUDA_CHECK(cudaGraphNodeGetType(nodes[i], &type));
-        waits += type == cudaGraphNodeTypeWaitEvent;
-    }
-    require(waits == 1);
-    cudaGraphExec_t instance;
-    CUDA_CHECK(cudaGraphInstantiate(&instance, graph, nullptr, nullptr, 0));
-    for (int repeat = 0; repeat < 3; ++repeat) {
-        CUDA_CHECK(cudaGraphLaunch(instance, compute));
-        if (pending_pack && repeat == 0) {
-            // Capture and submission return while the producer is still held.
-            require_pending(ready);
-            pack_gate.release();
+    for (int phase = 0; phase < 2; ++phase) {
+        const bool capture = phase == 0 ? capture_first : !capture_first;
+        cudaGraph_t graph = nullptr;
+        cudaGraphExec_t instance = nullptr;
+        if (capture) {
+            CUDA_CHECK(cudaStreamBeginCapture(compute, cudaStreamCaptureModeRelaxed));
+            ggml_quactlize_wait_ready(art, compute);
+            read_weights<<<1, 128, 0, compute>>>(weights, output, bytes);
+            CUDA_CHECK(cudaGetLastError());
+            CUDA_CHECK(cudaStreamEndCapture(compute, &graph));
+            cudaGraphNode_t nodes[8];
+            size_t count = 8;
+            CUDA_CHECK(cudaGraphGetNodes(graph, nodes, &count));
+            require(count <= 8);
+            int waits = 0;
+            for (size_t i = 0; i < count; ++i) {
+                cudaGraphNodeType type;
+                CUDA_CHECK(cudaGraphNodeGetType(nodes[i], &type));
+                waits += type == cudaGraphNodeTypeWaitEvent;
+            }
+            require(waits == 1);
+            CUDA_CHECK(cudaGraphInstantiate(&instance, graph, nullptr, nullptr, 0));
         }
-        CUDA_CHECK(cudaMemcpyAsync(result, output, bytes, cudaMemcpyDeviceToHost, compute));
-        CUDA_CHECK(cudaStreamSynchronize(compute));
-        require(bad_bytes(result, bytes, want) == 0);
-        if (stalled_copy) { require_pending(done); }
+        for (int repeat = 0; repeat < 3; ++repeat) {
+            if (capture) {
+                CUDA_CHECK(cudaGraphLaunch(instance, compute));
+            } else {
+                ggml_quactlize_wait_ready(art, compute);
+                read_weights<<<1, 128, 0, compute>>>(weights, output, bytes);
+                CUDA_CHECK(cudaGetLastError());
+            }
+            if (pending_pack && phase == 0 && repeat == 0) {
+                // Capture/eager submission returns while the producer is still held.
+                require_pending(ready);
+                pack_gate.release();
+            }
+            CUDA_CHECK(cudaMemcpyAsync(result, output, bytes, cudaMemcpyDeviceToHost, compute));
+            CUDA_CHECK(cudaStreamSynchronize(compute));
+            require(bad_bytes(result, bytes, want) == 0);
+            if (stalled_copy) { require_pending(done); }
+        }
+        if (capture) {
+            CUDA_CHECK(cudaGraphExecDestroy(instance));
+            CUDA_CHECK(cudaGraphDestroy(graph));
+        }
+        printf("KPACK_READY PASS capture=%d pending_pack=%d stalled_D2H=%d repeats=3\n",
+               capture, pending_pack, stalled_copy);
     }
     if (stalled_copy) {
         copy_gate.release();
         CUDA_CHECK(cudaStreamSynchronize(copy));
         require(bad_bytes(snapshot, bytes, packed) == 0);
     }
-    CUDA_CHECK(cudaGraphExecDestroy(instance));
-    CUDA_CHECK(cudaGraphDestroy(graph));
     CUDA_CHECK(cudaStreamSynchronize(pack));
     CUDA_CHECK(cudaEventDestroy(ready));
     CUDA_CHECK(cudaEventDestroy(done));
@@ -152,8 +184,8 @@ static void run_case(bool pending_pack, bool stalled_copy) {
     CUDA_CHECK(cudaFree(output));
     CUDA_CHECK(cudaFreeHost(result));
     CUDA_CHECK(cudaFreeHost(snapshot));
-    printf("KPACK_READY PASS pending_pack=%d stalled_D2H=%d replays=3 wait_nodes=%d\n",
-           pending_pack, stalled_copy, waits);
+    printf("KPACK_READY_TRANSITION PASS capture_first=%d pending_pack=%d stalled_D2H=%d\n",
+           capture_first, pending_pack, stalled_copy);
 }
 
 int main() {
@@ -161,9 +193,11 @@ int main() {
     CUDA_CHECK(cudaGetDeviceCount(&devices));
     if (!devices) { return 77; }
     CUDA_CHECK(cudaSetDevice(0));
-    run_case(false, false);
-    run_case(true, false);
-    run_case(false, true);
-    printf("KPACK_READY_ALL PASS graph_replays=9 model_oracle=NOT_RUN\n");
+    for (bool capture_first : {false, true}) {
+        run_case(capture_first, false, false);
+        run_case(capture_first, true, false);
+        run_case(capture_first, false, true);
+    }
+    printf("KPACK_READY_ALL PASS eager_checks=18 graph_replays=18 transitions=6 model_oracle=NOT_RUN\n");
     return 0;
 }
