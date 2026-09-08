@@ -3,6 +3,7 @@
 
 import argparse
 import hashlib
+from itertools import islice
 import json
 import math
 from pathlib import Path
@@ -26,6 +27,37 @@ METRICS = {
 def require(ok, message):
     if not ok:
         raise ValueError(message)
+
+
+def gsm8k_corpus(path):
+    """Use a fixed local sample for likelihood comparison, not answer scoring."""
+    suffix = path.suffix.lower()
+    if suffix in (".jsonl", ".ndjson"):
+        with path.open(encoding="utf-8") as stream:
+            rows = [json.loads(line) for line in islice((line for line in stream if line.strip()), 32)]
+    elif suffix == ".json":
+        rows = json.loads(path.read_text(encoding="utf-8"))
+        require(isinstance(rows, list), "GSM8K JSON must be a list of question/answer objects")
+        rows = rows[:32]
+    elif suffix == ".parquet":
+        try:
+            import pyarrow.parquet as pq
+        except ImportError as error:
+            raise ValueError("reading Parquet requires pyarrow; use a local JSONL export instead") from error
+        with pq.ParquetFile(path) as table:
+            batches = table.iter_batches(batch_size=32, columns=["question", "answer"])
+            first = next(batches, None)
+            rows = first.to_pylist() if first is not None else []
+    else:
+        raise ValueError("GSM8K_FILE must be one local .jsonl, .json or .parquet file, not a directory")
+    require(rows, "empty GSM8K sample")
+    samples = []
+    for index, row in enumerate(rows):
+        require(isinstance(row, dict) and all(isinstance(row.get(key), str) and row[key].strip()
+                                             for key in ("question", "answer")),
+                f"GSM8K record {index} needs nonempty question and answer strings")
+        samples.append(f"Question: {row['question']}\nAnswer: {row['answer']}\n\n")
+    return "".join(samples)
 
 
 def inventory(bundle, inspector):
@@ -163,8 +195,13 @@ def main():
     check.add_argument("--phase", choices=("reference-save", "reference-self", "kpack-save", "cache-self", "cache-reference"), required=True)
     lp = sub.add_parser("logprobs")
     lp.add_argument("path", type=Path)
+    corpus = sub.add_parser("gsm8k")
+    corpus.add_argument("path", type=Path)
     args = parser.parse_args()
     try:
+        if args.command == "gsm8k":
+            print(gsm8k_corpus(args.path), end="")
+            return
         if args.command == "inventory":
             result = inventory(args.bundle, args.inspector)
         elif args.command == "logprobs":
