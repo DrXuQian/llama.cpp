@@ -21,6 +21,9 @@ sample, **not GSM8K generated-answer accuracy**. Scored coverage remains two
 Only the existing `llama-perplexity` target is built incrementally. The
 Quactlize libraries, weights, cache format and compute implementation do not
 change. A complete cache is reused; no new background cache write is needed.
+Each invocation is first parsed with `--help`, before the profiler/model run.
+Perplexity uses the common `--log-colors off` option, not completion's
+example-specific `--color` option.
 
 The first integration check uses two 256-token chunks, with 254 scored tokens
 per mode. It runs both batch/ubatch 128 (prefill) and 1 (teacher-forced decode).

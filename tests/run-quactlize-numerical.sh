@@ -119,7 +119,7 @@ for batch in "${BATCHES[@]}"; do
     # No model warmup: trace evidence must come from the scored workload,
     # not a dummy warmup invocation. CUDA graph execution remains enabled.
     ARGS=(-m "$MODEL" --mmap -ngl 99 --split-mode none --fit off --no-warmup
-        -c 256 -b "$batch" -ub "$batch" -t 16 -tb 32 --chunks 2 --color off -f "$EVAL_FILE" -v)
+        -c 256 -b "$batch" -ub "$batch" -t 16 -tb 32 --chunks 2 --log-colors off -f "$EVAL_FILE" -v)
     for phase in reference-save reference-self kpack-save cache-self cache-reference; do
         stage="b$batch-$phase"
         case "$phase" in
@@ -134,6 +134,13 @@ for batch in "${BATCHES[@]}"; do
             cache-reference) EXTRA=(-ot 'ffn_.*_exps=CUDA0_KPACK' --kpack-cache "$CACHE_DIR"
                 --kl-divergence --kl-divergence-base "$RUN/logprobs/b$batch-reference");;
         esac
+        # Parse the exact invocation before starting the profiler or loading weights.
+        if ! "$BUILD_DIR/bin/llama-perplexity" "${ARGS[@]}" "${EXTRA[@]}" --help \
+                > "$RUN/results/$stage.cli.log" 2>&1; then
+            tail -n 25 "$RUN/results/$stage.cli.log" >&2
+            printf 'KPACK_NUMERICAL FAIL phase=%s reason=CLI_ARGUMENTS\n' "$stage" >&2
+            false
+        fi
         printf '\nKPACK_NUMERICAL_RUN phase=%s profiler=kernel-activity\n' "$stage"
         /usr/bin/time -v -o "$RUN/results/$stage.time" \
             "$ASYS" profile --trace hggc --hggc-trace-set kernel-activity --sample none \
