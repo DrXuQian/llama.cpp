@@ -4,6 +4,7 @@
 import copy
 import json
 from pathlib import Path
+import re
 import sqlite3
 import struct
 import tempfile
@@ -38,9 +39,40 @@ class NumericalEvidence(unittest.TestCase):
         ''')
         con.close()
 
-    def check(self, phase="cache-reference", text=None, manifest=None):
+    def check(self, phase="cache-reference", text=None, manifest=None, batch=1):
         self.log.write_text(self.text if text is None else text)
-        return analyze(self.log, self.db, self.index, manifest or self.manifest, 1, phase)
+        return analyze(self.log, self.db, self.index, manifest or self.manifest, batch, phase)
+
+    def save_text(self, batch):
+        source = (Path(__file__).parents[1] / 'tools/perplexity/perplexity.cpp').read_text()
+        fmt = re.search(r'LOG_INF\("([^"\n]*calculating perplexity[^"\n]*)", __func__', source)
+        self.assertIsNotNone(fmt)
+        header = fmt[1].replace('\\n', '\n') % ('perplexity', 2, 256, batch, 1)
+        route = f'[ncp-route] MUL_MAT_ID blk.0.ffn_up_exps.weight T={batch} E=256 used=8 -> so-quactlize-kpack\n'
+        return header + route + 'Final estimate: PPL = 7.1250 +/- 0.01000\n'
+
+    def test_kpack_save_producer_message(self):
+        for batch in (1, 128):
+            with self.subTest(batch=batch):
+                result = self.check('kpack-save', self.save_text(batch), batch=batch)
+                self.assertEqual(result['metrics']['ppl'], 7.125)
+
+    def test_reference_save_producer_message(self):
+        self.edit_db("UPDATE StringIds SET value='ordinary_gpu_gemm' WHERE id IN (1, 2)")
+        for batch in (1, 128):
+            with self.subTest(batch=batch):
+                result = self.check('reference-save', self.save_text(batch).replace('so-quactlize-kpack', 'GENERIC'), batch=batch)
+                self.assertEqual(result['quactlize_grouped_gemm_calls'], 0)
+
+    def test_save_still_rejects_wrong_coverage(self):
+        for before, after in (('over 2 chunks', 'over 1 chunks'), ('n_ctx=256', 'n_ctx=512'),
+                              ('batch_size=128', 'batch_size=1'), ('n_seq=1', 'n_seq=2'), ('n_seq=1', 'n_seq=10')):
+            with self.subTest(field=before), self.assertRaisesRegex(ValueError, 'context/chunks/batch'):
+                self.check('kpack-save', self.save_text(128).replace(before, after), batch=128)
+
+    def test_save_requires_save_header(self):
+        with self.assertRaisesRegex(ValueError, 'observed='):
+            self.check('kpack-save', self.text + 'Final estimate: PPL = 7.1250 +/- 0.01000\n')
 
     def edit_db(self, sql):
         with sqlite3.connect(self.db) as con:
