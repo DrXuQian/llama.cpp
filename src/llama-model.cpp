@@ -1485,7 +1485,33 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     }
 
-    ml.init_mappings(true, use_mlock ? &pimpl->mlock_mmaps : nullptr);
+    // Inspect cache metadata before prefetching the original GGUF payload.
+    if (!ml.no_alloc && params.kpack_cache_path && params.kpack_cache_path[0]) {
+        if (ml.files.size() == 1 && !ml.source_path.empty()) {
+            std::vector<llama_kpack_source_tensor> inventory;
+            for (const auto & entry : ml.weights_map) {
+                const auto & w = entry.second;
+                llama_kpack_source_tensor src;
+                src.name = entry.first; src.gguf_index = w.gguf_index;
+                src.data_offset = w.offs; src.size_bytes = ggml_nbytes(w.tensor);
+                src.ggml_type = w.tensor->type; src.rank = ggml_n_dims(w.tensor);
+                src.k = w.tensor->ne[0]; src.n = w.tensor->ne[1];
+                src.experts = src.rank == 3 ? w.tensor->ne[2] : 0;
+                inventory.push_back(std::move(src));
+            }
+            pimpl->kpack_cache = std::make_unique<llama_kpack_cache>(
+                params.kpack_cache_path, ml.source_path, inventory, ml.files[0]->file_id());
+            ml.kpack_cache = pimpl->kpack_cache.get();
+        } else {
+            LLAMA_LOG_WARN("[kpack-cache] persistence currently requires one named GGUF file; using GPU pack\n");
+        }
+    }
+    // Keep the source mapped for uncached tensors, but fault its pages on demand.
+    const bool prefetch_source = !ml.kpack_cache || !ml.kpack_cache->has_cached_tensors();
+    if (ml.use_mmap && ml.kpack_cache) {
+        LLAMA_LOG_INFO("[kpack-cache] source_mmap=%s\n", prefetch_source ? "prefetch" : "on-demand");
+    }
+    ml.init_mappings(prefetch_source, use_mlock ? &pimpl->mlock_mmaps : nullptr);
     pimpl->mappings.reserve(ml.mappings.size());
 
     // create the backend buffers
@@ -1608,26 +1634,6 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     }
 
     // load tensor data
-    if (params.kpack_cache_path && params.kpack_cache_path[0]) {
-        if (ml.files.size() == 1 && !ml.source_path.empty()) {
-            std::vector<llama_kpack_source_tensor> inventory;
-            for (const auto & entry : ml.weights_map) {
-                const auto & w = entry.second;
-                llama_kpack_source_tensor src;
-                src.name = entry.first; src.gguf_index = w.gguf_index;
-                src.data_offset = w.offs; src.size_bytes = ggml_nbytes(w.tensor);
-                src.ggml_type = w.tensor->type; src.rank = ggml_n_dims(w.tensor);
-                src.k = w.tensor->ne[0]; src.n = w.tensor->ne[1];
-                src.experts = src.rank == 3 ? w.tensor->ne[2] : 0;
-                inventory.push_back(std::move(src));
-            }
-            pimpl->kpack_cache = std::make_unique<llama_kpack_cache>(
-                params.kpack_cache_path, ml.source_path, inventory, ml.files[0]->file_id());
-            ml.kpack_cache = pimpl->kpack_cache.get();
-        } else {
-            LLAMA_LOG_WARN("[kpack-cache] persistence currently requires one named GGUF file; using GPU pack\n");
-        }
-    }
     for (auto & [ctx, buf_map] : ctx_buf_maps) {
         if (!ml.load_all_data(ctx, buf_map, use_mlock ? &pimpl->mlock_mmaps : NULL, params.progress_callback, params.progress_callback_user_data)) {
             return false;

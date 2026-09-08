@@ -442,6 +442,7 @@ int main() {
         memcpy(high_data + high.planes.low_bytes + high.planes.high_bytes, high.units.data(), high.planes.units_bytes);
         {
             llama_kpack_cache cache(model_cache, gguf_path, inventory);
+            CHECK(!cache.has_cached_tensors(), "a cache miss retains source prefetch");
             CHECK(!cache.load(tensor), "cache miss uses the normal GPU producer");
             cache.capture(other); // sorting must not mix up the shared staging slots
             cache.capture(tensor);
@@ -463,6 +464,13 @@ int main() {
         memset(other->data, 0xA5, ggml_nbytes(other));
         {
             llama_kpack_cache cache(model_cache, gguf_path, inventory);
+            CHECK(cache.has_cached_tensors(), "cached metadata disables whole-source prefetch before uploads");
+            auto * missing = ggml_dup_tensor(gctx, t_dense);
+            ggml_set_name(missing, dense.name.c_str());
+            missing->buffer = tensor->buffer;
+            CHECK(!cache.load(missing), "a partial cache leaves uncached tensors on the original loading path");
+            missing->buffer = nullptr;
+            CHECK(!cache.load(t_norm), "CPU weights remain on the original loading path");
             cache_mock::descriptor_mismatch = true;
             CHECK(!cache.load(tensor), "a changed registry cannot consume cached bytes");
             cache_mock::descriptor_mismatch = false;
@@ -520,6 +528,8 @@ int main() {
         w.pop_back(); write_file(c + "/weights.bin", w);
         llama_kpack_sidecar_reader truncated;
         CHECK(!truncated.open(c, err), "truncation must still fail the structural size check");
+        llama_kpack_cache invalid(c, gguf_path, inventory);
+        CHECK(!invalid.has_cached_tensors(), "an invalid cache retains source prefetch");
         rm_bundle(c);
     }
     {   // Cheap local identity still rejects a different source inode.
@@ -528,6 +538,10 @@ int main() {
         CHECK(r.open(streamed, err) && !r.load_unchecked(other, inventory, err), "local cache binds to its original source file");
         auto wrong = inventory; wrong[0].data_offset += 32;
         CHECK(!r.load_unchecked(gguf_path, wrong, err), "unchecked loading retains the tensor inventory contract");
+        llama_kpack_cache replaced(streamed, other, inventory);
+        CHECK(!replaced.has_cached_tensors(), "a replaced source retains source prefetch");
+        llama_kpack_cache mismatched(streamed, gguf_path, wrong);
+        CHECK(!mismatched.has_cached_tensors(), "an inventory mismatch retains source prefetch");
         unlink(other.c_str());
     }
     {   // a flipped byte inside a span
