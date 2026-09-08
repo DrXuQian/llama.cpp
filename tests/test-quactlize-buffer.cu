@@ -16,7 +16,7 @@ struct test_event { test_stream * stream = nullptr; size_t end = 0; };
 static std::set<void *> allocations, pinned;
 static bool allow_d2h = false;
 static bool plant_copy_wait = false;
-static int host_waits = 0, copies = 0, pack_calls = 0;
+static int host_waits = 0, copies = 0, pack_calls = 0, external_waits = 0;
 
 static test_stream * ts(cudaStream_t stream) { return (test_stream *) stream; }
 static test_event * te(cudaEvent_t event) { return (test_event *) event; }
@@ -70,7 +70,8 @@ static cudaError_t test_event_destroy(cudaEvent_t event) {
     return cudaSuccess;
 }
 static cudaError_t test_wait(cudaStream_t stream, cudaEvent_t event, unsigned flags) {
-    require(flags == 0 && event != nullptr);
+    require((flags == 0 || flags == cudaEventWaitExternal) && event != nullptr);
+    external_waits += flags == cudaEventWaitExternal;
     test_stream * dependency = te(event)->stream;
     const size_t end = te(event)->end;
     ts(stream)->work.push_back([=]() { drain(dependency, end); });
@@ -186,8 +187,10 @@ static void run_case(int qtype, int experts) {
     cudaStream_t compute;
     CUDA_CHECK(cudaStreamCreateWithFlags(&compute, cudaStreamNonBlocking));
     const int before_launch = host_waits;
+    const int before_external = external_waits;
     ggml_quactlize_wait_ready(art, compute);
     require(host_waits == before_launch);
+    require(external_waits == before_external + 1);
     CUDA_CHECK(cudaStreamSynchronize(compute));
     require(copies == copied);
 
