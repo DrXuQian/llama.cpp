@@ -317,6 +317,18 @@ if (GGML_NCP_QUACTLIZE)
         add_test(NAME test-quactlize-buffer COMMAND $<TARGET_FILE:test-quactlize-buffer>)
         set_tests_properties(test-quactlize-buffer PROPERTIES
             ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_CURRENT_BINARY_DIR}/quactlize-stub:$<TARGET_FILE_DIR:CUDA::cudart>:$ENV{LD_LIBRARY_PATH}")
+        if (TARGET ggml-cpu AND NOT GGML_BACKEND_DL)
+            add_executable(test-quactlize-scheduler test-quactlize-scheduler.cpp)
+            target_include_directories(test-quactlize-scheduler PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
+            target_link_libraries(test-quactlize-scheduler PRIVATE ggml-base ggml-cuda ggml-cpu)
+            add_dependencies(test-quactlize-scheduler ${QUACTLIZE_STUB_TARGETS})
+            add_test(NAME test-quactlize-scheduler COMMAND $<TARGET_FILE:test-quactlize-scheduler>)
+            set_tests_properties(test-quactlize-scheduler PROPERTIES
+                LABELS "device"
+                TIMEOUT 60
+                SKIP_RETURN_CODE 77
+                ENVIRONMENT "QUACTLIZE_PPU_BUNDLE=${CMAKE_CURRENT_BINARY_DIR}/quactlize-stub;QUACTLIZE_PPU_PACK_LIBRARY=$<TARGET_FILE:quactlize-stub-pack>")
+        endif()
     endif()
     # The persistent K-pack sidecar (quactlize kquant-kpack.bundle v3): reader, writer, and their negatives. Host-only
     # -- the file format does not need a device -- so the module is compiled in directly and only ggml-base is linked;
