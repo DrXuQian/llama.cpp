@@ -43,9 +43,15 @@ struct ggml_quactlize_artifact {
     int64_t k;
     int64_t experts;
     cudaEvent_t ready;
+    const uint16_t * scale = nullptr;
+    const uint16_t * zero = nullptr;
+    cudaEvent_t scale_ready = nullptr;
 };
 
 bool ggml_quactlize_artifact_for(const ggml_tensor * tensor, ggml_quactlize_artifact * out);
+// Called before graph capture. GPU preparation is queued once per weight;
+// false retains packed-metadata execution when the memory budget cannot fit.
+bool ggml_quactlize_prepare_scales(const ggml_tensor * tensor);
 
 #ifdef GGML_NCP_QUACTLIZE
 inline void ggml_quactlize_wait_ready(const ggml_quactlize_artifact & art, cudaStream_t stream) {
