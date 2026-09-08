@@ -47,9 +47,13 @@ struct ggml_quactlize_artifact {
 
 bool ggml_quactlize_artifact_for(const ggml_tensor * tensor, ggml_quactlize_artifact * out);
 
+#ifdef GGML_NCP_QUACTLIZE
 inline void ggml_quactlize_wait_ready(const ggml_quactlize_artifact & art, cudaStream_t stream) {
-    CUDA_CHECK(cudaStreamWaitEvent(stream, art.ready, 0));
+    // Recorded once by the pack/upload stream, outside any inference capture.
+    // Retained with the weights for all graph replays; no dependency on backcopy.
+    CUDA_CHECK(cudaStreamWaitEvent(stream, art.ready, cudaEventWaitExternal));
 }
+#endif
 
 // Does this node read a K-pack artifact through ANY of its sources?
 //
