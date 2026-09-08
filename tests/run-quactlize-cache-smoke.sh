@@ -148,7 +148,7 @@ for phase in baseline cold hit; do
     {
         printf '\nKPACK_TIMING phase=%s\n' "$phase"
         grep -E 'Elapsed \(wall clock\)|User time|System time' "$RUN/results/$phase.time"
-        grep -E 'llama_perf_context_print:|\[kpack-cache\]' "$RUN/results/$phase.log"
+        grep -aE '(common_perf_print|llama_perf_context_print):|\[kpack-cache\]' "$RUN/results/$phase.log"
     } >> "$RUN/results/timing-summary.log"
 done
 
@@ -192,7 +192,7 @@ if [[ -n ${EVAL_FILE:-} ]]; then
         fi
         {
             printf '\nKPACK_NUMERICAL phase=%s batch=%s\n' "$phase" "$EVAL_BATCH"
-            grep -E 'Final estimate:|Mean PPL|KLD:|Same top|llama_perf_context_print:' "$RUN/results/$phase.log"
+            grep -aE 'Final estimate:|Mean PPL|KLD:|Same top|(common_perf_print|llama_perf_context_print):' "$RUN/results/$phase.log"
         } >> "$RUN/results/numerical-summary.log"
     done
     printf 'KPACK_NUMERICAL_COMPARISON COMPLETE admission=PENDING_REVIEW\n' | tee -a "$RUN/results/numerical-summary.log"
