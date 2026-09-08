@@ -328,6 +328,18 @@ if (GGML_NCP_QUACTLIZE)
         set_tests_properties(test-quactlize-ready PROPERTIES
             LABELS "device" TIMEOUT 60 SKIP_RETURN_CODE 77
             ENVIRONMENT "LD_LIBRARY_PATH=$<TARGET_FILE_DIR:CUDA::cudart>:$ENV{LD_LIBRARY_PATH}")
+        add_executable(test-quactlize-upload test-quactlize-upload.cu)
+        set_target_properties(test-quactlize-upload PROPERTIES CUDA_RUNTIME_LIBRARY None)
+        target_compile_definitions(test-quactlize-upload PRIVATE GGML_NCP_QUACTLIZE)
+        target_include_directories(test-quactlize-upload PRIVATE
+            ${PROJECT_SOURCE_DIR}/ggml/include ${PROJECT_SOURCE_DIR}/ggml/src
+            ${PROJECT_SOURCE_DIR}/ggml/src/ggml-cuda ${CUDAToolkit_INCLUDE_DIRS})
+        target_link_libraries(test-quactlize-upload PRIVATE ggml-base ggml-cuda CUDA::cudart)
+        add_dependencies(test-quactlize-upload ${QUACTLIZE_STUB_TARGETS})
+        add_test(NAME test-quactlize-upload COMMAND $<TARGET_FILE:test-quactlize-upload>)
+        set_tests_properties(test-quactlize-upload PROPERTIES
+            LABELS "device" TIMEOUT 120 SKIP_RETURN_CODE 77
+            ENVIRONMENT "QUACTLIZE_PPU_BUNDLE=${CMAKE_CURRENT_BINARY_DIR}/quactlize-stub;QUACTLIZE_PPU_PACK_LIBRARY=$<TARGET_FILE:quactlize-stub-pack>")
         if (TARGET ggml-cpu AND NOT GGML_BACKEND_DL)
             add_executable(test-quactlize-scheduler test-quactlize-scheduler.cpp)
             target_include_directories(test-quactlize-scheduler PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)

@@ -14,6 +14,8 @@ struct ggml_quactlize_planes {
 bool ggml_quactlize_tensor_is_kpack(const ggml_tensor * tensor);
 bool ggml_quactlize_plane_layout(const ggml_tensor * tensor, size_t * low_bytes, size_t * high_bytes,
                                  size_t * units_bytes, quactlize_ppu_placed_arrangement_v2 * arrangement);
+// Loading-thread only. CPU inputs are consumed before return; uploads may still
+// be in flight in buffer-owned pinned slots. Consumers must use artifact.ready.
 void ggml_quactlize_set_planes(ggml_tensor * tensor, const ggml_quactlize_planes * planes);
 
 // Offset addresses the resident [low][high][units] allocation. The destination

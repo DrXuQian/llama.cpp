@@ -106,7 +106,7 @@ cmake -S . -B "$BUILD_DIR" \
     -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_OPENSSL=OFF \
     2>&1 | tee "$RUN/results/configure.log"
 stage=build
-TARGETS=(test-quactlize-ready llama-completion)
+TARGETS=(test-quactlize-ready test-quactlize-upload llama-completion)
 if [[ -n ${EVAL_FILE:-} ]]; then TARGETS+=(llama-perplexity); fi
 cmake --build "$BUILD_DIR" --target "${TARGETS[@]}" -j "$JOBS" \
     2>&1 | tee "$RUN/results/build.log"
@@ -114,6 +114,11 @@ cmake --build "$BUILD_DIR" --target "${TARGETS[@]}" -j "$JOBS" \
 stage=readiness
 printf '\nKPACK_READY_PREFLIGHT\n'
 timeout 60s "$BUILD_DIR/bin/test-quactlize-ready" 2>&1 | tee "$RUN/results/readiness.log"
+
+stage=upload
+printf '\nKPACK_UPLOAD_PREFLIGHT\n'
+timeout 120s "$BUILD_DIR/bin/test-quactlize-upload" 2>&1 | tee "$RUN/results/upload.log"
+grep -q 'KPACK_UPLOAD_DEVICE_ALL PASS' "$RUN/results/upload.log"
 
 ARGS=(-m "$MODEL" --mmap -ngl 99 --split-mode none --fit off
     -c 2048 -b 512 -ub 128 -t 16 -tb 32 --temp 0 --seed 0 -n 64
@@ -140,6 +145,7 @@ grep -q 'published: total_seconds=' "$RUN/results/cold.log"
 grep -q 'source_mmap=prefetch' "$RUN/results/cold.log"
 grep -q 'ready: tensors=.* content_checks=disabled' "$RUN/results/hit.log"
 grep -q 'source_mmap=on-demand' "$RUN/results/hit.log"
+grep -q 'cache H2D pipeline:.* slots=2 slot_MiB=8 pinned_MiB=16' "$RUN/results/hit.log"
 grep -qE 'cache_uploads=[1-9][0-9]* resident_misses=0' "$RUN/results/hit.log"
 if grep -q 'GPU pack queued' "$RUN/results/hit.log"; then
     printf 'FAIL: cache-hit run repacked weights\n' >&2
@@ -150,7 +156,7 @@ for phase in baseline cold hit; do
     {
         printf '\nKPACK_TIMING phase=%s\n' "$phase"
         grep -E 'Elapsed \(wall clock\)|User time|System time|Maximum resident set size|File system inputs' "$RUN/results/$phase.time"
-        grep -aE '(common_perf_print|llama_perf_context_print):|\[kpack-cache\]' "$RUN/results/$phase.log"
+        grep -aE '(common_perf_print|llama_perf_context_print):|\[kpack-cache\]|cache H2D pipeline:' "$RUN/results/$phase.log"
     } >> "$RUN/results/timing-summary.log"
 done
 
