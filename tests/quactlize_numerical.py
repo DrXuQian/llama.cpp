@@ -139,9 +139,12 @@ def analyze(log, db, index, manifest, batch, phase):
     text = log.read_text(errors="replace")
     require(not re.search(r"CUDA error:|PPU error:|failed to decode|failed reading log-probs", text),
             "model evaluation reported a runtime error")
-    start = re.search(r"(?:perplexity: calculating|kl_divergence: computing) over 2 chunks, "
-                      rf"n_ctx=256, batch_size={batch}, n_seq=1", text)
-    require(start is not None, "evaluation did not start with the requested context/chunks/batch")
+    label = "perplexity: calculating perplexity" if phase.endswith("save") else "kl_divergence: computing"
+    start = re.search(re.escape(label) + rf" over 2 chunks, n_ctx=256, batch_size={batch}, n_seq=1\b", text)
+    if start is None:
+        observed = re.findall(r"^.*(?:perplexity:|kl_divergence:).*chunks.*$", text, re.MULTILINE)[-3:]
+        raise ValueError("evaluation did not start with the requested context/chunks/batch; "
+                         f"observed={observed!r}")
     expected = {t["name"] for t in manifest["tensors"] if t.get("route_class") == "grouped"}
     require(expected, "cache manifest contains no grouped tensors")
     routed = {name for name, tokens, route in ROUTE.findall(text[start.end():])
