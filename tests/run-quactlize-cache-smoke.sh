@@ -167,7 +167,7 @@ if [[ -n ${EVAL_FILE:-} ]]; then
     # numerical admission threshold. Log-probability payloads stay on the box.
     EVAL_ARGS=(-m "$MODEL" -ngl 99 --split-mode none --fit off
         -c 256 -b "$EVAL_BATCH" -ub "$EVAL_BATCH" -t 16 -tb 32
-        --chunks 2 --color off -f "$EVAL_FILE" -v)
+        --chunks 2 --log-colors off -f "$EVAL_FILE" -v)
     for phase in kpack-eval cache-eval reference-eval kpack-reference-eval; do
         stage=$phase
         case "$phase" in
