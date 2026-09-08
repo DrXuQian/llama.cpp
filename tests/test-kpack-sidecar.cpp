@@ -19,11 +19,13 @@
 #include <fstream>
 #include <atomic>
 #include <chrono>
+#include <csignal>
 #include <future>
 #include <cstdarg>
 #include <thread>
 #include <string>
 #include <sys/stat.h>
+#include <sys/resource.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <vector>
@@ -37,7 +39,7 @@ void llama_log_internal(ggml_log_level, const char * format, ...) {
 }
 
 namespace cache_mock {
-struct event { const uint8_t * src = nullptr; void * dst = nullptr; size_t bytes = 0; };
+struct event { const uint8_t * src = nullptr; void * dst = nullptr; size_t bytes = 0; bool pending = false; };
 static ggml_backend_reg reg{};
 static ggml_backend_device dev{};
 static ggml_backend_buffer_type device_buft{}, host_buft{};
@@ -45,8 +47,11 @@ static std::thread::id owner;
 static std::promise<void> entered, release;
 static std::shared_future<void> released;
 static std::atomic<int> waits{0};
+static std::atomic<int> copies{0}, in_flight{0}, violations{0};
 static int uploads = 0, host_allocations = 0;
 static bool descriptor_mismatch = false;
+static int reject_copy = 0, reject_wait = 0;
+static bool hold = true;
 
 static ggml_backend_buffer_t allocate(ggml_backend_buffer_type_t buft, size_t bytes) {
     if (buft == &host_buft) { ++host_allocations; }
@@ -74,15 +79,23 @@ static void set(ggml_tensor * t, const ggml_quactlize_planes * p) {
 }
 static bool copy(const ggml_tensor * t, void * dst, size_t off, size_t bytes, ggml_backend_event_t ev) {
     auto * e = (event *) ev->context;
-    *e = {(const uint8_t *) t->data + off, dst, bytes};
+    if (std::this_thread::get_id() == owner || e->pending || bytes > 8 * 1024 * 1024 ||
+        off > ggml_nbytes(t) || bytes > ggml_nbytes(t) - off) { ++violations; return false; }
+    if (++copies == reject_copy) { return false; }
+    *e = {(const uint8_t *) t->data + off, dst, bytes, true};
+    if (++in_flight > 2) { ++violations; }
     return true;
 }
 static bool wait(ggml_backend_event_t ev) {
-    if (std::this_thread::get_id() == owner) { return false; }
-    if (waits.fetch_add(1) == 0) { entered.set_value(); released.wait(); }
-    const auto * e = (const event *) ev->context;
+    if (std::this_thread::get_id() == owner) { ++violations; return false; }
+    const int call = ++waits;
+    if (call == 1 && hold) { entered.set_value(); released.wait(); }
+    auto * e = (event *) ev->context;
+    if (!e->pending) { ++violations; return false; }
     memcpy(e->dst, e->src, e->bytes);
-    return true;
+    e->pending = false;
+    --in_flight;
+    return call != reject_wait;
 }
 static void init() {
     owner = std::this_thread::get_id();
@@ -99,7 +112,10 @@ static void init() {
     dev.reg = &reg;
     dev.iface.get_host_buffer_type = [](ggml_backend_dev_t) { return &host_buft; };
     dev.iface.event_new = [](ggml_backend_dev_t d) { return new ggml_backend_event{d, new event}; };
-    dev.iface.event_free = [](ggml_backend_dev_t, ggml_backend_event_t ev) { delete (event *) ev->context; delete ev; };
+    dev.iface.event_free = [](ggml_backend_dev_t, ggml_backend_event_t ev) {
+        if (((event *) ev->context)->pending) { ++violations; }
+        delete (event *) ev->context; delete ev;
+    };
     device_buft.device = host_buft.device = &dev;
     host_buft.iface.alloc_buffer = allocate;
 }
@@ -193,12 +209,14 @@ int main() {
     struct ggml_init_params ip = { 64 * 1024 * 1024, nullptr, false };
     ggml_context * gctx = ggml_init(ip);
     made_tensor dense  { "blk.0.attn_q.weight",        GGML_TYPE_Q4_K, 256, 512, 0, 2, {}, {}, {}, {}, {}, {} };
-    made_tensor grouped{ "blk.0.ffn_gate_exps.weight", GGML_TYPE_Q4_K, 256, 512, 4, 3, {}, {}, {}, {}, {}, {} };
+    made_tensor grouped{ "blk.0.ffn_gate_exps.weight", GGML_TYPE_Q4_K, 256, 512, 257, 3, {}, {}, {}, {}, {}, {} };
+    made_tensor high   { "blk.0.attn_v.weight",        GGML_TYPE_Q5_K, 256, 512, 0, 2, {}, {}, {}, {}, {}, {} };
     ggml_tensor * t_norm = ggml_new_tensor_1d(gctx, GGML_TYPE_F32, 256); ggml_set_name(t_norm, "blk.0.attn_norm.weight");
     ggml_tensor * t_dense = ggml_new_tensor_2d(gctx, GGML_TYPE_Q4_K, dense.k, dense.n); ggml_set_name(t_dense, dense.name.c_str());
     ggml_tensor * t_group = ggml_new_tensor_3d(gctx, GGML_TYPE_Q4_K, grouped.k, grouped.n, grouped.experts); ggml_set_name(t_group, grouped.name.c_str());
+    ggml_tensor * t_high = ggml_new_tensor_2d(gctx, GGML_TYPE_Q5_K, high.k, high.n); ggml_set_name(t_high, high.name.c_str());
     unsigned seed = 7;
-    for (ggml_tensor * t : { t_norm, t_dense, t_group }) {
+    for (ggml_tensor * t : { t_norm, t_dense, t_group, t_high }) {
         uint8_t * d = (uint8_t *) t->data;
         for (size_t i = 0; i < ggml_nbytes(t); ++i) { seed = seed*1103515245u + 12345u; d[i] = (uint8_t) (seed >> 16); }
     }
@@ -207,6 +225,7 @@ int main() {
     gguf_add_tensor(g, t_norm);     // index 0: not packable
     gguf_add_tensor(g, t_dense);    // index 1
     gguf_add_tensor(g, t_group);    // index 2
+    gguf_add_tensor(g, t_high);     // index 3: a nonempty high plane
     gguf_write_to_file(g, gguf_path.c_str(), false);
 
     auto fill = [&](made_tensor & m, ggml_tensor * t, int index) {
@@ -219,9 +238,11 @@ int main() {
         m.src.n = m.n; m.src.k = m.k; m.src.experts = m.rank == 3 ? m.experts : 0;
     };
     fill(dense, t_dense, 1); fill(grouped, t_group, 2);
+    fill(high, t_high, 3);
     CHECK(make_planes(dense),   "stub library must supply planes for the dense tensor");
     CHECK(make_planes(grouped), "stub library must supply planes for the grouped tensor");
-    std::vector<llama_kpack_source_tensor> inventory = { dense.src, grouped.src };
+    CHECK(make_planes(high), "stub library must supply a nonempty high plane");
+    std::vector<llama_kpack_source_tensor> inventory = { dense.src, grouped.src, high.src };
 
     // ---- writer ----
     printf("  [writer]\n");
@@ -236,8 +257,9 @@ int main() {
         llama_kpack_source_tensor bad = dense.src; bad.name = "x"; bad.gguf_index = 0;
         CHECK(!w.add(bad, dense.data.data(), dense.planes, err), "index order guard");
         CHECK(w.add(grouped.src, grouped.data.data(), grouped.planes, err), "%s", err.c_str());
+        CHECK(w.add(high.src, high.data.data(), high.planes, err), "%s", err.c_str());
         CHECK(w.finish(gguf_path, gguf_path, err), "%s", err.c_str());
-        CHECK(w.packed() == 2, "packed=%zu", w.packed());
+        CHECK(w.packed() == 3, "packed=%zu", w.packed());
     }
     struct stat st{};
     CHECK(stat((bundle + "/manifest.json").c_str(), &st) == 0 && stat((bundle + "/weights.bin").c_str(), &st) == 0, "bundle files exist");
@@ -316,7 +338,7 @@ int main() {
         };
         // Loading order is not file order. Neither the jobs nor their reader
         // contain the raw GGUF data pointer.
-        CHECK(writer.start({job_for(grouped), job_for(dense)}, inventory, staging.size(), err), "%s", err.c_str());
+        CHECK(writer.start({job_for(high), job_for(grouped), job_for(dense)}, inventory, staging.size(), err), "%s", err.c_str());
         CHECK(ready.wait_for(std::chrono::seconds(2)) == std::future_status::ready, "worker reached delayed copy");
         CHECK(stat((streamed + "/manifest.json").c_str(), &st) != 0, "no publication while a copy is pending");
         CHECK(calls == 0, "start returned before any D2H completion");
@@ -325,7 +347,13 @@ int main() {
         CHECK(calls > 3, "bounded stream uses multiple chunks");
         CHECK(read_file(streamed + "/weights.bin") == read_file(bundle + "/weights.bin"), "streamed bytes match synchronous writer");
         llama_kpack_sidecar_reader reader;
-        CHECK(reader.open(streamed, err) && reader.verify_source(gguf_path, inventory, 2, err) && reader.verify_storage(2, err), "%s", err.c_str());
+        CHECK(reader.open(streamed, err) && reader.load_unchecked(gguf_path, inventory, err), "%s", err.c_str());
+        CHECK(!reader.verify_source(gguf_path, inventory, 2, err) && !reader.verify_storage(2, err),
+              "a runtime cache must not claim verified-bundle provenance");
+        const auto bytes = read_file(streamed + "/manifest.json");
+        const std::string manifest(bytes.begin(), bytes.end());
+        CHECK(manifest.find("llama.kpack-cache") != std::string::npos && manifest.find("sha256") == std::string::npos,
+              "runtime manifest records local source identity, not checksums");
     }
     for (int variant = 0; variant < 3; ++variant) {
         const std::string target = dir + "/stream-fail-" + std::to_string(variant);
@@ -385,7 +413,7 @@ int main() {
             CHECK(rg->planes.low_bytes == grouped.planes.low_bytes && memcmp(rg->planes.low, grouped.low.data(), grouped.planes.low_bytes) == 0, "grouped low plane round-trips");
             CHECK(rg->planes.high == nullptr && rg->planes.high_bytes == 0, "Q4_K has no high plane");
             CHECK(rd->planes.mapping_id == dense.planes.mapping_id && rd->planes.bits == 4, "arrangement carried");
-            CHECK(rg->units.shape == std::vector<int64_t>({ 4, 2, 256, 16 }), "grouped units shape [E, K/256, N, 16]");
+            CHECK(rg->units.shape == std::vector<int64_t>({ grouped.experts, 2, 256, 16 }), "grouped units shape [E, K/256, N, 16]");
             CHECK(rd->units.shape == std::vector<int64_t>({ 2, 256, 16 }), "dense units shape [K/256, N, 16]");
             CHECK(rd->low.shape == std::vector<int64_t>({ 1, 256, 256 }), "dense low shape [1, N, K/2]");
         }
@@ -396,52 +424,118 @@ int main() {
     {
         cache_mock::init();
         auto ready = cache_mock::entered.get_future();
-        auto * tensor = ggml_dup_tensor(gctx, t_dense);
-        ggml_set_name(tensor, dense.name.c_str());
+        auto * tensor = ggml_dup_tensor(gctx, t_group);
+        ggml_set_name(tensor, grouped.name.c_str());
         tensor->buffer = cache_mock::allocate(&cache_mock::device_buft, ggml_nbytes(tensor));
         tensor->data = ggml_backend_buffer_get_base(tensor->buffer);
         // A finished GPU pack is represented by resident plane bytes here.
         auto * data = (uint8_t *) tensor->data;
-        memcpy(data, dense.low.data(), dense.planes.low_bytes);
-        memcpy(data + dense.planes.low_bytes, dense.units.data(), dense.planes.units_bytes);
+        memcpy(data, grouped.low.data(), grouped.planes.low_bytes);
+        memcpy(data + grouped.planes.low_bytes, grouped.units.data(), grouped.planes.units_bytes);
+        auto * other = ggml_dup_tensor(gctx, t_high);
+        ggml_set_name(other, high.name.c_str());
+        other->buffer = cache_mock::allocate(&cache_mock::device_buft, ggml_nbytes(other));
+        other->data = ggml_backend_buffer_get_base(other->buffer);
+        auto * high_data = (uint8_t *) other->data;
+        memcpy(high_data, high.low.data(), high.planes.low_bytes);
+        memcpy(high_data + high.planes.low_bytes, high.high.data(), high.planes.high_bytes);
+        memcpy(high_data + high.planes.low_bytes + high.planes.high_bytes, high.units.data(), high.planes.units_bytes);
         {
             llama_kpack_cache cache(model_cache, gguf_path, inventory);
             CHECK(!cache.load(tensor), "cache miss uses the normal GPU producer");
+            cache.capture(other); // sorting must not mix up the shared staging slots
             cache.capture(tensor);
             cache.capture(tensor); // aliases must not create duplicate records
             cache.start();
             CHECK(ready.wait_for(std::chrono::seconds(2)) == std::future_status::ready, "writer reached async completion");
-            CHECK(cache_mock::host_allocations == 1, "one bounded pinned slot per device");
-            CHECK(memcmp(tensor->data, dense.low.data(), dense.planes.low_bytes) == 0,
+            CHECK(cache_mock::host_allocations == 2, "two bounded pinned slots per device");
+            CHECK(cache_mock::copies == 2 && cache_mock::in_flight == 2,
+                  "both slots submitted before waiting for the first D2H completion");
+            CHECK(memcmp(tensor->data, grouped.low.data(), grouped.planes.low_bytes) == 0,
                   "compute can read resident weights while D2H is held");
             CHECK(stat(model_cache.c_str(), &st) != 0, "cache remains unpublished until copies finish");
             cache_mock::release.set_value();
         } // waits before tensor->buffer is freed
+        CHECK(cache_mock::copies == 7 && cache_mock::waits == 7 && cache_mock::in_flight == 0,
+              "multi-chunk low, partial tail, absent/present high and cross-tensor reuse drained exactly once");
         CHECK(stat((model_cache + "/manifest.json").c_str(), &st) == 0, "normal model teardown completes persistence");
         memset(tensor->data, 0xA5, ggml_nbytes(tensor));
+        memset(other->data, 0xA5, ggml_nbytes(other));
         {
             llama_kpack_cache cache(model_cache, gguf_path, inventory);
             cache_mock::descriptor_mismatch = true;
             CHECK(!cache.load(tensor), "a changed registry cannot consume cached bytes");
             cache_mock::descriptor_mismatch = false;
-            CHECK(cache.load(tensor), "second model load consumes verified planes without repacking");
+            CHECK(cache.load(tensor), "second model load trusts cached planes without repacking or hashing");
             CHECK(cache_mock::uploads == 1, "one direct plane upload on cache hit");
-            CHECK(memcmp(tensor->data, dense.low.data(), dense.planes.low_bytes) == 0, "cached low bytes match");
-            CHECK(memcmp(data + dense.planes.low_bytes, dense.units.data(), dense.planes.units_bytes) == 0, "cached unit bytes match");
+            CHECK(memcmp(tensor->data, grouped.low.data(), grouped.planes.low_bytes) == 0, "cached low bytes match after slot reuse");
+            CHECK(memcmp(data + grouped.planes.low_bytes, grouped.units.data(), grouped.planes.units_bytes) == 0, "cached unit bytes match");
+            CHECK(cache.load(other), "second tensor reuses the same bounded staging pool correctly");
+            CHECK(memcmp(high_data, high.low.data(), high.planes.low_bytes) == 0 &&
+                  memcmp(high_data + high.planes.low_bytes, high.high.data(), high.planes.high_bytes) == 0 &&
+                  memcmp(high_data + high.planes.low_bytes + high.planes.high_bytes, high.units.data(), high.planes.units_bytes) == 0,
+                  "Q5 low/high/units bytes match after cross-tensor slot reuse");
             cache.start(); // a cache hit must not start a replacement writer
         }
+        CHECK(cache_mock::copies == 7 && cache_mock::host_allocations == 2, "hit allocates no staging and starts no D2H");
+        // Rejecting the prefetched submission or its predecessor's completion
+        // leaves one other range in flight. It must be drained on the worker.
+        cache_mock::hold = false;
+        for (int variant = 0; variant < 3; ++variant) {
+            const std::string target = dir + "/pipeline-fail-" + std::to_string(variant);
+            cache_mock::reject_copy = variant == 0 ? cache_mock::copies + 2 : 0;
+            cache_mock::reject_wait = variant == 1 ? cache_mock::waits + 1 : 0;
+            struct rlimit original{}, limited{};
+            const auto old_signal = std::signal(SIGXFSZ, SIG_IGN);
+            CHECK(getrlimit(RLIMIT_FSIZE, &original) == 0, "get file-size limit");
+            limited = original; limited.rlim_cur = 4096;
+            if (variant == 2) { CHECK(setrlimit(RLIMIT_FSIZE, &limited) == 0, "plant a partial write followed by EFBIG"); }
+            {
+                llama_kpack_cache cache(target, gguf_path, inventory);
+                cache.capture(tensor);
+                cache.start();
+            }
+            if (variant == 2) { CHECK(setrlimit(RLIMIT_FSIZE, &original) == 0, "restore file-size limit"); }
+            std::signal(SIGXFSZ, old_signal);
+            CHECK(cache_mock::in_flight == 0, "failure drains prefetched DMA before releasing pinned slots");
+            CHECK(stat(target.c_str(), &st) != 0, "failed pipeline must not publish");
+            const std::string staging = target + ".partial." + std::to_string((long) getpid());
+            CHECK(stat(staging.c_str(), &st) != 0, "failed pipeline removes its owned partial cache");
+        }
+        CHECK(cache_mock::violations == 0, "no early reuse/free, owner-thread wait or unbounded staging");
         ggml_backend_buffer_free(tensor->buffer);
         tensor->buffer = nullptr;
+        ggml_backend_buffer_free(other->buffer);
+        other->buffer = nullptr;
     }
     rm_bundle(model_cache);
 
     // ---- negatives: one wrong thing each ----
     printf("  [negatives]\n");
+    {   // Unchecked runtime loading deliberately does NOT detect payload corruption.
+        const std::string c = dir + "/trusted-corrupt"; copy_bundle(streamed, c);
+        auto w = read_file(c + "/weights.bin"); w[1000] ^= 1; write_file(c + "/weights.bin", w);
+        llama_kpack_sidecar_reader r;
+        CHECK(r.open(c, err) && r.load_unchecked(gguf_path, inventory, err), "trusted cache must not secretly hash payloads");
+        w.pop_back(); write_file(c + "/weights.bin", w);
+        llama_kpack_sidecar_reader truncated;
+        CHECK(!truncated.open(c, err), "truncation must still fail the structural size check");
+        rm_bundle(c);
+    }
+    {   // Cheap local identity still rejects a different source inode.
+        const std::string other = dir + "/local-other.gguf"; write_file(other, read_file(gguf_path));
+        llama_kpack_sidecar_reader r;
+        CHECK(r.open(streamed, err) && !r.load_unchecked(other, inventory, err), "local cache binds to its original source file");
+        auto wrong = inventory; wrong[0].data_offset += 32;
+        CHECK(!r.load_unchecked(gguf_path, wrong, err), "unchecked loading retains the tensor inventory contract");
+        unlink(other.c_str());
+    }
     {   // a flipped byte inside a span
         const std::string c = dir + "/c1"; copy_bundle(bundle, c);
         auto w = read_file(c + "/weights.bin"); w[1000] ^= 0x01; write_file(c + "/weights.bin", w);
         llama_kpack_sidecar_reader r;
         CHECK(r.open(c, err) && !r.verify_storage(4, err), "flipped weights byte must fail storage verification (%s)", err.c_str());
+        CHECK(r.load_unchecked(gguf_path, inventory, err), "runtime can reuse old v3 bundles without hashing them");
         rm_bundle(c);
     }
     {   // an extra file in the root
@@ -482,7 +576,7 @@ int main() {
             return system(cmd.c_str());
         };
         CHECK(run(bundle, gguf_path) == 0, "quactlize load_kpack_bundle must accept the bundle");
-        CHECK(run(streamed, gguf_path) == 0, "quactlize must accept the background writer's bundle");
+        CHECK(run(streamed, gguf_path) != 0, "runtime cache must not masquerade as a verified offline bundle");
         const std::string c = dir + "/c4"; copy_bundle(bundle, c);
         auto w = read_file(c + "/weights.bin"); w[2000] ^= 0x01; write_file(c + "/weights.bin", w);
         CHECK(run(c, gguf_path) != 0, "quactlize must reject the flipped-byte copy (the oracle can say no)");

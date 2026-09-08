@@ -22,3 +22,35 @@ by this runtime binding.
 make divergence fail loudly. It is used here ONLY as a cross-check on the arrangement descriptor the library hands
 back -- llama.cpp does not construct an arrangement from it, because that would be a second source of the same
 policy and the two could disagree silently.
+
+## Runtime weight cache
+
+`--kpack-cache DIR` persists GPU-produced resident planes. On a miss, a single
+background writer uses two 8 MiB pinned slots per device. It prefetches the
+next D2H range while writing the completed range, then fsyncs and atomically
+publishes the directory. No completion wait is added to compute submission.
+Model teardown still waits before releasing weights; copy and disk traffic
+can contend for bandwidth with inference.
+
+Runtime caches use `llama.kpack-cache` v1, with the existing K-pack plane
+layout but **no content checksums**. Hits check file sizes, tensor metadata,
+arrangements and bounds, then upload the mapped bytes directly. A local cache
+also checks source device/inode/mtime/ctime, so copying or modifying the source
+file may invalidate it. Payload corruption is not detected: use trusted cache
+storage. An invalid/existing directory is not overwritten; use a new path to
+repack. Source files must remain unchanged during use.
+
+Old `quactlize.kquant-kpack.bundle` v3 files remain readable on this unchecked
+runtime path. The explicit offline verifier still requires their checksums;
+the new hash-free cache is not a verified v3 interchange bundle. No Quactlize
+producer or GEMM library rebuild is needed for this host-side change.
+
+`tests/run-quactlize-cache-smoke.sh` measures no-cache/cold/hit wall and model
+timings. Optionally set `EVAL_FILE` to a corpus of at least 512 tokens for the
+existing `llama-perplexity` PPL/KLD comparison: uncached K-pack vs cached K-pack,
+and the ordinary GPU weight route vs K-pack. `EVAL_BATCH=128` exercises prefill;
+`EVAL_BATCH=1` exercises teacher-forced decode. These are separate runs. The
+tool's saved log probabilities are compressed, not a bitwise FP32 logit oracle.
+Metrics require review; successful generation or exit 0 is not numerical
+admission. Log-probability files remain on the box; result archives contain
+only logs and the cache manifest.
