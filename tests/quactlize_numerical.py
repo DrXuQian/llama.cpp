@@ -31,9 +31,9 @@ def require(ok, message):
         raise ValueError(message)
 
 
-def gsm8k_corpus(path, limit=32):
-    """Use a fixed local sample for likelihood comparison, not answer scoring."""
-    require(limit > 0, "GSM8K sample size must be positive")
+def gsm8k_records(path, limit=None):
+    """Read local question/answer records without downloading a dataset."""
+    require(limit is None or limit > 0, "GSM8K sample size must be positive")
     suffix = path.suffix.lower()
     if suffix in (".jsonl", ".ndjson"):
         with path.open(encoding="utf-8") as stream:
@@ -48,19 +48,22 @@ def gsm8k_corpus(path, limit=32):
         except ImportError as error:
             raise ValueError("reading Parquet requires pyarrow; use a local JSONL export instead") from error
         with pq.ParquetFile(path) as table:
-            batches = table.iter_batches(batch_size=limit, columns=["question", "answer"])
-            first = next(batches, None)
-            rows = first.to_pylist() if first is not None else []
+            batches = table.iter_batches(batch_size=limit or 1024, columns=["question", "answer"])
+            rows = list(islice((row for batch in batches for row in batch.to_pylist()), limit))
     else:
         raise ValueError("GSM8K_FILE must be one local .jsonl, .json or .parquet file, not a directory")
     require(rows, "empty GSM8K sample")
-    samples = []
     for index, row in enumerate(rows):
         require(isinstance(row, dict) and all(isinstance(row.get(key), str) and row[key].strip()
                                              for key in ("question", "answer")),
                 f"GSM8K record {index} needs nonempty question and answer strings")
-        samples.append(f"Question: {row['question']}\nAnswer: {row['answer']}\n\n")
-    return "".join(samples)
+    return rows
+
+
+def gsm8k_corpus(path, limit=32):
+    """Use a fixed local sample for likelihood comparison, not answer scoring."""
+    return "".join(f"Question: {row['question']}\nAnswer: {row['answer']}\n\n"
+                   for row in gsm8k_records(path, limit))
 
 
 def inventory(bundle, inspector):
