@@ -285,7 +285,9 @@ if (GGML_NCP_QUACTLIZE)
     endforeach()
     target_compile_definitions(quactlize-stub-pack-incomplete PRIVATE QZ_PACK_OMIT_PREPARE)
 
-    set(QUACTLIZE_LOADER_TU ${PROJECT_SOURCE_DIR}/ggml/src/ggml-cuda/quactlize-lib.cu)
+    set(QUACTLIZE_LOADER_TU
+        ${PROJECT_SOURCE_DIR}/ggml/src/ggml-cuda/quactlize-lib.cu
+        ${PROJECT_SOURCE_DIR}/ggml/src/ggml-cuda/quactlize-execution-lib.cu)
     set_source_files_properties(${QUACTLIZE_LOADER_TU} PROPERTIES LANGUAGE CXX)
 
     add_executable(test-quactlize-loader test-quactlize-loader.cpp ${QUACTLIZE_LOADER_TU})
@@ -335,6 +337,24 @@ if (GGML_NCP_QUACTLIZE)
             ${PROJECT_SOURCE_DIR}/ggml/include ${PROJECT_SOURCE_DIR}/ggml/src
             ${PROJECT_SOURCE_DIR}/ggml/src/ggml-cuda ${CUDAToolkit_INCLUDE_DIRS})
         target_link_libraries(test-quactlize-upload PRIVATE ggml-base ggml-cuda CUDA::cudart)
+        add_executable(test-quactlize-execution test-quactlize-execution.cu)
+        set_target_properties(test-quactlize-execution PROPERTIES CUDA_RUNTIME_LIBRARY None)
+        target_compile_definitions(test-quactlize-execution PRIVATE GGML_NCP_QUACTLIZE)
+        if (GGML_CUDA_GRAPHS)
+            # The test constructs the backend's context, whose layout includes
+            # graph state under this same compile-time option.
+            target_compile_definitions(test-quactlize-execution PRIVATE GGML_CUDA_USE_GRAPHS)
+        endif()
+        target_include_directories(test-quactlize-execution PRIVATE
+            ${PROJECT_SOURCE_DIR}/ggml/include ${PROJECT_SOURCE_DIR}/ggml/src
+            ${PROJECT_SOURCE_DIR}/ggml/src/ggml-cuda ${CUDAToolkit_INCLUDE_DIRS})
+        target_link_libraries(test-quactlize-execution PRIVATE ggml-base ggml-cuda CUDA::cudart)
+        foreach(route fq sf gemv)
+            add_test(NAME test-quactlize-execution-${route} COMMAND $<TARGET_FILE:test-quactlize-execution>)
+            set_tests_properties(test-quactlize-execution-${route} PROPERTIES
+                LABELS "device" TIMEOUT 120 SKIP_RETURN_CODE 77
+                ENVIRONMENT "QUACTLIZE_KPACK_ROUTE=${route}")
+        endforeach()
         add_dependencies(test-quactlize-upload ${QUACTLIZE_STUB_TARGETS})
         add_test(NAME test-quactlize-upload COMMAND $<TARGET_FILE:test-quactlize-upload>)
         set_tests_properties(test-quactlize-upload PROPERTIES
