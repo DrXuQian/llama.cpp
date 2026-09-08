@@ -4,6 +4,7 @@
 
 #include "ncp-route.cuh"
 #include "quactlize-buft.cuh"
+#include "quactlize-execution.cuh"
 
 #include <cinttypes>
 #include <cuda_fp16.h>
@@ -32,6 +33,7 @@ bool ggml_cuda_mul_mat_is_quactlize(const ggml_tensor * src0) {
 
 void ggml_cuda_mul_mat_quactlize(ggml_backend_cuda_context & ctx,
         const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    if (ggml_quactlize_execution_run(ctx, src0, src1, nullptr, dst)) return;
     ggml_quactlize_artifact art;
     if (!ggml_quactlize_artifact_for(src0, &art)) {
         GGML_ABORT("[quactlize] %s has no K-pack artifact but reached the K-pack mul_mat", src0->name);
