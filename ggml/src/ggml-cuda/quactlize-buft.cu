@@ -4,11 +4,9 @@
 
 #include "ggml-backend-impl.h"
 
-#include <chrono>
 #include <cinttypes>
 #include <cstdlib>
 #include <cstring>
-#include <thread>
 #include <map>
 #include <mutex>
 #include <vector>
@@ -27,6 +25,13 @@ struct qz_plane_sizes {
 // the identity it has to satisfy, because only this side knows what ggml allocated.
 static bool qz_plane_sizes_for(
         const ggml_tensor * t, const quactlize_ppu_placed_arrangement_v2 & arr, qz_plane_sizes * out) {
+    if (t->ne[0] <= 0 || t->ne[0] > INT32_MAX || t->ne[1] <= 0 || t->ne[1] > INT32_MAX ||
+        t->ne[2] <= 0 || t->ne[3] <= 0 || t->ne[2] > INT32_MAX / t->ne[3]) {
+        return false;
+    }
+    if (t->ne[0] > INT64_MAX / (t->ne[2] * t->ne[3]) / t->ne[1] / 8) {
+        return false;
+    }
     if (!ggml_quactlize_plane_sizes((int) t->type, t->ne[1], t->ne[0], t->ne[2]*t->ne[3], &arr,
                                     &out->low, &out->high, &out->units)) {
         return false;
@@ -43,12 +48,51 @@ struct qz_buffer_context {
     int    device;
     void * dev_ptr;
     std::map<const ggml_tensor *, ggml_quactlize_artifact> artifacts;
+    cudaStream_t pack_stream = nullptr;
+    cudaStream_t copy_stream = nullptr;
+    cudaEvent_t upload_done = nullptr;
+    std::vector<cudaEvent_t> ready_events;
+    uint8_t * scratch = nullptr;
+    size_t scratch_bytes = 0;
+    std::vector<void *> scratch_allocations;
 };
+
+static void qz_init_streams(qz_buffer_context * ctx) {
+    if (!ctx->pack_stream) {
+        CUDA_CHECK(cudaStreamCreateWithFlags(&ctx->pack_stream, cudaStreamNonBlocking));
+        CUDA_CHECK(cudaStreamCreateWithFlags(&ctx->copy_stream, cudaStreamNonBlocking));
+        CUDA_CHECK(cudaEventCreateWithFlags(&ctx->upload_done, cudaEventDisableTiming));
+    }
+}
+
+static cudaEvent_t qz_record_ready(qz_buffer_context * ctx) {
+    cudaEvent_t event;
+    CUDA_CHECK(cudaEventCreateWithFlags(&event, cudaEventDisableTiming));
+    CUDA_CHECK(cudaEventRecord(event, ctx->pack_stream));
+    ctx->ready_events.push_back(event);
+    return event;
+}
 
 static void qz_buffer_free_buffer(ggml_backend_buffer_t buffer) {
     qz_buffer_context * ctx = (qz_buffer_context *) buffer->context;
     if (ctx->dev_ptr) {
         ggml_cuda_set_device(ctx->device);
+        // Only teardown drains backcopies, never an inference launch.
+        if (ctx->pack_stream) {
+            CUDA_CHECK(cudaStreamSynchronize(ctx->pack_stream));
+            CUDA_CHECK(cudaStreamSynchronize(ctx->copy_stream));
+        }
+        for (cudaEvent_t event : ctx->ready_events) {
+            CUDA_CHECK(cudaEventDestroy(event));
+        }
+        for (void * scratch : ctx->scratch_allocations) {
+            CUDA_CHECK(cudaFree(scratch));
+        }
+        if (ctx->pack_stream) {
+            CUDA_CHECK(cudaEventDestroy(ctx->upload_done));
+            CUDA_CHECK(cudaStreamDestroy(ctx->pack_stream));
+            CUDA_CHECK(cudaStreamDestroy(ctx->copy_stream));
+        }
         CUDA_CHECK(cudaFree(ctx->dev_ptr));
     }
     delete ctx;
@@ -65,25 +109,21 @@ static enum ggml_status qz_buffer_init_tensor(ggml_backend_buffer_t buffer, ggml
     return GGML_STATUS_SUCCESS;
 }
 
-static ggml_quactlize_sink_t g_sink     = nullptr;
-static void *                g_sink_ctx = nullptr;
-
-void ggml_quactlize_set_sink(ggml_quactlize_sink_t sink, void * ctx) {
-    g_sink     = sink;
-    g_sink_ctx = ctx;
-}
-
 // Upload three host planes into the tensor's own allocation and register the artifact. Shared by the conversion
 // path and the sidecar path, so the two cannot drift in what "resident" means.
 static void qz_install_planes(qz_buffer_context * ctx, ggml_tensor * tensor, const ggml_quactlize_planes & p,
                               int qtype, int64_t n, int64_t k, int64_t experts) {
     uint8_t * dst = (uint8_t *) tensor->data;
+    GGML_ASSERT(ctx->artifacts.count(tensor) == 0);
     ggml_cuda_set_device(ctx->device);
-    CUDA_CHECK(cudaMemcpy(dst,                                 p.low,   p.low_bytes,   cudaMemcpyHostToDevice));
+    qz_init_streams(ctx);
+    CUDA_CHECK(cudaMemcpyAsync(dst, p.low, p.low_bytes, cudaMemcpyHostToDevice, ctx->pack_stream));
     if (p.high_bytes) {
-        CUDA_CHECK(cudaMemcpy(dst + p.low_bytes,               p.high,  p.high_bytes,  cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpyAsync(dst + p.low_bytes, p.high, p.high_bytes,
+                                   cudaMemcpyHostToDevice, ctx->pack_stream));
     }
-    CUDA_CHECK(cudaMemcpy(dst + p.low_bytes + p.high_bytes,    p.units, p.units_bytes, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpyAsync(dst + p.low_bytes + p.high_bytes, p.units, p.units_bytes,
+                               cudaMemcpyHostToDevice, ctx->pack_stream));
 
     ggml_quactlize_artifact art;
     art.low         = dst;
@@ -94,6 +134,9 @@ static void qz_install_planes(qz_buffer_context * ctx, ggml_tensor * tensor, con
     art.n           = n;
     art.k           = k;
     art.experts     = experts;
+    art.ready       = qz_record_ready(ctx);
+    // set_planes borrows its CPU inputs only until return.
+    CUDA_CHECK(cudaEventSynchronize(art.ready));
     ctx->artifacts[tensor] = art;
 }
 
@@ -107,7 +150,7 @@ bool ggml_quactlize_plane_layout(const ggml_tensor * tensor, size_t * low_bytes,
     if (!tensor || !ggml_quactlize_arrangement_for((int) tensor->type, &arr)) {
         return false;
     }
-    qz_plane_sizes ps;
+    qz_plane_sizes ps = {};
     if (!qz_plane_sizes_for(tensor, arr, &ps)) {
         return false;
     }
@@ -159,7 +202,7 @@ static void qz_buffer_set_tensor(
                    "supports_op and set_tensor disagree", tensor->name, ggml_type_name(tensor->type));
     }
 
-    qz_plane_sizes ps;
+    qz_plane_sizes ps = {};
     if (!qz_plane_sizes_for(tensor, arr, &ps)) {
         GGML_ABORT("[quactlize] %s: K-pack planes (%" PRId64 " + %" PRId64 " + %" PRId64 ") do not add up to "
                    "ggml_nbytes (%zu) -- the artifact is not byte-neutral for this descriptor",
@@ -170,49 +213,99 @@ static void qz_buffer_set_tensor(
     const int64_t n       = tensor->ne[1];
     const int64_t experts = tensor->ne[2] * tensor->ne[3];
 
-    // Host side of the conversion. The GGUF bytes are already here -- the loader is handing us its mmap -- so this
-    // is the only new cost the K-pack path adds to a model load: no D2H, and the H2D below was going to happen.
-    std::vector<uint8_t> low  ((size_t) ps.low);
-    std::vector<uint8_t> high ((size_t) ps.high);
-    std::vector<uint8_t> units((size_t) ps.units);
-
-    // Convert and prove the artifact reproduces its own input. All of the policy -- how many threads, whether the
-    // expert axis may be split, what a failure on one side means -- lives in the loader translation unit, where it
-    // is host-only and therefore testable without a device. See ggml_quactlize_convert_verified.
-    std::vector<uint8_t> recovered(size);
-    int threads_used = 0;
-
-    const auto t_begin = std::chrono::steady_clock::now();
-
-    const int rc = ggml_quactlize_convert_verified(
-        qtype, (const uint8_t *) data, low.data(), ps.high ? high.data() : nullptr, units.data(), recovered.data(),
-        (int64_t) size, n, k, experts, &arr, ps.low, ps.high, ps.units, &threads_used);
-
-    if (rc != 0) {
-        GGML_ABORT("[quactlize] %s: K-pack conversion did not round-trip (rc=%d) for n=%" PRId64 " k=%" PRId64
-                   " experts=%" PRId64 " -- refusing to keep an artifact that does not reproduce its own input, "
-                   "and the GGUF bytes are the only other copy",
-                   tensor->name, rc, n, k, experts);
+    GGML_ASSERT(n <= INT32_MAX && k <= INT32_MAX && experts <= INT32_MAX);
+    GGML_ASSERT(ctx->artifacts.count(tensor) == 0);
+    quactlize_ppu_kpack_sizes_v1 sizes = {};
+    if (ggml_quactlize_device_pack_sizes(qtype, n, k, experts, &arr, &sizes) != 0 ||
+        sizes.raw_bytes != size) {
+        GGML_ABORT("[quactlize] %s: GPU producer and resident layout disagree", tensor->name);
     }
 
-    const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_begin).count();
-    GGML_LOG_DEBUG("[quactlize] %s: %.1f MiB converted in %.1f ms on %d thread(s) (%.0f MiB/s, includes the "
-                   "round-trip check)\n", tensor->name, size / 1048576.0, ms, threads_used,
-                   ms > 0.0 ? size / 1048576.0 / (ms / 1000.0) : 0.0);
-
-    ggml_quactlize_planes planes;
-    planes.low         = low.data();     planes.low_bytes   = (size_t) ps.low;
-    planes.high        = ps.high ? high.data() : nullptr;
-    planes.high_bytes  = (size_t) ps.high;
-    planes.units       = units.data();   planes.units_bytes = (size_t) ps.units;
-    planes.arrangement = arr;
-
-    // A loader writing a sidecar gets the planes now, while they are still on the host.
-    if (g_sink) {
-        g_sink(g_sink_ctx, tensor, data, size, &planes);
+    ggml_cuda_set_device(ctx->device);
+    qz_init_streams(ctx);
+    const size_t expert_bytes = size / experts;
+    const size_t budget = std::max(expert_bytes, size_t(64) * 1024 * 1024);
+    const int64_t batch = std::min(experts, (int64_t) (budget / expert_bytes));
+    const size_t needed = batch * expert_bytes;
+    if (needed > ctx->scratch_bytes) {
+        const size_t capacity = std::max(needed, ctx->scratch_bytes * 2);
+        void * scratch = nullptr;
+        CUDA_CHECK(cudaMalloc(&scratch, capacity));
+        // Retain older buffers until teardown; cudaFree can wait for unrelated streams.
+        ctx->scratch_allocations.push_back(scratch);
+        ctx->scratch = (uint8_t *) scratch;
+        ctx->scratch_bytes = capacity;
     }
+    uint8_t * dst = (uint8_t *) tensor->data;
+    for (int64_t first = 0; first < experts; first += batch) {
+        const int count = (int) std::min(batch, experts - first);
+        CUDA_CHECK(cudaMemcpyAsync(ctx->scratch, (const uint8_t *) data + first * expert_bytes,
+                                   count * expert_bytes, cudaMemcpyHostToDevice, ctx->pack_stream));
+        if (first + count == experts) {
+            CUDA_CHECK(cudaEventRecord(ctx->upload_done, ctx->pack_stream));
+        }
+        const int rc = ggml_quactlize_prepare_device(
+            qtype, ctx->scratch, dst + first * (ps.low / experts),
+            ps.high ? dst + ps.low + first * (ps.high / experts) : nullptr,
+            dst + ps.low + ps.high + first * (ps.units / experts),
+            n, k, count, &arr, ctx->pack_stream);
+        if (rc != 0) {
+            GGML_ABORT("[quactlize] %s: GPU pack failed (rc=%d)", tensor->name, rc);
+        }
+    }
+    ggml_quactlize_artifact art;
+    art.low = dst;
+    art.high = ps.high ? dst + ps.low : nullptr;
+    art.units = dst + ps.low + ps.high;
+    art.arrangement = arr;
+    art.qtype = qtype;
+    art.n = n;
+    art.k = k;
+    art.experts = experts;
+    art.ready = qz_record_ready(ctx);
+    // The caller may release raw CPU bytes on return. This waits only for H2D,
+    // not for the last pack, the backcopy stream, or a persistence worker.
+    CUDA_CHECK(cudaEventSynchronize(ctx->upload_done));
+    ctx->artifacts[tensor] = art;
+    GGML_LOG_DEBUG("[quactlize] %s: GPU pack queued, %.1f MiB, expert batch=%" PRId64 "\n",
+                   tensor->name, size / 1048576.0, batch);
+}
 
-    qz_install_planes(ctx, tensor, planes, qtype, n, k, experts);
+bool ggml_quactlize_copy_range_async(const ggml_tensor * tensor, void * pinned,
+                                    size_t offset, size_t bytes, ggml_backend_event_t completion) {
+    ggml_quactlize_artifact art;
+    if (!pinned || !completion || !completion->context || !bytes ||
+        !ggml_quactlize_artifact_for(tensor, &art) || offset > ggml_nbytes(tensor) ||
+        bytes > ggml_nbytes(tensor) - offset ||
+        completion->device != ggml_backend_buft_get_device(tensor->buffer->buft)) {
+        return false;
+    }
+    auto * ctx = (qz_buffer_context *) tensor->buffer->context;
+    ggml_cuda_set_device(ctx->device);
+    cudaPointerAttributes attributes = {};
+    cudaError_t rc = cudaPointerGetAttributes(&attributes, pinned);
+    if (rc != cudaSuccess || attributes.type != cudaMemoryTypeHost) {
+        if (rc != cudaSuccess) { (void) cudaGetLastError(); }
+        return false;
+    }
+    rc = cudaStreamWaitEvent(ctx->copy_stream, art.ready, 0);
+    if (rc == cudaSuccess) {
+        rc = cudaMemcpyAsync(pinned, art.low + offset, bytes, cudaMemcpyDeviceToHost, ctx->copy_stream);
+    }
+    if (rc == cudaSuccess) { rc = cudaEventRecord((cudaEvent_t) completion->context, ctx->copy_stream); }
+    if (rc == cudaSuccess) { return true; }
+    // The caller may release its destination after false. Drain any partial
+    // submission on this stream only, not unrelated compute streams.
+    CUDA_CHECK(cudaStreamSynchronize(ctx->copy_stream));
+    (void) cudaGetLastError();
+    return false;
+}
+
+bool ggml_quactlize_copy_range_wait(ggml_backend_event_t completion) {
+    if (!completion || !completion->context) { return false; }
+    const cudaError_t rc = cudaEventSynchronize((cudaEvent_t) completion->context);
+    if (rc != cudaSuccess) { (void) cudaGetLastError(); }
+    return rc == cudaSuccess;
 }
 
 static void qz_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value) {
@@ -275,7 +368,9 @@ static ggml_backend_buffer_t qz_buft_alloc_buffer(ggml_backend_buffer_type_t buf
         return nullptr;
     }
 
-    qz_buffer_context * ctx = new qz_buffer_context{ buft_ctx->device, dev_ptr, {} };
+    qz_buffer_context * ctx = new qz_buffer_context{};
+    ctx->device = buft_ctx->device;
+    ctx->dev_ptr = dev_ptr;
 
     return ggml_backend_buffer_init(buft, qz_buffer_interface, ctx, size);
 }
@@ -342,7 +437,7 @@ bool ggml_quactlize_can_serve(const ggml_tensor * weight, ggml_op op) {
     }
 
     // Without an in-process conversion there is no way to fill this buffer, and set_tensor has no second chance.
-    if (!ggml_quactlize_conversion_available(qtype)) {
+    if (!ggml_quactlize_device_pack_available(qtype)) {
         return false;
     }
 
@@ -354,6 +449,12 @@ bool ggml_quactlize_can_serve(const ggml_tensor * weight, ggml_op op) {
     const int k       = (int) weight->ne[0];
     const int n       = (int) weight->ne[1];
     const int experts = (int) (weight->ne[2] * weight->ne[3]);
+
+    quactlize_ppu_kpack_sizes_v1 device_sizes = {};
+    if (ggml_quactlize_device_pack_sizes(qtype, n, k, experts, &arr, &device_sizes) != 0 ||
+        device_sizes.raw_bytes != ggml_nbytes(weight)) {
+        return false;
+    }
 
     // The library answers for every runtime M at once. That is the only form of the question this function can
     // ask -- it runs at load, before any M exists, and the GGUF bytes do not survive a yes -- and no shape policy is

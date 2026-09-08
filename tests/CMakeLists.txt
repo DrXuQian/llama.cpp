@@ -275,6 +275,16 @@ if (GGML_NCP_QUACTLIZE)
         list(APPEND QUACTLIZE_STUB_TARGETS quactlize-stub-fmt${stub_fmt})
     endforeach()
 
+    foreach (variant "pack" "pack-incomplete")
+        add_library(quactlize-stub-${variant} MODULE test-quactlize-pack-stub.c)
+        target_include_directories(quactlize-stub-${variant} PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src/ggml-cuda)
+        set_target_properties(quactlize-stub-${variant} PROPERTIES
+            OUTPUT_NAME "quactlize_ppu_${variant}"
+            LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/quactlize-stub")
+        list(APPEND QUACTLIZE_STUB_TARGETS quactlize-stub-${variant})
+    endforeach()
+    target_compile_definitions(quactlize-stub-pack-incomplete PRIVATE QZ_PACK_OMIT_PREPARE)
+
     set(QUACTLIZE_LOADER_TU ${PROJECT_SOURCE_DIR}/ggml/src/ggml-cuda/quactlize-lib.cu)
     set_source_files_properties(${QUACTLIZE_LOADER_TU} PROPERTIES LANGUAGE CXX)
 
@@ -293,14 +303,28 @@ if (GGML_NCP_QUACTLIZE)
     set_tests_properties(test-quactlize-loader PROPERTIES
         LABELS "main"
         ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_CURRENT_BINARY_DIR}/quactlize-stub:$ENV{LD_LIBRARY_PATH};QZ_STUB_DIR=${CMAKE_CURRENT_BINARY_DIR}/quactlize-stub")
-endif()
-
+    if (GGML_CUDA)
+        enable_language(CUDA)
+        find_package(CUDAToolkit REQUIRED)
+        add_executable(test-quactlize-buffer test-quactlize-buffer.cu ${QUACTLIZE_LOADER_TU})
+        set_target_properties(test-quactlize-buffer PROPERTIES CUDA_RUNTIME_LIBRARY None)
+        target_compile_definitions(test-quactlize-buffer PRIVATE GGML_USE_PPU GGML_NCP_QUACTLIZE)
+        target_include_directories(test-quactlize-buffer PRIVATE
+            ${PROJECT_SOURCE_DIR}/ggml/include ${PROJECT_SOURCE_DIR}/ggml/src
+            ${PROJECT_SOURCE_DIR}/ggml/src/ggml-cuda ${CUDAToolkit_INCLUDE_DIRS})
+        target_link_libraries(test-quactlize-buffer PRIVATE ggml-base CUDA::cudart ${CMAKE_DL_LIBS})
+        add_dependencies(test-quactlize-buffer ${QUACTLIZE_STUB_TARGETS})
+        add_test(NAME test-quactlize-buffer COMMAND $<TARGET_FILE:test-quactlize-buffer>)
+        set_tests_properties(test-quactlize-buffer PROPERTIES
+            ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_CURRENT_BINARY_DIR}/quactlize-stub:$<TARGET_FILE_DIR:CUDA::cudart>:$ENV{LD_LIBRARY_PATH}")
+    endif()
     # The persistent K-pack sidecar (quactlize kquant-kpack.bundle v3): reader, writer, and their negatives. Host-only
     # -- the file format does not need a device -- so the module is compiled in directly and only ggml-base is linked;
     # the planes come from the stub libraries above. Set KPACK_PY (a python with quactlize importable) and
     # KPACK_PY_REPO to also run quactlize's own load_kpack_bundle on what the writer produced.
     find_package(Threads REQUIRED)
-    add_executable(test-kpack-sidecar test-kpack-sidecar.cpp ${PROJECT_SOURCE_DIR}/src/llama-kpack-sidecar.cpp ${QUACTLIZE_LOADER_TU})
+    add_executable(test-kpack-sidecar test-kpack-sidecar.cpp
+        ${PROJECT_SOURCE_DIR}/src/llama-kpack-sidecar.cpp ${PROJECT_SOURCE_DIR}/src/llama-kpack-cache.cpp ${QUACTLIZE_LOADER_TU})
     target_compile_definitions(test-kpack-sidecar PRIVATE GGML_USE_PPU GGML_NCP_QUACTLIZE)
     target_include_directories(test-kpack-sidecar PRIVATE
         ${PROJECT_SOURCE_DIR}/src
@@ -312,7 +336,9 @@ endif()
     add_dependencies(test-kpack-sidecar ${QUACTLIZE_STUB_TARGETS})
     add_test(NAME test-kpack-sidecar COMMAND $<TARGET_FILE:test-kpack-sidecar>)
     set_tests_properties(test-kpack-sidecar PROPERTIES
+        TIMEOUT 30
         ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_CURRENT_BINARY_DIR}/quactlize-stub:$ENV{LD_LIBRARY_PATH};QZ_STUB_DIR=${CMAKE_CURRENT_BINARY_DIR}/quactlize-stub")
+endif()
 
 llama_build_and_test(test-model-load-cancel.cpp LABEL "model")
 llama_build_and_test(test-autorelease.cpp       LABEL "model")

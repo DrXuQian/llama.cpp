@@ -7,6 +7,7 @@
 #include "llama-mmap.h"
 #include "llama-cparams.h"
 #include "llama-model-loader.h"
+#include "llama-kpack-cache.h"
 
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-iswa.h"
@@ -989,6 +990,8 @@ struct llama_model::impl {
 
     // contexts where the model tensors metadata is stored as well as the corresponding buffers:
     std::vector<std::pair<ggml_context_ptr, std::vector<ggml_backend_buffer_ptr>>> ctxs_bufs;
+    // Destroy the writer before any tensor metadata or device allocation.
+    std::unique_ptr<llama_kpack_cache> kpack_cache;
 
     buft_list_t cpu_buft_list;
     std::map<ggml_backend_dev_t, buft_list_t> gpu_buft_list;
@@ -1605,11 +1608,33 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     }
 
     // load tensor data
+    if (params.kpack_cache_path && params.kpack_cache_path[0]) {
+        if (ml.files.size() == 1 && !ml.source_path.empty()) {
+            std::vector<llama_kpack_source_tensor> inventory;
+            for (const auto & entry : ml.weights_map) {
+                const auto & w = entry.second;
+                llama_kpack_source_tensor src;
+                src.name = entry.first; src.gguf_index = w.gguf_index;
+                src.data_offset = w.offs; src.size_bytes = ggml_nbytes(w.tensor);
+                src.ggml_type = w.tensor->type; src.rank = ggml_n_dims(w.tensor);
+                src.k = w.tensor->ne[0]; src.n = w.tensor->ne[1];
+                src.experts = src.rank == 3 ? w.tensor->ne[2] : 0;
+                inventory.push_back(std::move(src));
+            }
+            pimpl->kpack_cache = std::make_unique<llama_kpack_cache>(
+                params.kpack_cache_path, ml.source_path, inventory, ml.files[0]->file_id());
+            ml.kpack_cache = pimpl->kpack_cache.get();
+        } else {
+            LLAMA_LOG_WARN("[kpack-cache] persistence currently requires one named GGUF file; using GPU pack\n");
+        }
+    }
     for (auto & [ctx, buf_map] : ctx_buf_maps) {
         if (!ml.load_all_data(ctx, buf_map, use_mlock ? &pimpl->mlock_mmaps : NULL, params.progress_callback, params.progress_callback_user_data)) {
             return false;
         }
     }
+
+    if (pimpl->kpack_cache) { pimpl->kpack_cache->start(); }
 
     if (use_mmap_buffer) {
         for (auto & mapping : ml.mappings) {
@@ -2267,6 +2292,7 @@ llama_model_params llama_model_default_params() {
         /*.progress_callback           =*/ nullptr,
         /*.progress_callback_user_data =*/ nullptr,
         /*.kv_overrides                =*/ nullptr,
+        /*.kpack_cache_path            =*/ nullptr,
         /*.vocab_only                  =*/ false,
         /*.use_mmap                    =*/ true,
         /*.use_direct_io               =*/ false,

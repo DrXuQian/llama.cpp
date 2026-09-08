@@ -5836,7 +5836,7 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
         return (void *)ggml_backend_cuda_split_buffer_type;
     }
 #ifdef GGML_NCP_QUACTLIZE
-    // K-pack sidecar seams (quactlize-buft.cuh). Reached by name so libllama does not link this backend.
+    // Host-only sidecar contract: quactlize-sidecar.h.
     if (strcmp(name, "ggml_quactlize_tensor_is_kpack") == 0) {
         return (void *) ggml_quactlize_tensor_is_kpack;
     }
@@ -5846,8 +5846,11 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     if (strcmp(name, "ggml_quactlize_set_planes") == 0) {
         return (void *) ggml_quactlize_set_planes;
     }
-    if (strcmp(name, "ggml_quactlize_set_sink") == 0) {
-        return (void *) ggml_quactlize_set_sink;
+    if (strcmp(name, "ggml_quactlize_copy_range_async") == 0) {
+        return (void *) ggml_quactlize_copy_range_async;
+    }
+    if (strcmp(name, "ggml_quactlize_copy_range_wait") == 0) {
+        return (void *) ggml_quactlize_copy_range_wait;
     }
 #endif
     if (strcmp(name, "ggml_backend_register_host_buffer") == 0) {

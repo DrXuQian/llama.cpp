@@ -32,6 +32,7 @@ add_library(llama
             llama-mmap.cpp
             llama-model-loader.cpp
             llama-kpack-sidecar.cpp
+            llama-kpack-cache.cpp
             llama-model-saver.cpp
             llama-model.cpp
             llama-quant.cpp

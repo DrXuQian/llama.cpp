@@ -25,6 +25,7 @@
 enum qz_kind {
     QZ_GATES,     // the admission guards: identity, registry, capability, byte neutrality
     QZ_CONVERT,   // the conversion itself: threading, the round trip, and the fallback when the split is invalid
+    QZ_DEVICE_PACK,
 };
 
 struct qz_case {
@@ -48,6 +49,21 @@ struct qz_case {
 // Five positives, one per format; five negatives, each making one guard fire; two deployment conditions. Every
 // negative must flip at least one column to false: a guard that cannot be made to fire is not a guard.
 static const qz_case g_cases[] = {
+    { QZ_DEVICE_PACK, "device-pack-q2", "", 10, true, true, true, true, true, false, "GPU producer Q2, NULL high plane" },
+    { QZ_DEVICE_PACK, "device-pack-q3", "", 11, true, true, true, true, true, false, "GPU producer Q3, two planes" },
+    { QZ_DEVICE_PACK, "device-pack-q4", "", 12, true, true, true, true, true, false, "GPU producer Q4, NULL high plane" },
+    { QZ_DEVICE_PACK, "device-pack-q5", "", 13, true, true, true, true, true, false, "GPU producer Q5, two planes" },
+    { QZ_DEVICE_PACK, "device-pack-q6", "", 14, true, true, true, true, true, false, "GPU producer Q6, two planes" },
+    { QZ_DEVICE_PACK, "device-pack-missing", "QUACTLIZE_PPU_PACK_LIBRARY=/missing/quactlize-pack.so", 12,
+      false, true, true, true, true, false, "explicit missing GPU producer does not fall back to CPU" },
+    { QZ_DEVICE_PACK, "device-pack-incomplete", "QUACTLIZE_PPU_PACK_LIBRARY=libquactlize_ppu_pack-incomplete.so", 12,
+      false, true, true, true, true, false, "query without a producer must decline" },
+    { QZ_DEVICE_PACK, "device-pack-sizes", "QZ_PACK_BAD_SIZES=1", 12,
+      false, true, true, true, true, false, "GPU and consumer plane sizes must agree" },
+    { QZ_DEVICE_PACK, "device-pack-query", "QZ_PACK_QUERY_FAIL=1", 12,
+      false, true, true, true, true, false, "GPU query rejects the consumer descriptor" },
+    { QZ_DEVICE_PACK, "device-pack-error", "QZ_PACK_LAUNCH_FAIL=1", 12,
+      true, false, true, true, true, false, "device launch error is propagated" },
     { QZ_GATES, "q2k",  "", GGML_TYPE_Q2_K, true,  true,  true,  true,  true,  false, "fmt2 -> Q2_K, arrangement matches the registry" },
     { QZ_GATES, "q3k",  "", GGML_TYPE_Q3_K, true,  true,  true,  true,  true,  false, "fmt3 -> Q3_K, two planes (2 + 1 bits)" },
     { QZ_GATES, "q4k",  "", GGML_TYPE_Q4_K, true,  true,  true,  true,  true,  false, "fmt0 -> Q4_K, one plane, gs=32" },
@@ -97,6 +113,20 @@ static const qz_case g_cases[] = {
 };
 
 static const size_t g_ncases = sizeof(g_cases) / sizeof(g_cases[0]);
+
+static int run_device_pack(const qz_case & c) {
+    const bool available = ggml_quactlize_device_pack_available(c.qtype);
+    if (available != c.want_available) return 1;
+    if (!available) return ggml_quactlize_conversion_available(c.qtype) ? 0 : 1;
+    quactlize_ppu_placed_arrangement_v2 arr = {};
+    quactlize_ppu_kpack_sizes_v1 sizes = {};
+    if (!ggml_quactlize_arrangement_for(c.qtype, &arr) ||
+        ggml_quactlize_device_pack_sizes(c.qtype, 256, 512, 3, &arr, &sizes)) return 1;
+    if (sizes.raw_bytes != ggml_row_size((ggml_type) c.qtype, 512) * 256 * 3) return 1;
+    const int rc = ggml_quactlize_prepare_device(c.qtype, (const uint8_t *) 1, (uint8_t *) 2,
+        arr.high_bits ? (uint8_t *) 3 : nullptr, (uint8_t *) 4, 256, 512, 3, &arr, (void *) 5);
+    return rc == (c.want_arrangement ? 0 : 41) ? 0 : 1;
+}
 
 // Shapes the byte-neutrality identity has to hold on. N and K are multiples of 256 because the real library admits
 // nothing else (a k-quant superblock is 256 along K; the N rule is the library's); the first row is the expert shape
@@ -344,7 +374,8 @@ int main(int argc, char ** argv) {
     if (argc >= 3 && strcmp(argv[1], "--case") == 0) {
         for (size_t i = 0; i < g_ncases; ++i) {
             if (strcmp(g_cases[i].name, argv[2]) == 0) {
-                const int f = g_cases[i].kind == QZ_CONVERT ? run_convert(g_cases[i]) : run_one(g_cases[i]);
+                const int f = g_cases[i].kind == QZ_DEVICE_PACK ? run_device_pack(g_cases[i]) :
+                              g_cases[i].kind == QZ_CONVERT ? run_convert(g_cases[i]) : run_one(g_cases[i]);
                 return f == 0 ? 0 : 1;
             }
         }
@@ -378,7 +409,7 @@ int main(int argc, char ** argv) {
 
         int failures = 0, ran = 0;
         for (size_t i = 0; i < g_ncases; ++i) {
-            if (g_cases[i].hide_bundle || strncmp(g_cases[i].env, "QZ_STUB_", 8) == 0) {
+            if (g_cases[i].kind == QZ_DEVICE_PACK || g_cases[i].hide_bundle || strncmp(g_cases[i].env, "QZ_STUB_", 8) == 0) {
                 continue;
             }
             ran++;

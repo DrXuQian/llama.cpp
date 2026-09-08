@@ -315,6 +315,11 @@ extern "C" {
         // override key-value pairs of the model meta data
         const struct llama_model_kv_override * kv_overrides;
 
+        // Optional K-pack sidecar directory for a single GGUF. Verified cache
+        // hits skip repacking; misses write asynchronously after model loading.
+        // The source file must stay unchanged until the cache is published.
+        const char * kpack_cache_path;
+
         // Keep the booleans together to avoid misalignment during copy-by-value.
         bool vocab_only;      // only load the vocabulary, no weights
         bool use_mmap;        // use mmap if possible

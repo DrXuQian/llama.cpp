@@ -20,6 +20,8 @@ using llama_buf_map = std::unordered_map<uint32_t, ggml_backend_buffer_t>;
 // lists of buffer types used for each layer
 using buft_list_t = std::vector<std::pair<ggml_backend_dev_t, ggml_backend_buffer_type_t>>;
 
+class llama_kpack_cache;
+
 enum llama_fver {
     GGUF_FILE_VERSION_V1 = 1,
     GGUF_FILE_VERSION_V2 = 2,
@@ -33,6 +35,7 @@ struct llama_model_loader {
     struct llama_tensor_weight {
         uint16_t  idx; // source file index
         size_t   offs; // tensor data offset in the original file
+        int32_t  gguf_index; // tensor table index within the source file
 
         ggml_tensor * tensor;
 
@@ -41,6 +44,7 @@ struct llama_model_loader {
             if (tensor_idx < 0) {
                 throw std::runtime_error(format("tensor '%s' not found in the model", ggml_get_name(tensor)));
             }
+            gguf_index = tensor_idx;
 
             offs = gguf_get_data_offset(gguf_ctx) + gguf_get_tensor_offset(gguf_ctx, tensor_idx);
             if (offs + ggml_nbytes(tensor) < offs || offs + ggml_nbytes(tensor) > file->size()) {
@@ -81,6 +85,8 @@ struct llama_model_loader {
     bool no_alloc;
 
     llama_files files;
+    std::string source_path;
+    llama_kpack_cache * kpack_cache = nullptr; // owned by the model
     llama_ftype ftype;
     llama_fver  fver;
 

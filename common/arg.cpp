@@ -2294,6 +2294,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_MMAP"));
     add_opt(common_arg(
+        {"--kpack-cache"}, "DIR",
+        "reuse a verified K-pack sidecar, or write one in the background (single GGUF, PPU K-pack backend)",
+        [](common_params & params, const std::string & value) {
+            params.kpack_cache_path = value;
+        }
+    ).set_env("LLAMA_ARG_KPACK_CACHE"));
+    add_opt(common_arg(
         {"-dio", "--direct-io"},
         {"-ndio", "--no-direct-io"},
         string_format("use DirectIO if available. (default: %s)", params.use_direct_io ? "enabled" : "disabled"),
