@@ -219,7 +219,8 @@ def performance(log, manifest, batch, phase, context=1024, chunks=8):
     for name, pattern in (("prompt", r"prompt eval time\s*=\s*(\S+) ms /\s*(\d+) tokens"),
                           ("decode", r":\s+eval time\s*=\s*(\S+) ms /\s*(\d+) runs")):
         matches = re.findall(pattern, text)
-        require(len(matches) == 1, f"missing/duplicate {name} evaluation timer")
+        require(len(matches) == 1, f"missing/duplicate {name} evaluation timer (matches={len(matches)}); "
+                "library INFO timers need --verbosity 4, not 3")
         ms, count = float(matches[0][0]), int(matches[0][1])
         require(math.isfinite(ms) and ms >= 0, f"invalid {name} evaluation timer")
         timings[name] = {"ms": ms, "tokens": count}

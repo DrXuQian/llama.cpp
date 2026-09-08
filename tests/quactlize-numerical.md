@@ -106,7 +106,11 @@ proofs and full numerical runs have separate results and share the same
 build/library receipts. The default short suite retains its trace requirements.
 
 Performance uses separate perplexity processes with normal model warmup,
-INFO-level logging, no profiler, no probability save and no KL comparison.
+`--verbosity 4`, no profiler, no probability save and no KL comparison.
+The common logger maps library INFO callbacks to threshold 4, unlike the
+application's INFO macros at 3; threshold 3 suppresses model timers and
+buffer/cache receipts. Level 4 still excludes DEBUG (5) route/graph logs;
+it does not enable an activity profiler.
 Reported throughput uses `llama_perf_context_print` model-evaluation timers,
 not process wall time. Loading, CPU likelihood calculation and probability
 file I/O must not be presented as GEMM time. This is model throughput with
@@ -128,3 +132,10 @@ need additional space. Large payloads remain on the box; upload only the
 printed `.results.tgz`, including `summary.tsv`, `performance-summary.json`
 and the original logs. GPU results are still required; host fixture tests
 exercise shell phase order/arguments/parsers, not numerical correctness.
+
+If numerical stages have completed but performance needs repeating, use
+`--performance-only` with the same inputs. It creates a new result directory
+and runs only the ABBA timing processes; no probability files or device traces
+are produced, and accuracy is marked `NOT_RUN`. `EVAL_BATCHES=128` limits this
+to four prefill processes. Preserve the previous numerical archive separately;
+this is a scoped rerun, not an automatic resume or merging of evidence.

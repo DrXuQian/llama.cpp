@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 import re
 import shlex
+import shutil
 import sqlite3
 import struct
 import subprocess
@@ -258,6 +259,50 @@ class NumericalEvidence(unittest.TestCase):
                     self.assertEqual(result['route_evidence'], 'BUFFER_PLACEMENT')
                     self.assertIsNone(result['routed_tensors'])
 
+    def test_library_info_callback_requires_trace_verbosity(self):
+        compiler = shutil.which('c++')
+        if compiler is None:
+            self.skipTest('host C++ compiler is not available')
+        repo = Path(__file__).parents[1]
+        source = self.root/'logger.cpp'
+        source.write_text(r'''
+#include "log.h"
+#include <cstdlib>
+// Only terminal colors and an unused abort dependency are stubbed.
+bool tty_can_use_colors() { return false; }
+extern "C" void ggml_abort(const char *, int, const char *, ...) { std::abort(); }
+int main(int argc, char ** argv) {
+    if (argc != 2) return 2;
+    common_log_set_verbosity_thold(std::atoi(argv[1]));
+    LOG_INF("APPLICATION_INFO\n");
+    common_log_default_callback(GGML_LOG_LEVEL_INFO,
+        "llama_perf_context_print: prompt eval time = 1.00 ms / 8192 tokens\n", nullptr);
+    common_log_default_callback(GGML_LOG_LEVEL_DEBUG, "[ncp-route] DEBUG_SENTINEL\n", nullptr);
+    common_log_flush(common_log_main());
+}
+''')
+        exe = self.root/'logger'
+        build = subprocess.run([compiler, '-std=c++17', '-pthread', '-I'+str(repo/'common'),
+                                '-I'+str(repo/'include'), '-I'+str(repo/'ggml/include'),
+                                str(source), str(repo/'common/log.cpp'), '-o', str(exe)],
+                               capture_output=True, text=True)
+        self.assertEqual(build.returncode, 0, build.stdout+build.stderr)
+        outputs = {}
+        for level in (3, 4, 5):
+            run = subprocess.run([str(exe), str(level)], capture_output=True, text=True)
+            self.assertEqual(run.returncode, 0, run.stderr)
+            outputs[level] = run.stdout+run.stderr
+            self.assertIn('APPLICATION_INFO', outputs[level])
+        self.assertNotIn('prompt eval time', outputs[3])
+        self.assertIn('prompt eval time', outputs[4])
+        self.assertNotIn('DEBUG_SENTINEL', outputs[4])
+        self.assertIn('DEBUG_SENTINEL', outputs[5])
+        runner = (repo/'tests/run-quactlize-numerical.sh').read_text()
+        configured = re.search(r'ARGS\+=\(--verbosity (\d+)\)', runner)
+        self.assertIsNotNone(configured)
+        self.assertIn('prompt eval time', outputs[int(configured[1])])
+        self.assertNotIn('DEBUG_SENTINEL', outputs[int(configured[1])])
+
     def test_performance_rejects_missing_work_and_instrumentation(self):
         replacements = (('warming up the model with an empty run', 'no warmup'),
                         ('8192 tokens', '8191 tokens'), ('1000.00 ms', 'nan ms'),
@@ -327,11 +372,12 @@ def arg(name):
 context, chunks, batch = int(arg('-c')), int(arg('--chunks')), int(arg('-b'))
 cached = '--kpack-cache' in args
 kpack = '_KPACK' in arg('-ot')
+verbosity = int(arg('--verbosity')) if '--verbosity' in args else (5 if '-v' in args else 3)
 if '--no-warmup' not in args:
     print('warming up the model with an empty run')
-if kpack:
+if kpack and verbosity >= 4:
     print('CUDA0_KPACK model buffer size = 16.00 MiB')
-if cached:
+if cached and verbosity >= 4:
     print('cache_uploads=1 resident_misses=0')
 label = 'kl_divergence: computing' if '--kl-divergence' in args else 'perplexity: calculating perplexity'
 print(f'{label} over {chunks} chunks, n_ctx={context}, batch_size={batch}, n_seq=1')
@@ -350,6 +396,8 @@ scored = chunks*(context-1-context//2)
 if '--save-all-logits' in args:
     path = pathlib.Path(arg('--save-all-logits'))
     path.write_bytes(b'_logits_'+struct.pack('<iii', context, 8, chunks)+bytes(context*chunks*4)+bytes(scored*24))
+if verbosity < 4:
+    sys.exit(0)
 if batch == 128:
     print(f'llama_perf_context_print: prompt eval time = 1000.00 ms / {context*chunks} tokens')
     print('llama_perf_context_print: eval time = 0.00 ms / 1 runs')
@@ -381,7 +429,7 @@ with sqlite3.connect(out) as db:
     db.executemany('INSERT INTO HGPTI_ACTIVITY_KIND_KERNEL VALUES(?, ?, 1, 2)', [(i*20, i*20+10) for i in range(calls)])
 ''')
         asys.chmod(0o755)
-        for mode in ('smoke', 'extended'):
+        for mode in ('smoke', 'extended', 'performance'):
             with self.subTest(mode=mode):
                 run = self.root/mode
                 for name in ('results', 'traces', 'logprobs'):
@@ -395,9 +443,9 @@ with sqlite3.connect(out) as db:
                 result = subprocess.run(['bash', '-c', script+tail], cwd=repo, capture_output=True, text=True)
                 self.assertEqual(result.returncode, 0, result.stdout[-3000:]+result.stderr)
                 phase_files = [p for p in (run/'results').glob('b*.json') if '-tokens' not in p.name]
-                self.assertEqual(len(phase_files), 10 if mode == 'smoke' else 16)
-                self.assertEqual(len(list((run/'traces').glob('*.sqlite'))), 10 if mode == 'smoke' else 2)
-                if mode == 'extended':
+                self.assertEqual(len(phase_files), {'smoke': 10, 'extended': 16, 'performance': 8}[mode])
+                self.assertEqual(len(list((run/'traces').glob('*.sqlite'))), {'smoke': 10, 'extended': 2, 'performance': 0}[mode])
+                if mode != 'smoke':
                     summary = json.loads((run/'results/performance-summary.json').read_text())
                     self.assertEqual(len(summary['rows']), 2)
                     for p in phase_files:
@@ -408,7 +456,10 @@ with sqlite3.connect(out) as db:
                         if row['phase'].endswith('perf'):
                             self.assertNotIn('--no-warmup', command)
                             self.assertNotIn('--save-all-logits', command)
-                            self.assertIn('--verbosity 3', command)
+                            self.assertIn('--verbosity 4', command)
+                    if mode == 'performance':
+                        self.assertEqual(list((run/'logprobs').iterdir()), [])
+                        self.assertTrue(all(json.loads(p.read_text())['phase'].endswith('perf') for p in phase_files))
 
 
 if __name__ == '__main__':
