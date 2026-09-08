@@ -506,8 +506,11 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
     // TODO: extract in a common llm_graph_context::build_inp_embd_h()
     auto inp = std::make_unique<llm_graph_input_embd_h>(hparams.n_embd);
 
-    inp->tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
-    ggml_set_input(inp->tokens);
+    inp->from_graph = params.nextn_tokens != nullptr;
+    inp->tokens = inp->from_graph ? params.nextn_tokens : ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
+    if (!inp->from_graph) {
+        ggml_set_input(inp->tokens);
+    }
 
     inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd_inp(), n_tokens);
     ggml_set_input(inp->embd);
@@ -524,11 +527,18 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
     }
     cb(tok_embd, "mtp_tok_embd", il);
 
-    inp->h = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd, n_tokens);
-    ggml_set_input(inp->h);
+    inp->h = inp->from_graph ? params.nextn_hidden : ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd, n_tokens);
+    if (!inp->from_graph) {
+        ggml_set_input(inp->h);
+    }
     ggml_set_name(inp->h, "mtp_h_input");
 
     ggml_tensor * h_embd = inp->h;
+    if (params.nextn_hidden && !params.nextn_tokens) {
+        h_embd = ggml_concat(ctx0,
+                ggml_view_2d(ctx0, inp->h, hparams.n_embd, 1, inp->h->nb[1], 0),
+                ggml_view_2d(ctx0, params.nextn_hidden, hparams.n_embd, n_tokens - 1, params.nextn_hidden->nb[1], 0), 1);
+    }
 
     res->add_input(std::move(inp));
 
@@ -606,6 +616,10 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
     cur = ggml_add(ctx0, cur, inpSA);
     cb(cur, "mtp_attn_residual", il);
 
+    if (cparams.embeddings_nextn_masked) {
+        cur = ggml_get_rows(ctx0, cur, inp_out_ids);
+    }
+
     ggml_tensor * ffn_residual = cur;
     cur = build_norm(cur, layer.attn_post_norm, nullptr, LLM_NORM_RMS, il);
     cb(cur, "mtp_attn_post_norm", il);
@@ -630,7 +644,9 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
     cb(cur, "h_nextn", -1);
     res->t_h_nextn = cur;
 
-    cur = ggml_get_rows(ctx0, cur, inp_out_ids);
+    if (!cparams.embeddings_nextn_masked) {
+        cur = ggml_get_rows(ctx0, cur, inp_out_ids);
+    }
     cb(cur, "mtp_shared_head_norm", -1);
 
     ggml_tensor * head_w = layer.nextn.shared_head_head ? layer.nextn.shared_head_head : model.output;

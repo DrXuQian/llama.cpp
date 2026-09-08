@@ -364,6 +364,12 @@ llama_kv_cache::llama_kv_cache(
 
     const char * LLAMA_KV_CACHE_DEBUG = getenv("LLAMA_KV_CACHE_DEBUG");
     debug = LLAMA_KV_CACHE_DEBUG ? atoi(LLAMA_KV_CACHE_DEBUG) : 0;
+
+    const char * LLAMA_KV_CACHE_FIXED_SIZE = getenv("LLAMA_KV_CACHE_FIXED_SIZE");
+    fixed_size = LLAMA_KV_CACHE_FIXED_SIZE && atoi(LLAMA_KV_CACHE_FIXED_SIZE) != 0;
+    if (fixed_size) {
+        LLAMA_LOG_INFO("%s: fixed KV graph size = %u\n", __func__, get_size());
+    }
 }
 
 void llama_kv_cache::clear(bool data) {
@@ -1248,6 +1254,10 @@ const llama_kv_cells & llama_kv_cache::get_cells(llama_seq_id seq_id) const {
 }
 
 uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
+    if (fixed_size) {
+        return get_size();
+    }
+
     uint32_t result = 0;
 
     // pad the n_kv value so that the graph remains constant across batches and can be reused
@@ -2740,6 +2750,35 @@ const llama_ubatch & llama_kv_cache_context::get_ubatch() const {
 
 uint32_t llama_kv_cache_context::get_n_kv() const {
     return n_kv;
+}
+
+std::unique_ptr<llama_kv_cache_context> llama_kv_cache_context::for_token(uint32_t i, uint32_t n_embd) const {
+    auto ubatch = get_ubatch();
+    GGML_ASSERT(ubatch.n_seqs_unq == 1 && i < ubatch.n_tokens);
+    auto sinfo = sinfos[i_cur];
+    GGML_ASSERT(sinfo.idxs.size() == 1);
+    sinfo.idxs[0] = { sinfo.idxs[0][i] };
+    if (ubatch.n_pos == 1) {
+        ubatch.pos += i;
+    } else {
+        struct token_data : llama_ubatch::data_t { std::shared_ptr<llama_ubatch::data_t> parent; };
+        auto data = std::make_shared<token_data>();
+        data->parent = ubatch.data;
+        for (uint32_t j = 0; j < ubatch.n_pos; j++) {
+            data->pos.push_back(ubatch.pos[j*ubatch.n_tokens + i]);
+        }
+        ubatch.pos = data->pos.data();
+        ubatch.data = std::move(data);
+    }
+    ubatch.n_tokens = ubatch.n_seq_tokens = ubatch.n_seqs = 1;
+    if (ubatch.token) { ubatch.token += i; }
+    if (ubatch.embd)  { ubatch.embd  += (size_t) i*n_embd; }
+    ubatch.n_seq_id += i;
+    ubatch.seq_id += i;
+    ubatch.output += i;
+    auto result = std::make_unique<llama_kv_cache_context>(kv, slot_info_vec_t{ std::move(sinfo) }, std::vector<llama_ubatch>{ std::move(ubatch) });
+    result->n_kv = n_kv;
+    return result;
 }
 
 ggml_type llama_kv_cache_context::type_k() const {

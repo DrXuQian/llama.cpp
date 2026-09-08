@@ -27,7 +27,9 @@
 #include <cassert>
 #include <cfloat>
 #include <cstdio>
+#include <map>
 #include <string>
+#include <tuple>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -1235,6 +1237,8 @@ struct ggml_tensor_extra_gpu {
 #define USE_CUDA_GRAPH
 #endif
 
+using ggml_cuda_graph_key = std::tuple<uintptr_t, int, int64_t, int64_t, int64_t, int64_t>;
+
 struct ggml_cuda_graph {
 #ifdef USE_CUDA_GRAPH
     ~ggml_cuda_graph() {
@@ -1419,6 +1423,13 @@ struct ggml_cuda_stream_context {
     }
 };
 
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && CUDART_VERSION >= 12080
+struct ggml_cuda_input_buffer {
+    void * data;
+    cudaEvent_t copied;
+};
+#endif
+
 struct ggml_backend_cuda_context {
     int device;
     std::string name;
@@ -1431,15 +1442,26 @@ struct ggml_backend_cuda_context {
 
     int curr_stream_no = 0;
 
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && CUDART_VERSION >= 12080
+    std::vector<ggml_cuda_input_buffer> input_buffers;
+    cudaStream_t input_stream = nullptr;
+#endif
+
 #ifdef USE_CUDA_GRAPH
-    // Map from first_node_ptr to cuda_graph - allows multiple graphs per context
-    // when the computation is split across CPU/GPU (e.g., with --n-cpu-moe)
-    std::unordered_map<const void *, std::unique_ptr<ggml_cuda_graph>> cuda_graphs;
+    // Keep separate variants when catch-up and draft graphs reuse the same tensor storage.
+    std::map<ggml_cuda_graph_key, std::unique_ptr<ggml_cuda_graph>> cuda_graphs;
 
     int64_t last_graph_eviction_sweep = 0;
 
-    ggml_cuda_graph * cuda_graph(const void * first_node_ptr) {
+    ggml_cuda_graph * cuda_graph(const ggml_cuda_graph_key & key) {
         const int64_t time_now = ggml_time_us();
+
+        // Keep graph destruction off the replay path.
+        auto cached = cuda_graphs.find(key);
+        if (cached != cuda_graphs.end()) {
+            cached->second->last_used_time = time_now;
+            return cached->second.get();
+        }
 
         // sweep every 5s, evicting cuda graphs unused for >=10s
         if (time_now - last_graph_eviction_sweep >= 5'000'000) {
@@ -1453,9 +1475,22 @@ struct ggml_backend_cuda_context {
             }
         }
 
-        auto it = cuda_graphs.find(first_node_ptr);
+        auto it = cuda_graphs.find(key);
         if (it == cuda_graphs.end()) {
-            it = cuda_graphs.emplace(first_node_ptr, std::make_unique<ggml_cuda_graph>()).first;
+            // Bound variants per split without evicting other CPU/GPU splits.
+            auto oldest = cuda_graphs.end();
+            size_t n_variants = 0;
+            for (auto cur = cuda_graphs.lower_bound({std::get<0>(key), 0, 0, 0, 0, 0});
+                    cur != cuda_graphs.end() && std::get<0>(cur->first) == std::get<0>(key); ++cur) {
+                ++n_variants;
+                if (oldest == cuda_graphs.end() || cur->second->last_used_time < oldest->second->last_used_time) {
+                    oldest = cur;
+                }
+            }
+            if (n_variants >= 8) {
+                cuda_graphs.erase(oldest);
+            }
+            it = cuda_graphs.emplace(key, std::make_unique<ggml_cuda_graph>()).first;
         }
         it->second->last_used_time = time_now;
         return it->second.get();

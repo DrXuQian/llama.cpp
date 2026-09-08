@@ -162,6 +162,12 @@ extern "C" {
         void * context;
     };
 
+    // Optional registry function: copy independent host inputs in backend order.
+    // On success, source reads finish before return; destination writes may remain queued.
+    typedef bool (*ggml_backend_set_inputs_t)(ggml_backend_t backend, struct ggml_tensor ** dst, struct ggml_tensor ** src, size_t count);
+    // Destinations must remain allocated and unaliased until the consuming graph completes.
+    typedef bool (*ggml_backend_set_inputs_async_t)(ggml_backend_t backend, struct ggml_tensor ** dst, struct ggml_tensor ** src, size_t count, ggml_backend_event_t consumed);
+
     struct ggml_backend_event {
         struct ggml_backend_device * device;
         void * context;

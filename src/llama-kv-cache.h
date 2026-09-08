@@ -267,6 +267,9 @@ private:
     // required padding
     const uint32_t n_pad = 1;
 
+    // env: LLAMA_KV_CACHE_FIXED_SIZE
+    bool fixed_size = false;
+
     // SWA
     const uint32_t n_swa = 0;
 
@@ -390,6 +393,9 @@ public:
     //
 
     uint32_t get_n_kv() const;
+
+    // A single-token view of an already applied, single-sequence batch.
+    std::unique_ptr<llama_kv_cache_context> for_token(uint32_t i, uint32_t n_embd) const;
 
     ggml_type type_k() const;
     ggml_type type_v() const;

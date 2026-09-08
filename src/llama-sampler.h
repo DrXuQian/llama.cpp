@@ -36,7 +36,8 @@ struct llama_sampler_chain {
 };
 
 uint32_t llama_sampler_backend_n_nodes(const llama_sampler * sampler);
-void llama_sampler_backend_begin(llama_sampler * sampler);
+void llama_sampler_backend_begin(llama_sampler * sampler, uint32_t n_precomputed = 0);
+bool llama_sampler_backend_can_prefetch(const llama_sampler * sampler);
 
 struct llama_sampler * llama_sampler_init_dry_testing(
         float   dry_multiplier,

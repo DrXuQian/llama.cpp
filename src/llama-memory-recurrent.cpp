@@ -138,6 +138,55 @@ llama_memory_recurrent::llama_memory_recurrent(
     }
 }
 
+bool llama_memory_recurrent::nextn_state_outputs(std::map<ggml_tensor *, ggml_tensor *> & outputs) {
+    if (n_seq_max != 1 || size != 1 || n_rs_seq == 0 || hparams.ple_conv_state() != 0) {
+        return false;
+    }
+    if (nextn_r_l.empty()) {
+        ggml_context_ptr ctx(ggml_init({ 2*r_l.size()*ggml_tensor_overhead(), nullptr, true }));
+        std::vector<ggml_tensor *> r(r_l.size()), s(s_l.size());
+        ggml_backend_buffer_type_t buft = nullptr;
+        for (size_t i = 0; i < r_l.size(); ++i) {
+            if (!r_l[i]) {
+                continue;
+            }
+            auto * cur_buft = ggml_backend_buffer_get_type(r_l[i]->buffer);
+            if ((buft && buft != cur_buft) || cur_buft != ggml_backend_buffer_get_type(s_l[i]->buffer)) {
+                return false;
+            }
+            buft = cur_buft;
+            r[i] = ggml_dup_tensor(ctx.get(), r_l[i]);
+            s[i] = ggml_dup_tensor(ctx.get(), s_l[i]);
+        }
+        if (!buft) {
+            return false;
+        }
+        ggml_backend_buffer_ptr buf(ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft));
+        if (!buf) {
+            return false;
+        }
+        ggml_backend_buffer_clear(buf.get(), 0);
+        LLAMA_LOG_INFO("%s: alternate RS buffer = %.2f MiB\n", __func__, ggml_backend_buffer_get_size(buf.get())/1024.0/1024.0);
+        ctxs_bufs.emplace_back(std::move(ctx), std::move(buf));
+        nextn_r_l = std::move(r);
+        nextn_s_l = std::move(s);
+    }
+    outputs.clear();
+    for (size_t i = 0; i < r_l.size(); ++i) {
+        if (r_l[i]) {
+            outputs.emplace(r_l[i], nextn_r_l[i]);
+            outputs.emplace(s_l[i], nextn_s_l[i]);
+        }
+    }
+    return true;
+}
+
+void llama_memory_recurrent::nextn_commit_states() {
+    GGML_ASSERT(!nextn_r_l.empty());
+    r_l.swap(nextn_r_l);
+    s_l.swap(nextn_s_l);
+}
+
 void llama_memory_recurrent::clear(bool data) {
     for (int32_t i = 0; i < (int32_t) size; ++i) {
         cells[i].pos = -1;

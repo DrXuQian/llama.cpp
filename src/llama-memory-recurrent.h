@@ -78,6 +78,9 @@ public:
 
     void set_rs_idx(llama_seq_id seq_id, uint32_t idx);
 
+    bool nextn_state_outputs(std::map<ggml_tensor *, ggml_tensor *> & outputs);
+    void nextn_commit_states();
+
     // computed before each graph build
     uint32_t n = 0;
 
@@ -122,6 +125,8 @@ private:
 
     // ggml contexts for the KV cache along with the allocated backend buffers:
     std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> ctxs_bufs;
+    std::vector<ggml_tensor *> nextn_r_l;
+    std::vector<ggml_tensor *> nextn_s_l;
 
     size_t total_size() const;
 

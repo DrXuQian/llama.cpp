@@ -366,9 +366,13 @@ static ggml_cuda_device_info ggml_cuda_init() {
         // Setting device scheduling strategy for iGPUs with cc121 to "spinning" to avoid delays in cuda synchronize calls.
         // TODO: Check for future drivers the default scheduling strategy and
         // remove this call again when cudaDeviceScheduleSpin is default.
-        if (prop.major == 12 && prop.minor == 1) {
+        const char * spin = getenv("GGML_CUDA_SCHEDULE_SPIN");
+        if ((prop.major == 12 && prop.minor == 1) || (spin && atoi(spin) != 0)) {
             CUDA_CHECK(cudaSetDevice(physical_id));
-            CUDA_CHECK(cudaSetDeviceFlags(cudaDeviceScheduleSpin));
+            unsigned int flags;
+            CUDA_CHECK(cudaGetDeviceFlags(&flags));
+            CUDA_CHECK(cudaSetDeviceFlags((flags & ~cudaDeviceScheduleMask) | cudaDeviceScheduleSpin));
+            GGML_LOG_INFO("%s: device %d uses spin scheduling\n", __func__, id);
         }
 
 #endif  // defined(GGML_USE_HIP)
@@ -704,6 +708,17 @@ static std::atomic<int> ggml_cuda_lock_counter;
 ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     std::unique_lock<std::mutex> lock(ggml_cuda_lock);
     ggml_cuda_lock_cv.wait(lock, []{ return ggml_cuda_lock_counter.load(std::memory_order_relaxed) == 0; });
+
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && CUDART_VERSION >= 12080
+    for (auto & input : input_buffers) {
+        CUDA_CHECK(cudaEventSynchronize(input.copied));
+        CUDA_CHECK(cudaEventDestroy(input.copied));
+        CUDA_CHECK(cudaFreeHost(input.data));
+    }
+    if (input_stream) {
+        CUDA_CHECK(cudaStreamDestroy(input_stream));
+    }
+#endif
 
     if (copy_event != nullptr) {
         CUDA_CHECK(cudaEventDestroy(copy_event));
@@ -2437,6 +2452,167 @@ static void ggml_backend_cuda_free(ggml_backend_t backend) {
     delete backend;
 }
 
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && CUDART_VERSION >= 12080
+struct ggml_cuda_token_sources {
+    const int32_t * data[11];
+};
+
+static __global__ void ggml_cuda_gather_tokens(ggml_cuda_token_sources src, int32_t * dst, int count) {
+    const int i = threadIdx.x;
+    if (i < count) {
+        dst[i] = *src.data[i];
+    }
+}
+
+static bool ggml_backend_cuda_get_tensors_async(ggml_backend_t backend, const ggml_tensor ** tensors, void ** dst, size_t count) {
+    auto * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+#if CUDART_VERSION >= 13000
+    std::vector<const void *> dsts, srcs;
+#else
+    std::vector<void *> dsts, srcs;
+#endif
+    std::vector<size_t> sizes;
+    for (size_t i = 0; i < count; i++) {
+        auto * tensor = tensors[i];
+        auto * buffer = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
+        if (buffer->buft != ggml_backend_cuda_buffer_type(cuda_ctx->device)) {
+            return false;
+        }
+        const size_t size = ggml_nbytes(tensor);
+        if (size > 0) {
+            srcs.push_back(tensor->data);
+            dsts.push_back(dst[i]);
+            sizes.push_back(size);
+        }
+    }
+    if (sizes.empty()) {
+        return true;
+    }
+    ggml_cuda_set_device(cuda_ctx->device);
+    bool tokens = count >= 2 && count <= 11 && sizes.size() == count;
+    for (size_t i = 0; tokens && i < count; i++) {
+        tokens = tensors[i]->type == GGML_TYPE_I32 && sizes[i] == sizeof(int32_t) &&
+            dst[i] == (char *) dst[0] + i*sizeof(int32_t);
+    }
+    if (tokens) {
+        cudaPointerAttributes attrs;
+        CUDA_CHECK(cudaPointerGetAttributes(&attrs, dst[0]));
+        if (attrs.type == cudaMemoryTypeDevice && attrs.device == ggml_cuda_get_physical_device(cuda_ctx->device)) {
+            ggml_cuda_token_sources sources = {};
+            for (size_t i = 0; i < count; i++) {
+                sources.data[i] = (const int32_t *) tensors[i]->data;
+            }
+            // Pack scalar outputs in one operation before the consumer stream starts.
+            ggml_cuda_gather_tokens<<<1, 32, 0, cuda_ctx->stream()>>>(sources, (int32_t *) dst[0], count);
+            CUDA_CHECK(cudaGetLastError());
+            return true;
+        }
+    }
+    cudaMemcpyAttributes attrs = {};
+    attrs.srcAccessOrder = cudaMemcpySrcAccessOrderStream;
+    size_t attrs_idx = 0;
+#if CUDART_VERSION >= 13000
+    CUDA_CHECK(cudaMemcpyBatchAsync(dsts.data(), srcs.data(), sizes.data(), sizes.size(), &attrs, &attrs_idx, 1, cuda_ctx->stream()));
+#else
+    size_t fail_idx = SIZE_MAX;
+    CUDA_CHECK(cudaMemcpyBatchAsync(dsts.data(), srcs.data(), sizes.data(), sizes.size(), &attrs, &attrs_idx, 1, &fail_idx, cuda_ctx->stream()));
+#endif
+    return true;
+}
+
+static bool ggml_backend_cuda_set_inputs_async(ggml_backend_t backend, ggml_tensor ** dst, ggml_tensor ** src, size_t count, ggml_backend_event_t consumed) {
+    auto * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+#if CUDART_VERSION >= 13000
+    std::vector<const void *> dsts, srcs;
+#else
+    std::vector<void *> dsts, srcs;
+#endif
+    std::vector<size_t> sizes;
+    dsts.reserve(count);
+    srcs.reserve(count);
+    sizes.reserve(count);
+    size_t total = 0;
+    for (size_t i = 0; i < count; i++) {
+        total += ggml_nbytes(src[i]);
+        if (total > 1024*1024) {
+            return false;
+        }
+    }
+    if (total == 0) {
+        return true;
+    }
+    ggml_cuda_set_device(cuda_ctx->device);
+    ggml_cuda_input_buffer * staging = nullptr;
+    for (auto & input : cuda_ctx->input_buffers) {
+        const cudaError_t status = cudaEventQuery(input.copied);
+        if (status == cudaErrorNotReady) {
+            continue;
+        }
+        CUDA_CHECK(status);
+        staging = &input;
+        break;
+    }
+    if (!staging) {
+        if (cuda_ctx->input_buffers.size() >= 8) {
+            return false;
+        }
+        void * data = ggml_cuda_host_malloc(1024*1024);
+        if (!data) {
+            return false;
+        }
+        cudaEvent_t copied;
+        CUDA_CHECK(cudaEventCreateWithFlags(&copied, cudaEventDisableTiming));
+        cuda_ctx->input_buffers.push_back({ data, copied });
+        staging = &cuda_ctx->input_buffers.back();
+    }
+    // Keep pinned sources until their stream-ordered transfers have completed.
+    size_t offset = 0;
+    for (size_t i = 0; i < count; i++) {
+        const size_t size = ggml_nbytes(src[i]);
+        GGML_ASSERT(size == ggml_nbytes(dst[i]));
+        if (size == 0) {
+            continue;
+        }
+        dsts.push_back(dst[i]->data);
+        memcpy((char *) staging->data + offset, src[i]->data, size);
+        srcs.push_back((char *) staging->data + offset);
+        sizes.push_back(size);
+        offset += size;
+    }
+    if (sizes.empty()) {
+        return true;
+    }
+
+    ggml_cuda_set_device(cuda_ctx->device);
+    cudaStream_t stream = cuda_ctx->stream();
+    if (consumed) {
+        if (!cuda_ctx->input_stream) {
+            CUDA_CHECK(cudaStreamCreateWithFlags(&cuda_ctx->input_stream, cudaStreamNonBlocking));
+        }
+        stream = cuda_ctx->input_stream;
+        CUDA_CHECK(cudaStreamWaitEvent(stream, (cudaEvent_t) consumed->context, 0));
+    }
+    cudaMemcpyAttributes attrs = {};
+    attrs.srcAccessOrder = cudaMemcpySrcAccessOrderStream;
+    size_t attrs_idx = 0;
+#if CUDART_VERSION >= 13000
+    CUDA_CHECK(cudaMemcpyBatchAsync(dsts.data(), srcs.data(), sizes.data(), sizes.size(), &attrs, &attrs_idx, 1, stream));
+#else
+    size_t fail_idx = SIZE_MAX;
+    CUDA_CHECK(cudaMemcpyBatchAsync(dsts.data(), srcs.data(), sizes.data(), sizes.size(), &attrs, &attrs_idx, 1, &fail_idx, stream));
+#endif
+    CUDA_CHECK(cudaEventRecord(staging->copied, stream));
+    if (consumed) {
+        CUDA_CHECK(cudaStreamWaitEvent(cuda_ctx->stream(), staging->copied, 0));
+    }
+    return true;
+}
+
+static bool ggml_backend_cuda_set_inputs(ggml_backend_t backend, ggml_tensor ** dst, ggml_tensor ** src, size_t count) {
+    return ggml_backend_cuda_set_inputs_async(backend, dst, src, count, nullptr);
+}
+#endif
+
 static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
     ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
@@ -2583,14 +2759,15 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
     return use_cuda_graph;
 }
 
-static const void * ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
-    return cgraph->nodes[0];
+static ggml_cuda_graph_key ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
+    const auto * first = cgraph->nodes[0];
+    return {reinterpret_cast<uintptr_t>(first), cgraph->n_nodes, first->ne[0], first->ne[1], first->ne[2], first->ne[3]};
 }
 
 static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph) {
     bool res = false;
 
-    const void * graph_key = ggml_cuda_graph_get_key(cgraph);
+    const auto graph_key = ggml_cuda_graph_get_key(cgraph);
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
 
     if (cgraph->uid != 0 &&
@@ -2629,7 +2806,7 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
     return res;
 }
 
-static void ggml_cuda_graph_update_executable(ggml_backend_cuda_context * cuda_ctx, const void * graph_key) {
+static void ggml_cuda_graph_update_executable(ggml_backend_cuda_context * cuda_ctx, const ggml_cuda_graph_key & graph_key) {
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
 
 #if CUDART_VERSION >= 12000
@@ -4177,7 +4354,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     return 0;
 }
 
-static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
+static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const ggml_cuda_graph_key & graph_key) {
     bool graph_evaluated_or_captured = false;
 
     // flag used to determine whether it is an integrated_gpu
@@ -4396,7 +4573,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 }
 
 #ifdef USE_CUDA_GRAPH
-static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, const void * graph_key) {
+static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, const ggml_cuda_graph_key & graph_key) {
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
 
     if (graph->graph == nullptr) {
@@ -4419,7 +4596,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 
     bool use_cuda_graph             = false;
     bool cuda_graph_update_required = false;
-    const void * graph_key = nullptr;
+    ggml_cuda_graph_key graph_key = {};
 
 #ifdef USE_CUDA_GRAPH
     graph_key = ggml_cuda_graph_get_key(cgraph);
@@ -4428,6 +4605,15 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
     if (graph->is_enabled()) {
+        // A scheduler UID is stable only while the graph and its allocations are unchanged.
+        // Replaying an already captured graph needs no per-node compatibility checks.
+        if (cgraph->uid != 0 && cgraph->uid == graph->uid &&
+            graph->warmup_complete && graph->instance != nullptr) {
+            GGML_ASSERT((int) graph->node_props.size() == cgraph->n_nodes);
+            CUDA_CHECK(cudaGraphLaunch(graph->instance, cuda_ctx->stream()));
+            return GGML_STATUS_SUCCESS;
+        }
+
         const bool graph_compatible = ggml_cuda_graph_check_compability(cgraph);
         if (graph_compatible) {
             const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph);
@@ -4457,6 +4643,8 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 #endif // USE_CUDA_GRAPH
 
     if (use_cuda_graph && cuda_graph_update_required) {
+        // Drain uncaptured input transfers before starting a new capture.
+        CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
         // Start CUDA graph capture
         {
             std::lock_guard<std::mutex> lock(ggml_cuda_lock);
@@ -4522,7 +4710,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
     }
 
 #ifdef USE_CUDA_GRAPH
-    const void * graph_key = ggml_cuda_graph_get_key(cgraph);
+    const auto graph_key = ggml_cuda_graph_get_key(cgraph);
     const bool use_cuda_graph = ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
 #else
     const bool use_cuda_graph = false;
@@ -5281,6 +5469,9 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 if (src0_type == GGML_TYPE_F32 && src1_type == GGML_TYPE_I32) {
                     return true;
                 }
+                if (src0_type == GGML_TYPE_F32 && src1_type == GGML_TYPE_I64) {
+                    return true;
+                }
                 if (src0_type == GGML_TYPE_I32 && src1_type == GGML_TYPE_F32) {
                     return true;
                 }
@@ -5672,6 +5863,18 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t 
 
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && CUDART_VERSION >= 12080
+    if (strcmp(name, "ggml_backend_set_inputs") == 0) {
+        return (void *) ggml_backend_cuda_set_inputs;
+    }
+    if (strcmp(name, "ggml_backend_set_inputs_async") == 0) {
+        const char * env = getenv("GGML_CUDA_ASYNC_INPUTS");
+        return env && atoi(env) != 0 ? (void *) ggml_backend_cuda_set_inputs_async : nullptr;
+    }
+    if (strcmp(name, "ggml_backend_get_tensors_async") == 0) {
+        return (void *) ggml_backend_cuda_get_tensors_async;
+    }
+#endif
     if (strcmp(name, "ggml_backend_comm_init") == 0) {
         return (void *)ggml_backend_cuda_comm_init;
     }

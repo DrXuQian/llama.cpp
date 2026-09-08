@@ -93,6 +93,15 @@ struct llama_cross {
 
 struct llm_graph_params;
 
+struct llm_graph_nextn_target {
+    ggml_tensor * tokens = nullptr;
+    ggml_tensor * positions = nullptr;
+    ggml_tensor * kv_idxs = nullptr;
+    ggml_tensor * mask = nullptr;
+    ggml_tensor * rs_copy = nullptr;
+    std::map<ggml_tensor *, ggml_tensor *> state_outputs;
+};
+
 //
 // llm_graph_input
 //
@@ -135,6 +144,8 @@ public:
     ggml_tensor * tokens = nullptr; // I32 [n_batch]
     ggml_tensor * embd   = nullptr; // F32 [n_embd, n_batch]
 
+    bool from_graph = false;
+
     const int64_t n_embd = 0;
 };
 
@@ -151,6 +162,8 @@ public:
     ggml_tensor * tokens = nullptr; // I32 [n_batch]
     ggml_tensor * embd   = nullptr; // F32 [n_embd, n_batch]
     ggml_tensor * h      = nullptr; // F32 [n_embd, n_batch]
+
+    bool from_graph = false;
 
     const int64_t n_embd = 0;
 };
@@ -347,6 +360,7 @@ public:
     // note: assumes v_rot^2 == I
     ggml_tensor * self_k_rot = nullptr;
     ggml_tensor * self_v_rot = nullptr;
+    bool from_graph = false;
 
     // note: these have to be copies because in order to be able to reuse a graph, its inputs
     //       need to carry these parameters with them. otherwise, they can point to freed
@@ -677,6 +691,8 @@ public:
     std::unique_ptr<llm_graph_input_attn_kv> inp_attn;
     std::unique_ptr<llm_graph_input_rs>      inp_rs;
 
+    bool from_graph = false;
+
     llm_graph_input_attn_kv * get_attn() const { return inp_attn.get(); }
     llm_graph_input_rs      * get_recr() const { return inp_rs.get(); }
 
@@ -809,9 +825,23 @@ struct llm_graph_params {
 
     llm_graph_result * res;
 
+    ggml_tensor * nextn_tokens = nullptr;
+    ggml_tensor * nextn_hidden = nullptr;
+    ggml_tensor * nextn_positions = nullptr;
+    ggml_tensor * nextn_reject_mask = nullptr;
+    ggml_tensor * nextn_verify_tokens = nullptr;
+    std::array<ggml_tensor *, 3> nextn_features = {};
+    bool nextn_gpu_kv = false;
+    const llm_graph_nextn_target * nextn_target = nullptr;
+
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
     bool allow_reuse(const llm_graph_params & other) const {
+        if (nextn_tokens != other.nextn_tokens || nextn_hidden != other.nextn_hidden || nextn_verify_tokens != other.nextn_verify_tokens ||
+                nextn_positions != other.nextn_positions || nextn_reject_mask != other.nextn_reject_mask ||
+                nextn_features != other.nextn_features || nextn_gpu_kv != other.nextn_gpu_kv || nextn_target != other.nextn_target) {
+            return false;
+        }
         // first check the ubatch
         bool can_reuse_ubatch =
             ubatch.equal_seqs() == other.ubatch.equal_seqs() &&
@@ -1029,6 +1059,11 @@ struct llm_graph_context {
     std::map<llama_seq_id, llama_sampler *> samplers;
 
     const llm_graph_cb & cb_func;
+
+    ggml_tensor * nextn_verify_tokens;
+    ggml_tensor * nextn_positions;
+    ggml_tensor * nextn_reject_mask;
+    const llm_graph_nextn_target * nextn_target;
 
     llm_graph_result * res;
 
@@ -1312,6 +1347,7 @@ struct llm_graph_context {
 
     //
     // recurrent
+    ggml_tensor * build_rs_output(ggml_tensor * state) const;
     //
 
     // TODO: move this implementation to llama_memory_recurrent.

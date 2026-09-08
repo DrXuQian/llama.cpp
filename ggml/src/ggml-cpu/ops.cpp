@@ -555,6 +555,7 @@ void ggml_compute_forward_dup(
                 else if (dst->type == GGML_TYPE_BF16) ggml_compute_forward_dup_flt<float, ggml_bf16_t>(params, dst);
                 else if (dst->type == GGML_TYPE_F32)  ggml_compute_forward_dup_flt<float, float      >(params, dst);
                 else if (dst->type == GGML_TYPE_I32)  ggml_compute_forward_dup_flt<float, int32_t    >(params, dst);
+                else if (dst->type == GGML_TYPE_I64)  ggml_compute_forward_dup_flt<float, int64_t    >(params, dst);
                 else ggml_compute_forward_dup_to_q<float>(params, dst);
             } break;
         case GGML_TYPE_I32:

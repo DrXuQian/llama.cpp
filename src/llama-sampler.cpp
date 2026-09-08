@@ -1414,7 +1414,7 @@ struct llama_sampler * llama_sampler_init_dist(uint32_t seed) {
     );
 }
 
-void llama_sampler_backend_begin(llama_sampler * sampler) {
+void llama_sampler_backend_begin(llama_sampler * sampler, uint32_t n_precomputed) {
     GGML_ASSERT(sampler != nullptr);
 
     if (sampler->iface == &llama_sampler_chain_i) {
@@ -1423,7 +1423,7 @@ void llama_sampler_backend_begin(llama_sampler * sampler) {
             if (!entry.is_backend) {
                 break;
             }
-            llama_sampler_backend_begin(entry.ptr);
+            llama_sampler_backend_begin(entry.ptr, n_precomputed);
         }
     } else if (sampler->iface == &llama_sampler_dist_i) {
         auto * ctx = (llama_sampler_dist *) sampler->ctx;
@@ -1431,6 +1431,15 @@ void llama_sampler_backend_begin(llama_sampler * sampler) {
             ctx->rng_backend = ctx->rng;
             ctx->n_backend_draws_generated = 0;
             ctx->n_backend_draws_committed = 0;
+        }
+        // Preserve CPU RNG accounting when a deterministic GPU batch was queued early.
+        std::uniform_real_distribution<double> dist(0.0f, 1.0f);
+        auto & rng = ctx->backend_transactional ? ctx->rng_backend : ctx->rng;
+        for (uint32_t i = 0; i < n_precomputed; ++i) {
+            dist(rng);
+            if (ctx->backend_transactional) {
+                ++ctx->n_backend_draws_generated;
+            }
         }
     }
 }
@@ -4348,6 +4357,28 @@ uint32_t llama_sampler_get_seed(const struct llama_sampler * smpl) {
     }
 
     return LLAMA_DEFAULT_SEED;
+}
+
+bool llama_sampler_backend_can_prefetch(const llama_sampler * sampler) {
+    if (sampler->iface == &llama_sampler_chain_i) {
+        const auto * chain = (const llama_sampler_chain *) sampler->ctx;
+        if (!chain->is_init || chain->samplers.empty()) {
+            return false;
+        }
+        for (const auto & entry : chain->samplers) {
+            if (!entry.is_backend || !llama_sampler_backend_can_prefetch(entry.ptr)) {
+                return false;
+            }
+        }
+        return true;
+    }
+    // The caller also requires one candidate per row, so dist cannot change the result.
+    const auto * iface = sampler->iface;
+    return iface == &llama_sampler_empty_i || iface == &llama_sampler_greedy_i ||
+        iface == &llama_sampler_dist_i || iface == &llama_sampler_top_k_i ||
+        iface == &llama_sampler_top_p_i || iface == &llama_sampler_min_p_i ||
+        iface == &llama_sampler_temp_i || iface == &llama_sampler_temp_ext_i ||
+        iface == &llama_sampler_logit_bias_i;
 }
 
 // perf

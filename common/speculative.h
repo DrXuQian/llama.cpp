@@ -82,6 +82,11 @@ bool common_speculative_process(common_speculative * spec, const llama_batch & b
 // generate drafts for the sequences specified with `common_speculative_get_draft_params`
 void common_speculative_draft(common_speculative * spec);
 
+// Generate drafts, deferring host token collection when a GPU MTP chain is available.
+// A true result must be resolved before processing or accepting the target batch.
+bool common_speculative_draft_async(common_speculative * spec);
+void common_speculative_resolve_draft(common_speculative * spec);
+
 // informs the speculative context that n_accepted tokens were accepted by the target model
 void common_speculative_accept(common_speculative * spec, llama_seq_id, uint16_t n_accepted);
 

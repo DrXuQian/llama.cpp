@@ -16,6 +16,7 @@
 #include "speculative.h"
 #include "mtmd.h"
 #include "mtmd-helper.h"
+#include "../../src/llama-ext.h"
 
 #include <algorithm>
 #include <cstddef>
@@ -894,6 +895,7 @@ private:
     common_context_seq_rm_type ctx_dft_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
 
     common_speculative_ptr spec;
+    bool spec_draft_async = false;
 
     bool add_bos_token = true;
 
@@ -2891,6 +2893,7 @@ private:
     }
 
     void pre_decode() {
+        GGML_ASSERT(!spec_draft_async);
         // apply context-shift if needed
         // TODO: simplify and improve
         iterate(slots, [&](server_slot & slot) {
@@ -3026,8 +3029,18 @@ private:
 
         // generate the actual drafts (if any)
         if (!drafting.empty()) {
+            const int n_draft = params_base.speculative.draft.n_max;
+            const bool can_defer = slots.size() == 1 && drafting.size() == 1 &&
+                ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_PART &&
+                (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_PART ||
+                    (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && n_draft <= (int) llama_n_rs_seq(ctx_tgt))) &&
+                n_draft + 1 <= (int) llama_n_batch(ctx_tgt) && n_draft + 1 <= (int) llama_n_ubatch(ctx_tgt);
             queue_tasks.yield_to_queue([&]() {
-                common_speculative_draft(spec.get());
+                if (can_defer) {
+                    spec_draft_async = common_speculative_draft_async(spec.get());
+                } else {
+                    common_speculative_draft(spec.get());
+                }
             });
         }
 
@@ -3662,12 +3675,49 @@ private:
         // yield to the queue, so we can still handle metrics tasks while decoding
         // note: the sync is done here too, so that the wait is also covered by the yield
         int ret = 0;
+        bool spec_ok = true;
+        const bool process_before_sync = spec &&
+            std::any_of(params_base.speculative.types.begin(), params_base.speculative.types.end(), [](auto type) {
+                return type == COMMON_SPECULATIVE_TYPE_DRAFT_MTP || type == COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3;
+            }) &&
+            std::all_of(params_base.speculative.types.begin(), params_base.speculative.types.end(), [](auto type) {
+                return type == COMMON_SPECULATIVE_TYPE_NONE || type == COMMON_SPECULATIVE_TYPE_DRAFT_MTP || type == COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3;
+            });
         queue_tasks.yield_to_queue([&]() {
-            ret = llama_decode(ctx_tgt, batch_view);
+            if (spec_draft_async) {
+                const bool submitted = llama_decode_nextn_verify(ctx_tgt, ctx_dft, batch_view, &ret);
+                common_speculative_resolve_draft(spec.get());
+                auto & slot = slots[0];
+                for (size_t i = 0; i < slot.spec_draft.size(); i++) {
+                    batch.batch.token[slot.spec_i_batch[i + 1]] = slot.spec_draft[i];
+                }
+                if (submitted) {
+                    SLT_DBG(slot, "GPU NextN verification: %zu draft tokens\n", slot.spec_draft.size());
+                } else {
+                    ret = llama_decode(ctx_tgt, batch_view);
+                }
+            } else {
+                ret = llama_decode(ctx_tgt, batch_view);
+            }
+            if (ret == 0 && process_before_sync) {
+                spec_ok = common_speculative_process(spec.get(), batch_view);
+            }
             if (ret == 0 && has_output) {
-                llama_synchronize(ctx_tgt);
+                llama_synchronize_outputs(ctx_tgt);
             }
         });
+
+        if (spec_draft_async) {
+            // Queue readers may inspect the prompt while the worker is running.
+            // Update its token values only after returning from the worker.
+            auto & slot = slots[0];
+            slot.prompt.tokens.keep_first(slot.prompt.tokens.size() - slot.spec_draft.size());
+            slot.prompt.tokens.insert(slot.spec_draft);
+            for (size_t i = 0; i < slot.spec_draft.size(); i++) {
+                batch.tokens[slot.spec_i_batch[i + 1]].token = slot.spec_draft[i];
+            }
+            spec_draft_async = false;
+        }
 
         if (ret != 0) {
             {
@@ -3722,21 +3772,14 @@ private:
             metrics_post_decode(off, batch_view.n_tokens, has_output);
         }
 
-        // TODO: avoid restoring the draft context and re-evaluating the drafted tokens when not needed [TAG_SPEC_AVOID_DRAFT_REEVAL]
-        //       for now, always re-evaluate for simplicity
-        //       ref: https://github.com/ggml-org/llama.cpp/pull/22728#issuecomment-4400925384
-        if (spec) {
-            bool ok = true;
+        if (spec && !process_before_sync) {
             queue_tasks.yield_to_queue([&]() {
-                ok = common_speculative_process(spec.get(), batch_view);
+                spec_ok = common_speculative_process(spec.get(), batch_view);
             });
-
-            if (!ok) {
-                SRV_ERR("%s", "failed to process speculative batch\n");
-
-                // TODO: handle error
-                throw std::runtime_error("failed to process speculative batch");
-            }
+        }
+        if (!spec_ok) {
+            SRV_ERR("%s", "failed to process speculative batch\n");
+            throw std::runtime_error("failed to process speculative batch");
         }
 
         // handle `n_cmpl > 1` tasks - when the main prompt is processed, activate all child tasks too
@@ -3892,7 +3935,14 @@ private:
 
             // verify and try to accept the draft
             {
-                common_sampler_ptr smpl_save(common_sampler_clone(slot.smpl.get()));
+                const bool may_need_ckpt =
+                    ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
+                    (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && n_draft > llama_n_rs_seq(ctx_tgt));
+
+                common_sampler_ptr smpl_save;
+                if (may_need_ckpt) {
+                    smpl_save.reset(common_sampler_clone(slot.smpl.get()));
+                }
 
                 GGML_ASSERT(slot.spec_i_batch.size() == n_draft + 1);
                 const auto & synth_probs = common_speculative_get_synth_probs(spec.get());

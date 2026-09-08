@@ -95,6 +95,42 @@ LLAMA_API llama_memory_breakdown llama_get_memory_breakdown(const struct llama_c
 // If masked == false, output the embeddings for all tokens in the batch regardless of batch.logits
 LLAMA_API void llama_set_embeddings_nextn(struct llama_context * ctx, bool value, bool masked);
 
+// Decode a single-sequence, greedy NextN chain. Only backend top-10 sampling outputs are returned.
+// Returns false when unsupported or on failure; the caller can use regular decode instead.
+LLAMA_API bool llama_decode_nextn(struct llama_context * ctx, struct llama_batch batch, int32_t n_draft);
+
+// Queue a single-sequence MTP or EAGLE3 catch-up from the target's GPU hidden states.
+// MTP uses batch.embd for its carry row; its snapshot is ready after synchronizing source.
+// EAGLE3 retains the seed KV and uses llama_synchronize_nextn_catchup for its encoded snapshot.
+// The snapshot remains valid until the next catch-up.
+LLAMA_API bool llama_decode_nextn_catchup(struct llama_context * ctx, struct llama_context * source, struct llama_batch batch, const float ** snapshot);
+
+LLAMA_API void llama_synchronize_nextn_catchup(struct llama_context * ctx);
+
+// Submit verification using GPU draft tokens, then resolve batch.token on the host.
+// False means no decode was attempted. Otherwise result contains the decode status.
+LLAMA_API bool llama_decode_nextn_verify(struct llama_context * ctx, struct llama_context * source, struct llama_batch batch, int32_t * result);
+
+// After GPU catch-up, queue the next draft using GPU acceptance and positions.
+// The next decode_nextn consumes it after the caller trims the rejected suffix.
+LLAMA_API bool llama_decode_nextn_prefetch(struct llama_context * ctx, struct llama_context * source, struct llama_batch batch);
+
+// Wait for the logical batch outputs while a speculative future batch may still run.
+LLAMA_API void llama_synchronize_outputs(struct llama_context * ctx);
+
+struct llama_sampling_result {
+    llama_token token;
+    const float * probs;
+    const float * logits;
+    const llama_token * candidates;
+    const float * raw_logits;
+    uint32_t n_probs;
+    uint32_t n_logits;
+};
+
+// Read one sampling result with a single synchronization.
+LLAMA_API llama_sampling_result llama_get_sampling_result(struct llama_context * ctx, int32_t i);
+
 // Select which appended NextN block the DECODER_MTP graph runs (offset past
 // the trunk: il = n_layer() + offset). Used by the speculative NextN driver to
 // chain multiple trained NextN heads. Default 0 (first head).

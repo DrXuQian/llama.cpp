@@ -67,6 +67,9 @@ static bool can_reuse_kq_mask(
 // impl
 
 void llm_graph_input_embd::set_input(const llama_ubatch * ubatch) {
+    if (from_graph) {
+        return;
+    }
     if (ubatch->token) {
         const int64_t n_tokens = ubatch->n_tokens;
 
@@ -92,6 +95,9 @@ bool llm_graph_input_embd::can_reuse(const llm_graph_params & params) {
 }
 
 void llm_graph_input_embd_h::set_input(const llama_ubatch * ubatch) {
+    if (from_graph) {
+        return;
+    }
     const int64_t n_tokens = ubatch->n_tokens;
 
     if (ubatch->token) {
@@ -468,6 +474,9 @@ void llm_graph_input_attn_no_cache::set_input(const llama_ubatch * ubatch) {
 }
 
 void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
+    if (from_graph) {
+        return;
+    }
     mctx->set_input_k_idxs(self_k_idxs, ubatch);
     mctx->set_input_v_idxs(self_v_idxs, ubatch);
 
@@ -1087,6 +1096,9 @@ void llm_graph_input_attn_cross::set_input(const llama_ubatch * ubatch) {
 }
 
 void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
+    if (from_graph) {
+        return;
+    }
     mctx->get_attn()->set_input_k_idxs(inp_attn->self_k_idxs, ubatch);
     mctx->get_attn()->set_input_v_idxs(inp_attn->self_v_idxs, ubatch);
 
@@ -1491,6 +1503,10 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     cross            (params.cross),
     samplers         (params.samplers),
     cb_func          (params.cb),
+    nextn_verify_tokens(params.nextn_verify_tokens),
+    nextn_positions(params.nextn_positions),
+    nextn_reject_mask(params.nextn_reject_mask),
+    nextn_target(params.nextn_target),
     res              (params.res),
     ctx0             (res->get_ctx()),
     gf               (res->get_gf()) {
@@ -2363,10 +2379,19 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd) const {
 
     auto inp = std::make_unique<llm_graph_input_embd>(n_embd_inp);
 
-    inp->tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, ubatch.n_tokens);
-    cb(inp->tokens, "inp_tokens", -1);
-    ggml_set_input(inp->tokens);
+    inp->from_graph = nextn_target != nullptr;
+    inp->tokens = nextn_target ? nextn_target->tokens : ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, ubatch.n_tokens);
+    if (!nextn_target) {
+        cb(inp->tokens, "inp_tokens", -1);
+        ggml_set_input(inp->tokens);
+    }
     res->t_inp_tokens = inp->tokens;
+
+    auto * token_ids = inp->tokens;
+    if (nextn_verify_tokens) {
+        token_ids = ggml_concat(ctx0, ggml_view_1d(ctx0, inp->tokens, 1, 0), nextn_verify_tokens, 0);
+        res->t_inp_tokens = token_ids;
+    }
 
     inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd_inp, ubatch.n_tokens);
     cb(inp->embd, "inp_embd", -1);
@@ -2380,7 +2405,7 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd) const {
     {
         auto & cur = inps[0];
 
-        cur = ggml_get_rows(ctx0, tok_embd, inp->tokens);
+        cur = ggml_get_rows(ctx0, tok_embd, token_ids);
 
         // apply lora for embedding tokens if needed
         for (const auto & lora : *loras) {
@@ -2394,7 +2419,7 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd) const {
 
             ggml_tensor * inpL_delta = ggml_scale(ctx0, ggml_mul_mat(
                         ctx0, lw->b, // non-transposed lora_b
-                        ggml_get_rows(ctx0, lw->a, inp->tokens)
+                        ggml_get_rows(ctx0, lw->a, token_ids)
                         ), scale);
 
             cur = ggml_add(ctx0, cur, inpL_delta);
@@ -2445,6 +2470,12 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd) const {
 }
 
 ggml_tensor * llm_graph_context::build_inp_pos() const {
+    if (nextn_target) {
+        return nextn_target->positions;
+    }
+    if (nextn_positions) {
+        return nextn_positions;
+    }
     auto inp = std::make_unique<llm_graph_input_pos>(hparams.n_pos_per_embd());
 
     auto & cur = inp->pos;
@@ -2832,6 +2863,13 @@ llm_graph_input_attn_kv * llm_graph_context::build_attn_inp_kv() const {
     const auto * mctx_cur = static_cast<const llama_kv_cache_context *>(mctx);
 
     auto inp = build_attn_inp_kv_impl(ctx0, ubatch, hparams, cparams, mctx_cur);
+
+    if (nextn_reject_mask) {
+        auto * mask = inp->self_kq_mask_cnv;
+        auto * f32 = mask->type == GGML_TYPE_F32 ? mask : ggml_cast(ctx0, mask, GGML_TYPE_F32);
+        auto * sum = ggml_add(ctx0, f32, nextn_reject_mask);
+        inp->self_kq_mask_cnv = mask->type == GGML_TYPE_F32 ? sum : ggml_cast(ctx0, sum, mask->type);
+    }
 
     return (llm_graph_input_attn_kv *) res->add_input(std::move(inp));
 }
@@ -3463,6 +3501,10 @@ llm_graph_input_dsv4 * llm_graph_context::build_inp_dsv4() const {
     return (llm_graph_input_dsv4 *) res->add_input(std::move(inp));
 }
 
+ggml_tensor * llm_graph_context::build_rs_output(ggml_tensor * state) const {
+    return nextn_target ? nextn_target->state_outputs.at(state) : state;
+}
+
 ggml_tensor * llm_graph_context::build_rs(
         ggml_tensor * s,
         ggml_tensor * state_copy_main,
@@ -3589,7 +3631,19 @@ llm_graph_input_mem_hybrid * llm_graph_context::build_inp_mem_hybrid() const {
     auto inp_rs   = build_rs_inp_impl     (ctx0, ubatch, mctx_cur->get_recr());
     auto inp_attn = build_attn_inp_kv_impl(ctx0, ubatch, hparams, cparams, mctx_cur->get_attn());
 
+    if (nextn_target) {
+        GGML_ASSERT(ubatch.n_seqs == 1 && mctx_cur->get_recr()->get_n_rs() == 1);
+        inp_rs->s_copy = nextn_target->rs_copy;
+        inp_rs->s_copy_main = nextn_target->rs_copy;
+        inp_rs->s_copy_extra = ggml_view_1d(ctx0, nextn_target->rs_copy, 0, 0);
+        inp_attn->self_k_idxs = nextn_target->kv_idxs;
+        inp_attn->self_v_idxs = nextn_target->kv_idxs;
+        inp_attn->self_kq_mask = nextn_target->mask;
+        inp_attn->self_kq_mask_cnv = nextn_target->mask;
+    }
+
     auto inp = std::make_unique<llm_graph_input_mem_hybrid>(cparams, std::move(inp_attn), std::move(inp_rs), mctx_cur);
+    inp->from_graph = nextn_target != nullptr;
 
     return (llm_graph_input_mem_hybrid *) res->add_input(std::move(inp));
 }

@@ -461,6 +461,7 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
     const int64_t n_seqs = ubatch.n_seqs;
 
     ggml_tensor * conv_states = build_rs(inp, conv_states_all, hparams.n_embd_r(), n_seqs);
+    conv_states_all = build_rs_output(conv_states_all);
     cb(conv_states, "conv_states", il);
 
     conv_states = ggml_reshape_3d(ctx0, conv_states, conv_kernel_size - 1, conv_channels, n_seqs);
@@ -535,6 +536,7 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
         ggml_tensor *        s,
         int                  il) {
     const auto * mctx_cur   = inp->mctx;
+    ssm_states_all = build_rs_output(ssm_states_all);
     const auto   kv_head    = mctx_cur->get_head();
     const uint32_t mem_size = mctx_cur->get_size();
 

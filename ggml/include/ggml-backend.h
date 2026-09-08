@@ -213,6 +213,9 @@ extern "C" {
     typedef ggml_backend_buffer_type_t   (*ggml_backend_split_buffer_type_t)(int main_device, const float * tensor_split);
     // Set the number of threads for the backend
     typedef void                         (*ggml_backend_set_n_threads_t)(ggml_backend_t backend, int n_threads);
+
+    // Optional batch read. Sources and destinations must remain valid until the backend is synchronized.
+    typedef bool                         (*ggml_backend_get_tensors_async_t)(ggml_backend_t backend, const struct ggml_tensor ** tensors, void ** dst, size_t count);
     // Get additional buffer types provided by the device (returns a NULL-terminated array)
     typedef ggml_backend_buffer_type_t * (*ggml_backend_dev_get_extra_bufts_t)(ggml_backend_dev_t device);
     // Set the abort callback for the backend
