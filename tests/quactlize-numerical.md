@@ -75,3 +75,56 @@ logs. The potentially large `.asysrep`, SQLite exports and saved probability
 payloads stay on the box. The reports can be opened in Asight for inspection.
 
 Host parser checks: `python3 tests/test-quactlize-numerical.py`.
+
+## Extended numerical and unprofiled timing pass
+
+After the short gate, run the same entry with `--extended`. Required inputs
+are unchanged. This is a fixed follow-up suite, not a new config sweep or
+kernel build. With both default batches it runs 16 fresh processes:
+
+| Per batch | Coverage | Profiler | Purpose |
+| --- | --- | --- | --- |
+| cache-proof | 2 chunks x 256 | Kernel activity | Reconfirm the delivered GEMMs execute |
+| reference-save | 8 chunks x 1024 | None | Save ordinary GPU probabilities |
+| reference-self | Same saved input | None | Quantify replay/serialization noise |
+| cache-reference | Same saved input | None | Compare cached K-pack against ordinary GPU |
+| reference, cache, cache, reference | 8 chunks x 1024 each | None | Separate model-timer samples (ABBA) |
+
+Numerical coverage is 8,192 input tokens and 4,088 scored positions per mode,
+about 16 times the short gate. GSM8K uses the first 256 records to supply the
+text; this still is not generated-answer accuracy or necessarily all 256
+questions. Too few input tokens, mismatched headers or incomplete saved
+payloads reject instead of silently shrinking the sample. Batch 1 and 128
+must save identical input token receipts. The already checked GPU-pack and
+cache-persistence comparison is not repeated; every K-pack run uses the
+existing cache, requiring zero misses. No new cache is written.
+
+Only the short proof is traced. The extended numerical logs still require
+post-start route coverage, but correctly report `kernel_execution=NOT_COLLECTED`
+and null kernel counts; a host route record is not a new device trace. Short
+proofs and full numerical runs have separate results and share the same
+build/library receipts. The default short suite retains its trace requirements.
+
+Performance uses separate perplexity processes with normal model warmup,
+INFO-level logging, no profiler, no probability save and no KL comparison.
+Reported throughput uses `llama_perf_context_print` model-evaluation timers,
+not process wall time. Loading, CPU likelihood calculation and probability
+file I/O must not be presented as GEMM time. This is model throughput with
+the remaining backend work included, not isolated GEMM latency. Batch 128
+uses the 8,192-token prompt timer; batch 1 uses the 4,088 scored single-token
+runs (the tool classifies the preceding context work as prompt evaluation).
+The exact timer counts and warmup are checked. These low-verbosity processes
+check buffer placement/cache receipts; their execution evidence is the
+separate short proof, not their own route trace.
+
+`performance-summary.json` retains both samples per arm, median/min/max,
+spread and relative throughput change. Two ABBA samples per arm are an
+initial comparison, not a confidence bound or a guaranteed 5% precision.
+Numerical and performance admissions both remain review-based.
+
+Allow at least 8 GiB free in `RESULT_ROOT`. For the 248,320-token vocabulary,
+the two reference probability files occupy about 3.8 GiB total; short traces
+need additional space. Large payloads remain on the box; upload only the
+printed `.results.tgz`, including `summary.tsv`, `performance-summary.json`
+and the original logs. GPU results are still required; host fixture tests
+exercise shell phase order/arguments/parsers, not numerical correctness.
