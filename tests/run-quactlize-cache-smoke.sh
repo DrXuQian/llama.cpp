@@ -115,7 +115,7 @@ stage=readiness
 printf '\nKPACK_READY_PREFLIGHT\n'
 timeout 60s "$BUILD_DIR/bin/test-quactlize-ready" 2>&1 | tee "$RUN/results/readiness.log"
 
-ARGS=(-m "$MODEL" -ngl 99 --split-mode none --fit off
+ARGS=(-m "$MODEL" --mmap -ngl 99 --split-mode none --fit off
     -c 2048 -b 512 -ub 128 -t 16 -tb 32 --temp 0 --seed 0 -n 64
     --no-conversation --no-display-prompt --color off
     -p 'Explain why the sky is blue in two sentences.'
@@ -137,7 +137,9 @@ grep -q 'GPU pack queued' "$RUN/results/cold.log"
 grep -q 'background write started:' "$RUN/results/cold.log"
 grep -q 'slots_per_device=2 content_checks=disabled' "$RUN/results/cold.log"
 grep -q 'published: total_seconds=' "$RUN/results/cold.log"
+grep -q 'source_mmap=prefetch' "$RUN/results/cold.log"
 grep -q 'ready: tensors=.* content_checks=disabled' "$RUN/results/hit.log"
+grep -q 'source_mmap=on-demand' "$RUN/results/hit.log"
 grep -qE 'cache_uploads=[1-9][0-9]* resident_misses=0' "$RUN/results/hit.log"
 if grep -q 'GPU pack queued' "$RUN/results/hit.log"; then
     printf 'FAIL: cache-hit run repacked weights\n' >&2
@@ -147,7 +149,7 @@ cp "$RUN/cache/manifest.json" "$RUN/results/cache-manifest.json"
 for phase in baseline cold hit; do
     {
         printf '\nKPACK_TIMING phase=%s\n' "$phase"
-        grep -E 'Elapsed \(wall clock\)|User time|System time' "$RUN/results/$phase.time"
+        grep -E 'Elapsed \(wall clock\)|User time|System time|Maximum resident set size|File system inputs' "$RUN/results/$phase.time"
         grep -aE '(common_perf_print|llama_perf_context_print):|\[kpack-cache\]' "$RUN/results/$phase.log"
     } >> "$RUN/results/timing-summary.log"
 done
