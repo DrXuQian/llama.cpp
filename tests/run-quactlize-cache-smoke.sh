@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Model/cache smoke only; this does not replace the PPU numeric or performance gates.
+# Readiness/model/cache smoke; this does not replace the PPU numeric or performance gates.
 if [[ ${BASH_SOURCE[0]} != "$0" ]]; then
     printf 'Run this script with bash; do not source it.\n' >&2
     return 1
@@ -96,13 +96,17 @@ cmake -S . -B "$BUILD_DIR" \
     -DGGML_CUDA=ON -DGGML_USE_PPU=ON -DGGML_NCP_QUACTLIZE=ON \
     -DGGML_NCP_FA=OFF -DGGML_NCP_MOE=OFF -DGGML_NCP_GDN=OFF \
     -DGGML_CUDA_NCCL=OFF -DGGML_NATIVE=OFF \
-    -DLLAMA_BUILD_TOOLS=ON -DLLAMA_BUILD_TESTS=OFF \
+    -DLLAMA_BUILD_TOOLS=ON -DLLAMA_BUILD_TESTS=ON \
     -DLLAMA_BUILD_APP=OFF -DLLAMA_BUILD_SERVER=OFF \
     -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_OPENSSL=OFF \
     2>&1 | tee "$RUN/results/configure.log"
 stage=build
-cmake --build "$BUILD_DIR" --target llama-completion -j "$JOBS" \
+cmake --build "$BUILD_DIR" --target test-quactlize-ready llama-completion -j "$JOBS" \
     2>&1 | tee "$RUN/results/build.log"
+
+stage=readiness
+printf '\nKPACK_READY_PREFLIGHT\n'
+timeout 60s "$BUILD_DIR/bin/test-quactlize-ready" 2>&1 | tee "$RUN/results/readiness.log"
 
 ARGS=(-m "$MODEL" -ngl 99 --split-mode none --fit off
     -c 2048 -b 512 -ub 128 -t 16 -tb 32 --temp 0 --seed 0 -n 64
