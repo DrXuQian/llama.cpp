@@ -38,6 +38,9 @@ const ggml_quactlize_execution_api * ggml_quactlize_execution_library() {
         QZ_BIND(gemv_query, device, "quactlize_kpack_gemv_query_v1");
         QZ_BIND(gemv_run, device, "quactlize_kpack_gemv_run_v1");
         QZ_BIND(sf_prepare, device, "quactlize_kpack_sf_prepare_v1");
+        if (getenv("QUACTLIZE_KPACK_JIT_HELPER")) {
+            QZ_BIND(enable_jit, host, "quactlize_kpack_dispatch_enable_jit_v1");
+        }
 #undef QZ_BIND
         GGML_LOG_INFO("[quactlize] native execution package: %s\n", root);
         return result;
@@ -85,7 +88,7 @@ int ggml_quactlize_prefill_route(const qks_request_v1 & request) {
         if (!path || !*path) return result;
         std::ifstream input(path);
         std::string line;
-        if (!std::getline(input,line) || line != "KPACK_PREFILL_POLICY_V1")
+        if (!std::getline(input,line) || line != "KPACK_PREFILL_POLICY_V2_PER_CALL")
             GGML_ABORT("[quactlize] invalid prefill policy: %s",path);
         while (std::getline(input,line)) {
             std::istringstream row(line);
