@@ -187,8 +187,8 @@ static void run_case(bool grouped, int tokens, int channels) {
     CUDA_CHECK(cudaFree(a->data)); CUDA_CHECK(cudaFree(out->data));
     if (ids) CUDA_CHECK(cudaFree(ids->data));
     ggml_free(tensors);
-    printf("KPACK_ADAPTER_DEVICE PASS op=%s route=%s tokens=%d channels=%d eager=2 replay=2 changing_ids=1 host_rows=0\n",
-           grouped ? "grouped" : "dense",gemv ? "gemv" : sf ? "sf" : "fq",tokens,channels);
+    printf("KPACK_ADAPTER_DEVICE PASS op=%s route=%s tokens=%d channels=%d eager=2 replay=2 changing_ids=1 host_rows=0 sf_per_call_poison=%d\n",
+           grouped ? "grouped" : "dense",gemv ? "gemv" : sf ? "sf" : "fq",tokens,channels,int(sf));
 }
 int main() {
     int devices=0;
