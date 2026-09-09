@@ -18,7 +18,9 @@ from urllib.error import URLError
 from quactlize_gsm8k import request, save, digest, server_args, completion_payload
 from quactlize_numerical import require, activity
 
-PATTERN = r"(ffn_.*_exps|output\.weight)"
+# The loader uses regex_search, and an explicit override bypasses automatic
+# buffer admission. Match whole weight names, not attn_output.weight suffixes.
+PATTERN = r"^(blk\.[0-9]+\.ffn_[a-z0-9_]+_exps\.weight|output\.weight)$"
 
 
 def timings(response, payload):
@@ -148,6 +150,8 @@ def run_arm(args, index, arm, tokens):
     base = f"http://127.0.0.1:{port}"
     records = []
     begin = time.monotonic()
+    phase = "startup-health"
+    print(f"KPACK_MODEL_START arm={label} log={log_path}", flush=True)
     with log_path.open("x") as log:
         proc = subprocess.Popen(
             command,
@@ -176,6 +180,7 @@ def run_arm(args, index, arm, tokens):
                     )
                     update = time.monotonic()
                 time.sleep(1)
+            phase = "server-properties"
             props = request(base + "/props", key)
             require(
                 props.get("model_alias") == alias and props.get("total_slots") == 1,
@@ -192,6 +197,7 @@ def run_arm(args, index, arm, tokens):
                 for f in ("model_path", "build_info"):
                     require(prior.get(f) == props.get(f), "A/B model/build differs")
             if tokens is None:
+                phase = "tokenize"
                 text = (
                     "A short explanation of how matrix multiplication works with quantized weights. "
                     * 256
@@ -216,6 +222,7 @@ def run_arm(args, index, arm, tokens):
             with (args.output / (label + ".jsonl")).open("x") as rows:
                 for n in args.prompts:
                     for repeat in range(args.repeats + 1):
+                        phase = f"completion-prompt-{n}-repeat-{repeat}"
                         payload = completion_payload(
                             tokens[str(n)], 20260909, args.generate
                         )
@@ -242,6 +249,21 @@ def run_arm(args, index, arm, tokens):
                             f"decode_us_per_token={rec['timings']['decode_us_per_token']:.3f}",
                             flush=True,
                         )
+        except (ValueError, OSError) as error:
+            status = proc.poll()
+            save(
+                args.output / (label + ".failure.json"),
+                dict(
+                    arm=label,
+                    phase=phase,
+                    error=str(error),
+                    log=str(log_path),
+                    returncode_before_cleanup=status,
+                ),
+            )
+            raise ValueError(
+                f"{label} phase={phase}: {error}; server_rc={status}; log={log_path}"
+            ) from error
         finally:
             if proc.poll() is None:
                 proc.terminate()
@@ -497,6 +519,7 @@ def main():
             graphs=True,
             native_route="auto",
             dense_scope="Q6 output.weight; Q8_0 remains ordinary GPU",
+            tensor_override_pattern=PATTERN,
             first_use_excluded_from_steady=True,
         ),
     )
