@@ -20,6 +20,7 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include <sys/wait.h>
 #include <unistd.h>
 
 enum qz_kind {
@@ -113,6 +114,12 @@ static const qz_case g_cases[] = {
 };
 
 static const size_t g_ncases = sizeof(g_cases) / sizeof(g_cases[0]);
+
+static void print_case_failure(int status) {
+    const int code = status != -1 && WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+    const int signal = status != -1 && WIFSIGNALED(status) ? WTERMSIG(status) : 0;
+    printf("    -> case FAILED (wait_status=%d exit_code=%d signal=%d)\n", status, code, signal);
+}
 
 static int run_device_pack(const qz_case & c) {
     const bool available = ggml_quactlize_device_pack_available(c.qtype);
@@ -423,7 +430,7 @@ int main(int argc, char ** argv) {
             const int rc = system(cmd.c_str());
             if (rc != 0) {
                 failures++;
-                printf("    -> case FAILED (rc=%d)\n", rc);
+                print_case_failure(rc);
             }
         }
         printf("test-quactlize-loader --real: %d cases against %s, %d failed\n", ran, bundle, failures);
@@ -450,9 +457,11 @@ int main(int argc, char ** argv) {
 
         // The loader path is set per case rather than inherited, so "nothing is installed" is a case like any
         // other instead of a separate script nobody runs.
-        std::string cmd = "env LD_LIBRARY_PATH=";
+        // Production overrides take precedence over LD_LIBRARY_PATH. Clear
+        // them only for stub cases; --real and --bench keep their environment.
+        std::string cmd = "env -u QUACTLIZE_PPU_BUNDLE -u QUACTLIZE_PPU_PACK_LIBRARY -u PPU_SDK LD_LIBRARY_PATH='";
         cmd += g_cases[i].hide_bundle ? "" : stub_dir;
-        cmd += " ";
+        cmd += "' ";
         cmd += g_cases[i].env;
         cmd += " '";
         cmd += self;
@@ -462,7 +471,7 @@ int main(int argc, char ** argv) {
         const int rc = system(cmd.c_str());
         if (rc != 0) {
             failures++;
-            printf("    -> case FAILED (rc=%d)\n", rc);
+            print_case_failure(rc);
         }
     }
 

@@ -305,6 +305,14 @@ if (GGML_NCP_QUACTLIZE)
     set_tests_properties(test-quactlize-loader PROPERTIES
         LABELS "main"
         ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_CURRENT_BINARY_DIR}/quactlize-stub:$ENV{LD_LIBRARY_PATH};QZ_STUB_DIR=${CMAKE_CURRENT_BINARY_DIR}/quactlize-stub")
+    add_test(NAME test-quactlize-loader-env COMMAND ${CMAKE_COMMAND} -E env
+        "QUACTLIZE_PPU_BUNDLE=/must-not-load/quactlize-bundle"
+        "QUACTLIZE_PPU_PACK_LIBRARY=/must-not-load/quactlize-pack.so"
+        "PPU_SDK=/must-not-load/ppu-sdk"
+        $<TARGET_FILE:test-quactlize-loader>)
+    set_tests_properties(test-quactlize-loader-env PROPERTIES
+        LABELS "main" TIMEOUT 30
+        ENVIRONMENT "QZ_STUB_DIR=${CMAKE_CURRENT_BINARY_DIR}/quactlize-stub")
     if (GGML_CUDA)
         enable_language(CUDA)
         find_package(CUDAToolkit REQUIRED)
@@ -318,7 +326,7 @@ if (GGML_NCP_QUACTLIZE)
         add_dependencies(test-quactlize-buffer ${QUACTLIZE_STUB_TARGETS})
         add_test(NAME test-quactlize-buffer COMMAND $<TARGET_FILE:test-quactlize-buffer>)
         set_tests_properties(test-quactlize-buffer PROPERTIES
-            ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_CURRENT_BINARY_DIR}/quactlize-stub:$<TARGET_FILE_DIR:CUDA::cudart>:$ENV{LD_LIBRARY_PATH}")
+            ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_CURRENT_BINARY_DIR}/quactlize-stub:$<TARGET_FILE_DIR:CUDA::cudart>:$ENV{LD_LIBRARY_PATH};QUACTLIZE_PPU_BUNDLE=${CMAKE_CURRENT_BINARY_DIR}/quactlize-stub;QUACTLIZE_PPU_PACK_LIBRARY=$<TARGET_FILE:quactlize-stub-pack>;PPU_SDK=")
         add_executable(test-quactlize-ready test-quactlize-ready.cu)
         set_target_properties(test-quactlize-ready PROPERTIES CUDA_RUNTIME_LIBRARY None)
         target_compile_definitions(test-quactlize-ready PRIVATE GGML_NCP_QUACTLIZE)
@@ -392,7 +400,7 @@ if (GGML_NCP_QUACTLIZE)
     add_test(NAME test-kpack-sidecar COMMAND $<TARGET_FILE:test-kpack-sidecar>)
     set_tests_properties(test-kpack-sidecar PROPERTIES
         TIMEOUT 30
-        ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_CURRENT_BINARY_DIR}/quactlize-stub:$ENV{LD_LIBRARY_PATH};QZ_STUB_DIR=${CMAKE_CURRENT_BINARY_DIR}/quactlize-stub")
+        ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_CURRENT_BINARY_DIR}/quactlize-stub:$ENV{LD_LIBRARY_PATH};QZ_STUB_DIR=${CMAKE_CURRENT_BINARY_DIR}/quactlize-stub;QUACTLIZE_PPU_BUNDLE=${CMAKE_CURRENT_BINARY_DIR}/quactlize-stub;QUACTLIZE_PPU_PACK_LIBRARY=$<TARGET_FILE:quactlize-stub-pack>;PPU_SDK=")
 endif()
 
 llama_build_and_test(test-model-load-cancel.cpp LABEL "model")
