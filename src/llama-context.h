@@ -40,58 +40,7 @@ struct llama_memory_buffer {
 
 using llama_memory_buffers = std::map<ggml_backend_buffer_type_t, llama_memory_buffer>;
 
-struct llama_output_copies;
-struct llama_nextn_target;
-
-struct llama_nextn_graph {
-    llama_token seed_token = LLAMA_TOKEN_NULL;
-    llama_pos seed_pos = -1;
-    llama_seq_id seed_seq = -1;
-    ggml_backend_sched_ptr sched;
-    llm_graph_result_ptr res;
-    ggml_backend_event_ptr done;
-    std::vector<llm_graph_params> params;
-    std::vector<size_t> input_ends;
-    std::vector<ggml_tensor *> tokens;
-    std::vector<ggml_tensor *> hidden;
-    std::vector<ggml_tensor *> candidates;
-    std::vector<ggml_tensor *> logits;
-    bool prefetch = false;
-    bool prefetched = false;
-    float p_min = 0.0f;
-    int n_verify = 0;
-    ggml_context_ptr early_ctx;
-    ggml_backend_buffer_ptr early_device;
-    ggml_backend_buffer_ptr early_host;
-    ggml_tensor * early_counts = nullptr;
-    uint64_t generation = 0;
-    ggml_tensor * accepted = nullptr;
-    ggml_tensor * selected_token = nullptr;
-    ggml_tensor * selected_hidden = nullptr;
-    ggml_tensor * inp_draft = nullptr;
-    ggml_tensor * inp_weights = nullptr;
-    ggml_tensor * inp_positions = nullptr;
-    ggml_tensor * inp_position_mask = nullptr;
-    ggml_tensor * inp_kv_positions = nullptr;
-    ggml_tensor * reject_mask = nullptr;
-    std::vector<ggml_tensor *> positions;
-};
-
-struct llama_nextn_handoff {
-    ggml_context_ptr ctx;
-    ggml_backend_buffer_ptr device;
-    ggml_backend_buffer_ptr host;
-    ggml_backend_event_ptr consumed;
-    std::vector<ggml_tensor *> rows;
-};
-
-struct llama_nextn_lookahead {
-    llama_nextn_handoff sampled;
-    ggml_backend_event_ptr ready;
-    std::vector<llama_token> draft;
-    llama_pos pos = -1;
-    llama_seq_id seq = -1;
-};
+struct llama_spec_pipeline;
 
 struct llama_context {
     // init scheduler and compute buffers, reserve worst-case graphs
@@ -318,6 +267,10 @@ public:
     bool prefetch_nextn_target(llama_context & source);
 
 private:
+    friend struct llama_spec_pipeline;
+
+    static llm_graph_type ctx_type_to_graph_type(llama_context_type ctx_type);
+
     llm_graph_params graph_params(
                         llm_graph_result * res,
                       const llama_ubatch & ubatch,
@@ -410,33 +363,8 @@ private:
     std::array<ggml_backend_sched_ptr, 3*graph_cache_stride> sched_cache;
     std::array<int, 3*graph_cache_stride> graph_rs_banks = {};
     uint32_t graph_cache_active = 0;
-    uint32_t nextn_graph_cache_max = 0;
 
     void select_graph(uint32_t index);
-
-    std::unique_ptr<llama_nextn_graph> nextn_graph;
-    std::array<std::unique_ptr<llama_nextn_graph>, 10> nextn_graph_cache;
-    uint32_t nextn_graph_active = 0;
-    std::unique_ptr<llama_nextn_handoff> nextn_handoff;
-    std::unique_ptr<llama_nextn_handoff> nextn_features;
-    std::array<ggml_tensor *, 3> nextn_catchup_features = {};
-    ggml_tensor * nextn_catchup_input = nullptr;
-    std::unique_ptr<llama_nextn_handoff> nextn_verify;
-    ggml_tensor * nextn_verify_input = nullptr;
-    bool nextn_outputs = false;
-    llama_ubatch nextn_last_ubatch = {};
-    std::unique_ptr<llama_output_copies> nextn_readback;
-    std::unique_ptr<llama_nextn_lookahead> nextn_lookahead;
-    std::array<std::unique_ptr<llama_nextn_target>, 20> nextn_targets;
-    llama_memory_context_ptr nextn_mctx;
-    ggml_backend_event_ptr nextn_output_ready;
-    bool nextn_output_pending = false;
-    int nextn_target_active = -1;
-    int nextn_target_bank = 0;
-    int nextn_target_pending = -1;
-    bool nextn_target_consume = false;
-    bool nextn_prefetch_enabled = true;
-    bool nextn_prefetch_reported = false;
 
     void set_sched_need_reserve(bool sampler_only = false);
     bool sched_need_reserve = true;
@@ -444,6 +372,7 @@ private:
 
     ggml_backend_t backend_cpu = nullptr;
     std::vector<ggml_backend_ptr> backends;
+    std::unique_ptr<llama_spec_pipeline> spec;
 
     // training
     ggml_opt_context_t opt_ctx = nullptr;

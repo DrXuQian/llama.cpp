@@ -32,6 +32,8 @@ Fixed KV sizing and prefetch have memory and compute costs; reducing CPU-wait ga
 
 Single-query attention in a bounded graph uses the vector kernel, including at a logical KV length of 8192 where the ordinary CUDA heuristic can select the MMA kernel. Both paths implement the same attention operation, but their floating-point results are not bit-identical at that boundary. Use `--no-spec-gpu-pipeline` when comparing against the ordinary kernel selection.
 
+For code ownership, lifecycle hooks and algorithm extension boundaries, see [Speculative GPU execution](development/speculative-pipeline.md).
+
 ## Implementations
 
 The `llama-server` application supports several implementations of speculative decoding. An implementation with draft model can be mixed with an implementation without draft model.
