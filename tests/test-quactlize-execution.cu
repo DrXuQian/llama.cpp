@@ -19,6 +19,7 @@
 static ggml_tensor * test_weight;
 static ggml_quactlize_artifact test_art;
 static int prepares, queries, scale_prepares;
+static int gemv_lookups, prefill_lookups, expected_route;
 
 static void require(bool value) {
     if (!value) GGML_ABORT("KPACK_ADAPTER_DEVICE invariant failed");
@@ -38,16 +39,21 @@ bool test_prepare_scales(const ggml_tensor *) {
     return true;
 }
 bool test_gemv_config(const qkg_call_v1 &, qkg_config_v1 * out) {
+    ++gemv_lookups;
     *out = {1,sizeof(*out),32,4,1};
     return true;
 }
-int test_prefill_route(const qks_request_v1 &) { return 1; }
+int test_prefill_route(const qks_request_v1 &) {
+    ++prefill_lookups;
+    return 1;
+}
 static int fake_open(const char *, void ** p) { *p = (void *) 1; return 0; }
 static void fake_close(void *) {}
 static const char * fake_error() { return "device tag stub"; }
 static int fake_query(void *, const qks_request_v1 * r, qks_choice_v1 * c) {
     ++queries;
     require(r->m > 0 && r->max_rows > 0);
+    require(r->route == expected_route);
     *c = {}; c->version=1; c->size=sizeof(*c); c->ticket=1;
     c->compute_units=72; c->split=1;
     snprintf(c->parent,sizeof(c->parent),"device_tag_stub");
@@ -55,6 +61,7 @@ static int fake_query(void *, const qks_request_v1 * r, qks_choice_v1 * c) {
 }
 static int fake_prepare(void *, const qks_choice_v1 *, const qk_call_v1 * c, void ** out) {
     require(!c->rows_host && !c->rows_device && c->a && c->output);
+    require(bool(c->zero) == (expected_route == QK_DENSE_SF || expected_route == QK_GROUPED_SF));
     ++prepares;
     *out = new qk_call_v1(*c);
     return 0;
@@ -105,7 +112,9 @@ static void run_case(bool grouped, int tokens, int channels) {
     constexpr int k=512, n=256, experts=4;
     const int topk=grouped ? 2 : 1, rows=tokens*topk;
     const bool gemv = !strcmp(getenv("QUACTLIZE_KPACK_ROUTE"),"gemv");
-    const bool sf = !strcmp(getenv("QUACTLIZE_KPACK_ROUTE"),"sf");
+    const bool auto_prefill = !strcmp(getenv("QUACTLIZE_KPACK_ROUTE"),"auto") && tokens > 1;
+    const bool sf = !strcmp(getenv("QUACTLIZE_KPACK_ROUTE"),"sf") || auto_prefill;
+    expected_route = grouped ? (sf ? QK_GROUPED_SF : QK_GROUPED_FQ) : (sf ? QK_DENSE_SF : QK_DENSE_FQ);
     ggml_context * tensors = ggml_init({1<<20,nullptr,true});
     require(tensors);
     test_weight = ggml_new_tensor_3d(tensors,GGML_TYPE_Q4_K,k,n,grouped ? experts : 1);
@@ -126,7 +135,7 @@ static void run_case(bool grouped, int tokens, int channels) {
     CUDA_CHECK(cudaEventCreateWithFlags(&test_art.ready,cudaEventDisableTiming));
     CUDA_CHECK(cudaEventRecord(test_art.ready));
     CUDA_CHECK(cudaEventSynchronize(test_art.ready));
-    prepares=queries=scale_prepares=0;
+    prepares=queries=scale_prepares=gemv_lookups=prefill_lookups=0;
     {
         ggml_backend_cuda_context ctx(0);
         auto * graph=ggml_new_graph_custom(tensors,16,false);
@@ -134,6 +143,7 @@ static void run_case(bool grouped, int tokens, int channels) {
         test_prepare_graph(ctx,graph);
         test_prepare_graph(ctx,graph);
         require(prepares==(gemv ? 0 : 1) && queries==prepares && scale_prepares==(sf ? 1 : 0));
+        require(gemv_lookups==(gemv ? 1 : 0) && prefill_lookups==(auto_prefill ? 1 : 0));
         cudaGraph_t capture;
         cudaGraphExec_t instance;
         CUDA_CHECK(cudaStreamBeginCapture(ctx.stream(),cudaStreamCaptureModeRelaxed));
@@ -161,6 +171,7 @@ static void run_case(bool grouped, int tokens, int channels) {
             require(bad==0);
         }
         require(prepares==(gemv ? 0 : 1) && queries==prepares && scale_prepares==(sf ? 1 : 0));
+        require(gemv_lookups==(gemv ? 1 : 0) && prefill_lookups==(auto_prefill ? 1 : 0));
         CUDA_CHECK(cudaGraphExecDestroy(instance));
         CUDA_CHECK(cudaGraphDestroy(capture));
     }
@@ -168,8 +179,8 @@ static void run_case(bool grouped, int tokens, int channels) {
     CUDA_CHECK(cudaFree(a->data)); CUDA_CHECK(cudaFree(out->data));
     if (ids) CUDA_CHECK(cudaFree(ids->data));
     ggml_free(tensors);
-    printf("KPACK_ADAPTER_DEVICE PASS op=%s tokens=%d channels=%d eager=2 replay=2 changing_ids=1 host_rows=0\n",
-           grouped ? "grouped" : "dense",tokens,channels);
+    printf("KPACK_ADAPTER_DEVICE PASS op=%s route=%s tokens=%d channels=%d eager=2 replay=2 changing_ids=1 host_rows=0\n",
+           grouped ? "grouped" : "dense",gemv ? "gemv" : sf ? "sf" : "fq",tokens,channels);
 }
 int main() {
     int devices=0;

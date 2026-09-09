@@ -147,7 +147,8 @@ Plan & prepare(ggml_backend_cuda_context & ctx, const ggml_tensor * weight,
     auto p = std::make_unique<Plan>();
     p->api = owner.api; p->art = art; p->rows = tokens * topk; p->tokens = tokens; p->topk = topk;
     const RouteMode mode = route_mode();
-    p->direct = mode == RouteMode::Gemv || (mode == RouteMode::Auto && tokens == 1);
+    // Automatic decode uses selected FQ; GEMV remains an explicit diagnostic.
+    p->direct = mode == RouteMode::Gemv;
     if (p->direct) {
         auto & c = p->gemv;
         c.version = 1; c.size = sizeof(c); c.qtype = art.qtype; c.n = art.n; c.k = art.k;
