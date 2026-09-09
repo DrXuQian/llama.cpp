@@ -44,7 +44,20 @@ static void common_speculative_nextn_collect(llama_context * ctx, int n_max, flo
 }
 
 static bool common_speculative_nextn_chain(llama_context * ctx, const llama_batch & batch, int n_max, float p_min, common_sampler * sampler, llama_tokens & result, bool defer = false) {
-    if (p_min > 0.0f || !result.empty() || !llama_decode_nextn(ctx, batch, n_max)) {
+    if (!result.empty()) {
+        return false;
+    }
+    if (p_min > 0.0f) {
+        if (!llama_decode_nextn_early(ctx, batch, n_max, p_min)) {
+            return false;
+        }
+        const int count = llama_get_nextn_draft_length(ctx);
+        GGML_ASSERT(count >= 0 && count <= n_max);
+        common_speculative_nextn_collect(ctx, count, 0.0f, sampler, result);
+        llama_memory_seq_rm(llama_get_memory(ctx), batch.seq_id[0][0], batch.pos[0] + std::min(n_max, count + 1), -1);
+        return true;
+    }
+    if (!llama_decode_nextn(ctx, batch, n_max)) {
         return false;
     }
     SPC_DBG("GPU NextN chain: %d steps\n", n_max);
@@ -520,7 +533,7 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
     {
         allow_prefetch = params.draft.gpu_pipeline && params.draft.backend_sampling &&
             params.draft.n_max >= 2 && params.draft.n_max <= 8 &&
-            n_seq == 1 && !params.has_synth() && params.draft.p_min == 0.0f;
+            n_seq == 1 && !params.has_synth();
         SPC_TRC("%s", "adding speculative implementation 'draft-eagle3'\n");
         SPC_TRC("- n_max=%d, n_min=%d, p_min=%f, backend_sampling=%d\n", params.draft.n_max, params.draft.n_min, params.draft.p_min, (int) params.draft.backend_sampling);
 
@@ -591,6 +604,10 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
 
         llama_set_nextn_prefetch(ctx_tgt, allow_prefetch);
         llama_set_nextn_prefetch(ctx_dft, allow_prefetch);
+        const int n_cache = params.draft.gpu_pipeline && n_seq == 1 && !params.has_synth() &&
+            params.draft.p_min > 0.0f && params.draft.n_max >= 2 && params.draft.n_max <= 8 ? params.draft.n_max + 1 : 0;
+        llama_set_nextn_graph_cache(ctx_tgt, n_cache);
+        llama_set_nextn_graph_cache(ctx_dft, n_cache);
 
         pending_g_last.assign(n_seq, std::vector<float>(n_embd_dec, 0.0f));
         pending_pos_last.assign(n_seq, -1);
@@ -642,7 +659,7 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
 
     bool process(const llama_batch & batch_in) override {
         finish_async_verify();
-        const bool async_catchup = n_seq == 1 && batch_in.n_tokens == catchup_rows && catchup_rows > 1 &&
+        const bool async_catchup = n_seq == 1 && batch_in.n_tokens == catchup_rows && catchup_rows > 0 &&
             batch_in.pos && batch_in.pos[0] == catchup_pos && pending_pos_last[0] + 1 == catchup_pos;
         catchup_rows = 0;
         if (batch_in.n_tokens <= 0) {
@@ -687,7 +704,8 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
                 verify_pos_first[0] = batch_in.pos[0];
                 pending_pos_last[0] = batch_in.pos[n_tokens - 1];
                 SPC_DBG("GPU EAGLE3 encoder and catch-up: %d rows\n", n_tokens);
-                if (allow_prefetch && n_tokens == params.n_max + 1 && llama_decode_nextn_prefetch(ctx_dft, ctx_tgt, batch)) {
+                if (allow_prefetch && (params.p_min > 0.0f || n_tokens == params.n_max + 1) &&
+                        llama_decode_nextn_prefetch(ctx_dft, ctx_tgt, batch, params.n_max, params.p_min)) {
                     SPC_DBG("GPU acceptance and next-draft prefetch: %d rows\n", n_tokens);
                 }
                 return true;
@@ -1504,7 +1522,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     {
         allow_prefetch = params.draft.gpu_pipeline && params.draft.backend_sampling &&
             params.draft.n_max >= 2 && params.draft.n_max <= 8 &&
-            n_seq == 1 && !params.has_synth() && params.draft.p_min == 0.0f;
+            n_seq == 1 && !params.has_synth();
         auto * ctx_tgt = this->params.ctx_tgt;
         auto * ctx_dft = this->params.ctx_dft;
         GGML_ASSERT(ctx_tgt && ctx_dft && "MTP requires ctx_tgt and ctx_dft to be set");
@@ -1560,6 +1578,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         llama_set_nextn_prefetch(ctx_tgt, allow_prefetch);
         llama_set_nextn_prefetch(ctx_dft, allow_prefetch);
+        const int n_cache = params.draft.gpu_pipeline && n_seq == 1 && !params.has_synth() &&
+            params.draft.p_min > 0.0f && params.draft.n_max >= 2 && params.draft.n_max <= 8 ? params.draft.n_max + 1 : 0;
+        llama_set_nextn_graph_cache(ctx_tgt, n_cache);
+        llama_set_nextn_graph_cache(ctx_dft, n_cache);
 
         is_mem_shared = llama_get_ctx_other(ctx_dft) == ctx_tgt;
         chain_heads   = n_mtp_layers > 1 && !is_mem_shared;
@@ -1628,7 +1650,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
     bool process(const llama_batch & batch_in) override {
         finish_async_verify();
-        const bool async_catchup = n_seq == 1 && batch_in.n_tokens == catchup_rows && catchup_rows > 1 &&
+        const bool async_catchup = n_seq == 1 && batch_in.n_tokens == catchup_rows && catchup_rows > 0 &&
             batch_in.pos && batch_in.pos[0] == catchup_pos;
         catchup_rows = 0;
         if (batch_in.n_tokens <= 0) {
@@ -1674,7 +1696,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             if (llama_decode_nextn_catchup(ctx_dft, ctx_tgt, batch, &async_verify_h)) {
                 verify_h_rows[0] = n_tokens;
                 SPC_DBG("GPU MTP catch-up: %d rows\n", n_tokens);
-                if (allow_prefetch && n_tokens == params.n_max + 1 && llama_decode_nextn_prefetch(ctx_dft, ctx_tgt, batch)) {
+                if (allow_prefetch && (params.p_min > 0.0f || n_tokens == params.n_max + 1) &&
+                        llama_decode_nextn_prefetch(ctx_dft, ctx_tgt, batch, params.n_max, params.p_min)) {
                     SPC_DBG("GPU acceptance and next-draft prefetch: %d rows\n", n_tokens);
                 }
                 return true;
@@ -2643,10 +2666,10 @@ const std::vector<double> & common_speculative_get_synth_probs(const common_spec
     return spec->synth_probs;
 }
 
-bool common_speculative_gpu_pipeline(const common_params & params) {
+bool common_speculative_gpu_sampling(const common_params & params) {
     const auto & spec = params.speculative;
     return spec.draft.gpu_pipeline && params.n_parallel == 1 && !spec.has_synth() &&
-        spec.draft.backend_sampling && spec.draft.p_min == 0.0f &&
+        spec.draft.backend_sampling &&
         spec.draft.n_max >= 2 && spec.draft.n_max <= 8 &&
         params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED &&
         std::any_of(spec.types.begin(), spec.types.end(), [](auto type) {
@@ -3089,7 +3112,8 @@ bool common_speculative_draft_async(common_speculative * spec) {
     auto * defer = mtp ? &mtp->defer_draft : eagle ? &eagle->defer_draft : nullptr;
     auto * result = mtp ? &mtp->deferred_result : eagle ? &eagle->deferred_result : nullptr;
     const int n_max = mtp ? mtp->params.n_max : eagle ? eagle->params.n_max : 0;
-    if (!defer || !spec->dparams[0].drafting || spec->dparams[0].n_max < n_max) {
+    const float p_min = mtp ? mtp->params.p_min : eagle ? eagle->params.p_min : 0.0f;
+    if (!defer || p_min > 0.0f || !spec->dparams[0].drafting || spec->dparams[0].n_max < n_max) {
         common_speculative_draft(spec);
         return false;
     }

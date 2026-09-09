@@ -502,6 +502,10 @@ static void llama_sampler_empty_backend_set_input(struct llama_sampler * smpl) {
     GGML_UNUSED(smpl);
 }
 
+static void llama_sampler_empty_copy_state(const struct llama_sampler * src, struct llama_sampler * dst) {
+    ((llama_sampler_empty *) dst->ctx)->name = ((const llama_sampler_empty *) src->ctx)->name;
+}
+
 static struct llama_sampler_i llama_sampler_empty_i = {
     /* .name              = */ llama_sampler_empty_name,
     /* .accept            = */ llama_sampler_empty_accept,
@@ -514,7 +518,7 @@ static struct llama_sampler_i llama_sampler_empty_i = {
     /* .backend_apply     = */ llama_sampler_empty_backend_apply,
     /* .backend_set_input = */ llama_sampler_empty_backend_set_input,
     /* .backend_reset     = */ nullptr,
-    /* .copy_state        = */ nullptr,
+    /* .copy_state        = */ llama_sampler_empty_copy_state,
 };
 
 struct llama_sampler * llama_sampler_init_empty(const char * name) {
@@ -4379,6 +4383,68 @@ bool llama_sampler_backend_can_prefetch(const llama_sampler * sampler) {
         iface == &llama_sampler_top_p_i || iface == &llama_sampler_min_p_i ||
         iface == &llama_sampler_temp_i || iface == &llama_sampler_temp_ext_i ||
         iface == &llama_sampler_logit_bias_i;
+}
+
+bool llama_sampler_backend_same_config(const llama_sampler * a, const llama_sampler * b) {
+    if (!a || !b || a->iface != b->iface) {
+        return false;
+    }
+    const auto * iface = a->iface;
+    if (iface == &llama_sampler_chain_i) {
+        const auto * ca = (const llama_sampler_chain *) a->ctx;
+        const auto * cb = (const llama_sampler_chain *) b->ctx;
+        if (!ca->is_init || !cb->is_init || ca->samplers.size() != cb->samplers.size()) {
+            return false;
+        }
+        for (size_t i = 0; i < ca->samplers.size(); ++i) {
+            if (ca->samplers[i].is_backend != cb->samplers[i].is_backend ||
+                    !llama_sampler_backend_same_config(ca->samplers[i].ptr, cb->samplers[i].ptr)) {
+                return false;
+            }
+        }
+        return true;
+    }
+    if (iface == &llama_sampler_empty_i || iface == &llama_sampler_greedy_i) {
+        return true;
+    }
+    if (iface == &llama_sampler_dist_i) {
+        return ((const llama_sampler_dist *) a->ctx)->seed == ((const llama_sampler_dist *) b->ctx)->seed;
+    }
+    if (iface == &llama_sampler_top_k_i) {
+        return ((const llama_sampler_top_k *) a->ctx)->k == ((const llama_sampler_top_k *) b->ctx)->k;
+    }
+    if (iface == &llama_sampler_top_p_i) {
+        const auto & ca = *(const llama_sampler_top_p *) a->ctx;
+        const auto & cb = *(const llama_sampler_top_p *) b->ctx;
+        return ca.p == cb.p && ca.min_keep == cb.min_keep;
+    }
+    if (iface == &llama_sampler_min_p_i) {
+        const auto & ca = *(const llama_sampler_min_p *) a->ctx;
+        const auto & cb = *(const llama_sampler_min_p *) b->ctx;
+        return ca.p == cb.p && ca.min_keep == cb.min_keep;
+    }
+    if (iface == &llama_sampler_temp_i) {
+        return ((const llama_sampler_temp *) a->ctx)->temp == ((const llama_sampler_temp *) b->ctx)->temp;
+    }
+    if (iface == &llama_sampler_temp_ext_i) {
+        const auto & ca = *(const llama_sampler_temp_ext *) a->ctx;
+        const auto & cb = *(const llama_sampler_temp_ext *) b->ctx;
+        return ca.temp == cb.temp && ca.delta == cb.delta && ca.exponent == cb.exponent;
+    }
+    if (iface == &llama_sampler_logit_bias_i) {
+        const auto & ca = *(const llama_sampler_logit_bias *) a->ctx;
+        const auto & cb = *(const llama_sampler_logit_bias *) b->ctx;
+        if (ca.n_vocab != cb.n_vocab || ca.logit_bias.size() != cb.logit_bias.size()) {
+            return false;
+        }
+        for (size_t i = 0; i < ca.logit_bias.size(); ++i) {
+            if (ca.logit_bias[i].token != cb.logit_bias[i].token || ca.logit_bias[i].bias != cb.logit_bias[i].bias) {
+                return false;
+            }
+        }
+        return true;
+    }
+    return false;
 }
 
 // perf

@@ -2785,6 +2785,16 @@ std::unique_ptr<llama_kv_cache_context> llama_kv_cache_context::for_token(uint32
     return result;
 }
 
+std::unique_ptr<llama_kv_cache_context> llama_kv_cache_context::for_graph(const llama_ubatch & ubatch, uint32_t n_kv) const {
+    GGML_ASSERT(n_kv <= kv->get_size() && ubatch.n_seqs_unq == 1);
+    auto sinfo = sinfos[i_cur];
+    GGML_ASSERT(sinfo.idxs.size() == 1);
+    sinfo.idxs[0].resize(ubatch.n_tokens);
+    auto result = std::make_unique<llama_kv_cache_context>(kv, slot_info_vec_t{ std::move(sinfo) }, std::vector<llama_ubatch>{ ubatch });
+    result->n_kv = n_kv;
+    return result;
+}
+
 ggml_type llama_kv_cache_context::type_k() const {
     return kv->type_k();
 }

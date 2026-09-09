@@ -1,6 +1,7 @@
 #pragma once
 
 #include "llama.h"
+#include "llama-cpp.h"
 #include "llama-ext.h"
 #include "llama-cparams.h"
 #include "llama-graph.h"
@@ -48,6 +49,7 @@ struct llama_nextn_graph {
     llama_seq_id seed_seq = -1;
     ggml_backend_sched_ptr sched;
     llm_graph_result_ptr res;
+    ggml_backend_event_ptr done;
     std::vector<llm_graph_params> params;
     std::vector<size_t> input_ends;
     std::vector<ggml_tensor *> tokens;
@@ -56,6 +58,12 @@ struct llama_nextn_graph {
     std::vector<ggml_tensor *> logits;
     bool prefetch = false;
     bool prefetched = false;
+    float p_min = 0.0f;
+    int n_verify = 0;
+    ggml_context_ptr early_ctx;
+    ggml_backend_buffer_ptr early_device;
+    ggml_backend_buffer_ptr early_host;
+    ggml_tensor * early_counts = nullptr;
     uint64_t generation = 0;
     ggml_tensor * accepted = nullptr;
     ggml_tensor * selected_token = nullptr;
@@ -160,7 +168,8 @@ struct llama_context {
 
     void set_embeddings (bool value);
     void set_embeddings_nextn(bool value, bool masked);
-    void set_nextn_prefetch(bool enabled);
+    void set_nextn_prefetch(bool enabled, bool fixed_kv = true);
+    void set_nextn_graph_cache(int32_t n_max);
     void set_embeddings_layer_inp(uint32_t lid, bool enable);
     void set_nextn_layer_offset(int32_t offset);
     void set_causal_attn(bool value);
@@ -300,8 +309,9 @@ public:
 
     bool set_sampler(llama_seq_id seq_id, llama_sampler * sampler);
 
-    bool decode_nextn(const llama_batch & batch, int32_t n_draft, bool prefetch = false);
-    bool decode_nextn_prefetch(llama_context & source, const llama_batch & batch);
+    bool decode_nextn(const llama_batch & batch, int32_t n_draft, bool prefetch = false, float p_min = 0.0f);
+    int32_t nextn_draft_length();
+    bool decode_nextn_prefetch(llama_context & source, const llama_batch & batch, int n_draft = 0, float p_min = 0.0f);
     bool decode_nextn_catchup(llama_context & source, const llama_batch & batch, const float ** snapshot);
     void synchronize_nextn_catchup();
     bool decode_nextn_verify(llama_context & source, const llama_batch & batch, int32_t * result);
@@ -396,10 +406,17 @@ private:
     std::vector<swap_info> output_swaps;
 
     ggml_backend_sched_ptr sched;
-    ggml_backend_sched_ptr sched_other;
-    bool using_draft_graph = false;
+    static constexpr uint32_t graph_cache_stride = 10;
+    std::array<ggml_backend_sched_ptr, 3*graph_cache_stride> sched_cache;
+    std::array<int, 3*graph_cache_stride> graph_rs_banks = {};
+    uint32_t graph_cache_active = 0;
+    uint32_t nextn_graph_cache_max = 0;
+
+    void select_graph(uint32_t index);
 
     std::unique_ptr<llama_nextn_graph> nextn_graph;
+    std::array<std::unique_ptr<llama_nextn_graph>, 10> nextn_graph_cache;
+    uint32_t nextn_graph_active = 0;
     std::unique_ptr<llama_nextn_handoff> nextn_handoff;
     std::unique_ptr<llama_nextn_handoff> nextn_features;
     std::array<ggml_tensor *, 3> nextn_catchup_features = {};
@@ -410,17 +427,20 @@ private:
     llama_ubatch nextn_last_ubatch = {};
     std::unique_ptr<llama_output_copies> nextn_readback;
     std::unique_ptr<llama_nextn_lookahead> nextn_lookahead;
-    std::unique_ptr<llama_nextn_target> nextn_targets[2];
+    std::array<std::unique_ptr<llama_nextn_target>, 20> nextn_targets;
     llama_memory_context_ptr nextn_mctx;
     ggml_backend_event_ptr nextn_output_ready;
     bool nextn_output_pending = false;
     int nextn_target_active = -1;
+    int nextn_target_bank = 0;
     int nextn_target_pending = -1;
     bool nextn_target_consume = false;
     bool nextn_prefetch_enabled = true;
     bool nextn_prefetch_reported = false;
 
+    void set_sched_need_reserve(bool sampler_only = false);
     bool sched_need_reserve = true;
+    bool sched_reserve_only_sampler = false;
 
     ggml_backend_t backend_cpu = nullptr;
     std::vector<ggml_backend_ptr> backends;
@@ -442,7 +462,8 @@ private:
     std::vector<size_t>                     backend_buf_exp_size; // expected buffer sizes
 
     llm_graph_result_ptr gf_res_prev;
-    llm_graph_result_ptr gf_res_other;
+    std::array<llm_graph_result_ptr, 3*graph_cache_stride> gf_res_cache;
+    std::array<std::map<llama_seq_id, llama_sampler_ptr>, 3*graph_cache_stride> samplers_cache;
     llm_graph_result_ptr gf_res_reserve;
 
     // host buffer for the model output (logits and embeddings)

@@ -2668,6 +2668,14 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         GGML_ASSERT(n_kv_max >= 0 && n_kv_max <= INT32_MAX);
         ggml_flash_attn_ext_set_n_kv_max(cur, static_cast<int32_t>(n_kv_max));
         ggml_flash_attn_ext_set_prec (cur, GGML_PREC_F32);
+        const auto * hybrid = dynamic_cast<const llama_memory_hybrid_context *>(mctx);
+        const auto * kv = hybrid ? hybrid->get_attn() : dynamic_cast<const llama_kv_cache_context *>(mctx);
+        if (kv && kv->is_fixed_size() && kq_mask && kq_mask->ne[0] == cparams.n_ctx) {
+            ggml_flash_attn_ext_set_mask_bounds(cur, true);
+            if (nextn_target) {
+                ggml_flash_attn_ext_set_kv_indices(cur, nextn_target->kv_idxs);
+            }
+        }
 
         if (v_mla) {
 #if 0

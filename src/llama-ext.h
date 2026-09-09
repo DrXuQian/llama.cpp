@@ -96,11 +96,16 @@ LLAMA_API llama_memory_breakdown llama_get_memory_breakdown(const struct llama_c
 LLAMA_API void llama_set_embeddings_nextn(struct llama_context * ctx, bool value, bool masked);
 
 // Configure NextN prefetch before decoding. Supported single-GPU contexts use fixed KV graph sizes.
-LLAMA_API void llama_set_nextn_prefetch(struct llama_context * ctx, bool enabled);
+LLAMA_API void llama_set_nextn_prefetch(struct llama_context * ctx, bool enabled, bool fixed_kv = true);
+
+// Cache small NextN graphs up to n_max rows. Zero disables caching.
+LLAMA_API void llama_set_nextn_graph_cache(struct llama_context * ctx, int32_t n_max);
 
 // Decode a single-sequence, greedy NextN chain. Only backend top-10 sampling outputs are returned.
 // Returns false when unsupported or on failure; the caller can use regular decode instead.
 LLAMA_API bool llama_decode_nextn(struct llama_context * ctx, struct llama_batch batch, int32_t n_draft);
+LLAMA_API bool llama_decode_nextn_early(struct llama_context * ctx, struct llama_batch batch, int32_t n_draft, float p_min);
+LLAMA_API int32_t llama_get_nextn_draft_length(struct llama_context * ctx);
 
 // Queue a single-sequence MTP or EAGLE3 catch-up from the target's GPU hidden states.
 // MTP uses batch.embd for its carry row; its snapshot is ready after synchronizing source.
@@ -116,7 +121,7 @@ LLAMA_API bool llama_decode_nextn_verify(struct llama_context * ctx, struct llam
 
 // After GPU catch-up, queue the next draft using GPU acceptance and positions.
 // The next decode_nextn consumes it after the caller trims the rejected suffix.
-LLAMA_API bool llama_decode_nextn_prefetch(struct llama_context * ctx, struct llama_context * source, struct llama_batch batch);
+LLAMA_API bool llama_decode_nextn_prefetch(struct llama_context * ctx, struct llama_context * source, struct llama_batch batch, int32_t n_draft = 0, float p_min = 0.0f);
 
 // Wait for the logical batch outputs while a speculative future batch may still run.
 LLAMA_API void llama_synchronize_outputs(struct llama_context * ctx);

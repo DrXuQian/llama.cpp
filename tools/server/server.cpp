@@ -11,6 +11,7 @@
 #include "fit.h"
 #include "llama.h"
 #include "log.h"
+#include "speculative.h"
 
 #include <atomic>
 #include <clocale>
@@ -150,10 +151,12 @@ int llama_server(common_params & params, int argc, char ** argv) {
         }
 
         if (params.n_parallel < 0) {
-            SRV_TRC("%s", "n_parallel is set to auto, using n_parallel = 4 and kv_unified = true\n");
-
-            params.n_parallel = 4;
-            params.kv_unified = true;
+            params.n_parallel = 1;
+            if (!common_speculative_gpu_sampling(params) || params.n_gpu_layers == 0) {
+                params.n_parallel = 4;
+                params.kv_unified = true;
+            }
+            SRV_TRC("n_parallel is set to auto, using n_parallel = %d and kv_unified = %s\n", params.n_parallel, params.kv_unified ? "true" : "false");
         }
     }
 

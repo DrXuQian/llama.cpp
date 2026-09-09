@@ -705,6 +705,10 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     std::unique_lock<std::mutex> lock(ggml_cuda_lock);
     ggml_cuda_lock_cv.wait(lock, []{ return ggml_cuda_lock_counter.load(std::memory_order_relaxed) == 0; });
 
+#ifdef USE_CUDA_GRAPH
+    cuda_graphs.clear();
+#endif
+
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && CUDART_VERSION >= 12080
     for (auto & input : input_buffers) {
         CUDA_CHECK(cudaEventSynchronize(input.copied));
@@ -2450,13 +2454,27 @@ static void ggml_backend_cuda_free(ggml_backend_t backend) {
 
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && CUDART_VERSION >= 12080
 struct ggml_cuda_token_sources {
-    const int32_t * data[11];
+    const int32_t * data[12];
 };
 
 static __global__ void ggml_cuda_gather_tokens(ggml_cuda_token_sources src, int32_t * dst, int count) {
     const int i = threadIdx.x;
     if (i < count) {
         dst[i] = *src.data[i];
+    }
+}
+
+struct ggml_cuda_copy_sources {
+    const int32_t * src[12];
+    int32_t * dst[12];
+    int n[12];
+};
+
+static __global__ void ggml_cuda_copy_small_tensors(ggml_cuda_copy_sources copies) {
+    const int i = blockIdx.x*blockDim.x + threadIdx.x;
+    const int tensor = blockIdx.y;
+    if (i < copies.n[tensor]) {
+        copies.dst[tensor][i] = copies.src[tensor][i];
     }
 }
 
@@ -2485,7 +2503,7 @@ static bool ggml_backend_cuda_get_tensors_async(ggml_backend_t backend, const gg
         return true;
     }
     ggml_cuda_set_device(cuda_ctx->device);
-    bool tokens = count >= 2 && count <= 11 && sizes.size() == count;
+    bool tokens = count >= 2 && count <= 12 && sizes.size() == count;
     for (size_t i = 0; tokens && i < count; i++) {
         tokens = tensors[i]->type == GGML_TYPE_I32 && sizes[i] == sizeof(int32_t) &&
             dst[i] == (char *) dst[0] + i*sizeof(int32_t);
@@ -2500,6 +2518,35 @@ static bool ggml_backend_cuda_get_tensors_async(ggml_backend_t backend, const gg
             }
             // Pack scalar outputs in one operation before the consumer stream starts.
             ggml_cuda_gather_tokens<<<1, 32, 0, cuda_ctx->stream()>>>(sources, (int32_t *) dst[0], count);
+            CUDA_CHECK(cudaGetLastError());
+            return true;
+        }
+    }
+    if (count >= 2 && count <= 12 && sizes.size() == count) {
+        size_t total = 0;
+        size_t max_size = 0;
+        bool small = true;
+        for (const size_t size : sizes) {
+            total += size;
+            max_size = std::max(max_size, size);
+            small &= size % sizeof(int32_t) == 0;
+        }
+        small &= total <= 256*1024;
+        for (size_t i = 0; small && i < count; ++i) {
+            cudaPointerAttributes attrs;
+            CUDA_CHECK(cudaPointerGetAttributes(&attrs, dst[i]));
+            small = attrs.type == cudaMemoryTypeDevice && attrs.device == ggml_cuda_get_physical_device(cuda_ctx->device) &&
+                (uintptr_t) srcs[i] % sizeof(int32_t) == 0 && (uintptr_t) dsts[i] % sizeof(int32_t) == 0;
+        }
+        if (small) {
+            ggml_cuda_copy_sources copies = {};
+            for (size_t i = 0; i < count; ++i) {
+                copies.src[i] = (const int32_t *) srcs[i];
+                copies.dst[i] = (int32_t *) dsts[i];
+                copies.n[i] = sizes[i]/sizeof(int32_t);
+            }
+            const dim3 blocks((max_size/sizeof(int32_t) + 127)/128, count);
+            ggml_cuda_copy_small_tensors<<<blocks, 128, 0, cuda_ctx->stream()>>>(copies);
             CUDA_CHECK(cudaGetLastError());
             return true;
         }
@@ -4350,7 +4397,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     return 0;
 }
 
-static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const ggml_cuda_graph_key & graph_key) {
+static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const ggml_cuda_graph_key & graph_key, const bool launch = true) {
     bool graph_evaluated_or_captured = false;
 
     // flag used to determine whether it is an integrated_gpu
@@ -4555,14 +4602,15 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
         ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
         if (graph->instance == nullptr) { // Create executable graph from captured graph.
             CUDA_CHECK(cudaGraphInstantiate(&graph->instance, graph->graph, NULL, NULL, 0));
-        }
-        if (cuda_graph_update_required) { // Update graph executable
+        } else if (cuda_graph_update_required) { // Update graph executable
             ggml_cuda_graph_update_executable(cuda_ctx, graph_key);
         }
-        // Launch graph
-        CUDA_CHECK(cudaGraphLaunch(graph->instance, cuda_ctx->stream()));
+        if (launch) {
+            CUDA_CHECK(cudaGraphLaunch(graph->instance, cuda_ctx->stream()));
+        }
 #else
         GGML_UNUSED(graph_key);
+        GGML_UNUSED(launch);
         graph_evaluated_or_captured = true;
 #endif  // USE_CUDA_GRAPH
     }
@@ -4583,6 +4631,237 @@ static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, co
 
     return graph->is_enabled();
 }
+
+static bool ggml_backend_cuda_graph_prepare(ggml_backend_t backend, ggml_cgraph * cgraph) {
+    auto * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    ggml_cuda_set_device(cuda_ctx->device);
+    if (cgraph->n_nodes == 0) {
+        return false;
+    }
+    const auto graph_key = ggml_cuda_graph_get_key(cgraph);
+    if (!ggml_cuda_graph_set_enabled(cuda_ctx, graph_key) || !ggml_cuda_graph_check_compability(cgraph)) {
+        return false;
+    }
+
+    auto * graph = cuda_ctx->cuda_graph(graph_key);
+    const bool changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph);
+    if (!changed && graph->instance && graph->warmup_complete) {
+        return true;
+    }
+
+    CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
+    {
+        std::lock_guard<std::mutex> lock(ggml_cuda_lock);
+        ggml_cuda_lock_counter.fetch_add(1, std::memory_order_relaxed);
+    }
+    CUDA_CHECK(cudaStreamBeginCapture(cuda_ctx->stream(), cudaStreamCaptureModeRelaxed));
+    ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, true, true, graph_key, false);
+    graph->warmup_complete = true;
+    return true;
+}
+
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && CUDART_VERSION >= 12080
+static __global__ void ggml_cuda_early_exit(const float * scores, int n, float p_min, int32_t * counts, cudaGraphConditionalHandle next) {
+    float sum = 0.0f;
+    for (int i = 0; i < n; ++i) {
+        sum += expf(scores[i] - scores[0]);
+    }
+    const bool keep = 1.0f / sum >= p_min;
+    counts[0] += keep;
+    counts[1] += 1;
+    if (next) {
+        cudaGraphSetConditional(next, keep);
+    }
+}
+
+static bool ggml_backend_cuda_graph_early_exit(ggml_backend_t backend, ggml_cgraph * cgraph,
+        ggml_tensor * const * scores, int n_steps, float p_min, ggml_tensor * counts) {
+    auto * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    ggml_cuda_set_device(cuda_ctx->device);
+    if (n_steps < 2 || n_steps > 8 || !(p_min > 0.0f) || !cgraph->n_nodes ||
+            counts->type != GGML_TYPE_I32 || ggml_nelements(counts) != 2) {
+        return false;
+    }
+    const auto key = ggml_cuda_graph_get_key(cgraph);
+    if (!ggml_cuda_graph_set_enabled(cuda_ctx, key)) {
+        return false;
+    }
+    auto * graph = cuda_ctx->cuda_graph(key);
+    if (graph->uid == cgraph->uid && cgraph->uid && graph->warmup_complete && graph->instance &&
+            graph->early_p_min == p_min && graph->early_counts == counts->data) {
+        return true;
+    }
+    if (!ggml_cuda_graph_check_compability(cgraph)) {
+        return false;
+    }
+    std::vector<int> ends;
+    int cursor = 0;
+    for (int step = 0; step < n_steps; ++step) {
+        if (scores[step]->type != GGML_TYPE_F32 || !ggml_is_contiguous(scores[step])) {
+            return false;
+        }
+        while (cursor < cgraph->n_nodes && cgraph->nodes[cursor] != scores[step]) {
+            ++cursor;
+        }
+        if (cursor == cgraph->n_nodes) {
+            return false;
+        }
+        ends.push_back(++cursor);
+    }
+    ends.back() = cgraph->n_nodes;
+    if (graph->instance) {
+        CUDA_CHECK(cudaGraphExecDestroy(graph->instance));
+        graph->instance = nullptr;
+    }
+    if (graph->graph) {
+        CUDA_CHECK(cudaGraphDestroy(graph->graph));
+    }
+    CUDA_CHECK(cudaGraphCreate(&graph->graph, 0));
+    std::vector<cudaGraphConditionalHandle> handles(n_steps - 1);
+    for (auto & handle : handles) {
+        CUDA_CHECK(cudaGraphConditionalHandleCreate(&handle, graph->graph, 0, cudaGraphCondAssignDefault));
+    }
+    cudaGraphNode_t previous = nullptr;
+    for (int step = 0; step < n_steps; ++step) {
+        cudaGraph_t body;
+        if (step == 0) {
+            CUDA_CHECK(cudaGraphCreate(&body, 0));
+        } else {
+            cudaGraphNodeParams params = {};
+            params.type = cudaGraphNodeTypeConditional;
+            params.conditional.handle = handles[step - 1];
+            params.conditional.type = cudaGraphCondTypeIf;
+            params.conditional.size = 1;
+            const auto dependency = previous;
+            CUDA_CHECK(cudaGraphAddNode(&previous, graph->graph, &dependency, 1, &params));
+            body = params.conditional.phGraph_out[0];
+        }
+        {
+            std::lock_guard<std::mutex> lock(ggml_cuda_lock);
+            ggml_cuda_lock_counter.fetch_add(1, std::memory_order_relaxed);
+        }
+        CUDA_CHECK(cudaStreamBeginCaptureToGraph(cuda_ctx->stream(), body, nullptr, nullptr, 0, cudaStreamCaptureModeRelaxed));
+        if (step == 0) {
+            CUDA_CHECK(cudaMemsetAsync(counts->data, 0, 2*sizeof(int32_t), cuda_ctx->stream()));
+        }
+        auto part = ggml_graph_view(cgraph, step ? ends[step - 1] : 0, ends[step]);
+        ggml_cuda_graph_evaluate_and_capture(cuda_ctx, &part, false, false, key);
+        ggml_cuda_early_exit<<<1, 1, 0, cuda_ctx->stream()>>>((const float *) scores[step]->data,
+                ggml_nelements(scores[step]), p_min, (int32_t *) counts->data, step + 1 < n_steps ? handles[step] : 0);
+        CUDA_CHECK(cudaStreamEndCapture(cuda_ctx->stream(), &body));
+        {
+            std::lock_guard<std::mutex> lock(ggml_cuda_lock);
+            if (ggml_cuda_lock_counter.fetch_sub(1, std::memory_order_relaxed) == 1) {
+                ggml_cuda_lock_cv.notify_all();
+            }
+        }
+        if (step == 0) {
+            CUDA_CHECK(cudaGraphAddChildGraphNode(&previous, graph->graph, nullptr, 0, body));
+            CUDA_CHECK(cudaGraphDestroy(body));
+        }
+    }
+    CUDA_CHECK(cudaGraphInstantiate(&graph->instance, graph->graph, 0));
+    ggml_cuda_graph_update_required(cuda_ctx, cgraph);
+    graph->early_p_min = p_min;
+    graph->early_counts = counts->data;
+    graph->warmup_complete = true;
+    return true;
+}
+static __global__ void ggml_cuda_graph_select(const int32_t * selector, cudaGraphConditionalHandle handle) {
+    cudaGraphSetConditional(handle, selector[0]);
+}
+
+static bool ggml_backend_cuda_graph_select(ggml_backend_t backend, ggml_cgraph * const * prefixes,
+        ggml_cgraph * const * graphs, int n_graphs, ggml_tensor * selector) {
+    auto * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    ggml_cuda_set_device(cuda_ctx->device);
+    if (n_graphs < 1 || n_graphs > 9 || selector->type != GGML_TYPE_I32) {
+        return false;
+    }
+    const auto key = ggml_cuda_graph_get_key(graphs[0]);
+    if (!ggml_cuda_graph_set_enabled(cuda_ctx, key)) {
+        return false;
+    }
+    auto * graph = cuda_ctx->cuda_graph(key);
+    std::vector<uint64_t> uids;
+    for (int i = 0; i < n_graphs; ++i) {
+        uids.push_back(prefixes[i] ? prefixes[i]->uid : 0);
+        uids.push_back(graphs[i]->uid);
+    }
+    if (graph->select_uids == uids && graph->select_data == selector->data) {
+        if (graph->instance && graph->warmup_complete) {
+            return true;
+        }
+    }
+    for (int i = 0; i < n_graphs; ++i) {
+        if (!ggml_cuda_graph_check_compability(graphs[i]) || (prefixes[i] && !ggml_cuda_graph_check_compability(prefixes[i]))) {
+            return false;
+        }
+    }
+    const auto previous_instance = graph->instance;
+    const auto previous_graph = graph->graph;
+    graph->instance = nullptr;
+    CUDA_CHECK(cudaGraphCreate(&graph->graph, 0));
+    cudaGraphConditionalHandle handle;
+    CUDA_CHECK(cudaGraphConditionalHandleCreate(&handle, graph->graph, 0, cudaGraphCondAssignDefault));
+    void * data = selector->data;
+    void * args[] = { &data, &handle };
+    cudaKernelNodeParams kernel = {};
+    kernel.func = (void *) ggml_cuda_graph_select;
+    kernel.gridDim = kernel.blockDim = dim3(1);
+    kernel.kernelParams = args;
+    cudaGraphNode_t first, branch;
+    CUDA_CHECK(cudaGraphAddKernelNode(&first, graph->graph, nullptr, 0, &kernel));
+    cudaGraphNodeParams params = {};
+    params.type = cudaGraphNodeTypeConditional;
+    params.conditional.handle = handle;
+    params.conditional.type = cudaGraphCondTypeSwitch;
+    params.conditional.size = n_graphs;
+    CUDA_CHECK(cudaGraphAddNode(&branch, graph->graph, &first, 1, &params));
+    for (int i = 0; i < n_graphs; ++i) {
+        auto body = params.conditional.phGraph_out[i];
+        {
+            std::lock_guard<std::mutex> lock(ggml_cuda_lock);
+            ggml_cuda_lock_counter.fetch_add(1, std::memory_order_relaxed);
+        }
+        CUDA_CHECK(cudaStreamBeginCaptureToGraph(cuda_ctx->stream(), body, nullptr, nullptr, 0, cudaStreamCaptureModeRelaxed));
+        if (prefixes[i]) {
+            ggml_cuda_graph_evaluate_and_capture(cuda_ctx, prefixes[i], false, false, key);
+        }
+        ggml_cuda_graph_evaluate_and_capture(cuda_ctx, graphs[i], false, false, key);
+        CUDA_CHECK(cudaStreamEndCapture(cuda_ctx->stream(), &body));
+        {
+            std::lock_guard<std::mutex> lock(ggml_cuda_lock);
+            if (ggml_cuda_lock_counter.fetch_sub(1, std::memory_order_relaxed) == 1) {
+                ggml_cuda_lock_cv.notify_all();
+            }
+        }
+    }
+    ggml_cuda_graph_update_required(cuda_ctx, graphs[0]);
+    graph->select_uids = std::move(uids);
+    graph->select_data = selector->data;
+    graph->instance = previous_instance;
+    if (graph->instance) {
+        cudaGraphExecUpdateResultInfo info;
+        const auto status = cudaGraphExecUpdate(graph->instance, graph->graph, &info);
+        if (status == cudaErrorGraphExecUpdateFailure) {
+            (void) cudaGetLastError();
+            CUDA_CHECK(cudaGraphExecDestroy(graph->instance));
+            graph->instance = nullptr;
+        } else {
+            CUDA_CHECK(status);
+        }
+    }
+    if (previous_graph) {
+        CUDA_CHECK(cudaGraphDestroy(previous_graph));
+    }
+    if (!graph->instance) {
+        CUDA_CHECK(cudaGraphInstantiate(&graph->instance, graph->graph, 0));
+    }
+    graph->warmup_complete = true;
+    return true;
+}
+#endif
 #endif // USE_CUDA_GRAPH
 
 static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
@@ -5859,7 +6138,24 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t 
 
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
+#if defined(USE_CUDA_GRAPH) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    if (strcmp(name, "ggml_backend_graph_prepare") == 0) {
+        return (void *) ggml_backend_cuda_graph_prepare;
+    }
+#endif
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && CUDART_VERSION >= 12080
+    if (strcmp(name, "ggml_backend_graph_early_exit") == 0) {
+#ifdef USE_CUDA_GRAPH
+        return (void *) ggml_backend_cuda_graph_early_exit;
+#else
+        return nullptr;
+#endif
+    }
+    if (strcmp(name, "ggml_backend_graph_select") == 0) {
+#if defined(USE_CUDA_GRAPH) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && CUDART_VERSION >= 12080
+        return (void *) ggml_backend_cuda_graph_select;
+#endif
+    }
     if (strcmp(name, "ggml_backend_set_inputs") == 0) {
         return (void *) ggml_backend_cuda_set_inputs;
     }

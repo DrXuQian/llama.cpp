@@ -158,6 +158,7 @@ public:
     uint32_t get_size()     const;
     uint32_t get_n_stream() const;
     bool set_fixed_size(bool value);
+    bool is_fixed_size() const { return fixed_size; }
 
     bool get_has_shift() const;
 
@@ -393,9 +394,11 @@ public:
     //
 
     uint32_t get_n_kv() const;
+    bool is_fixed_size() const { return kv->is_fixed_size(); }
 
     // A single-token view of an already applied, single-sequence batch.
     std::unique_ptr<llama_kv_cache_context> for_token(uint32_t i, uint32_t n_embd) const;
+    std::unique_ptr<llama_kv_cache_context> for_graph(const llama_ubatch & ubatch, uint32_t n_kv) const;
 
     ggml_type type_k() const;
     ggml_type type_v() const;

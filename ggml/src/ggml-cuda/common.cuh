@@ -1255,6 +1255,10 @@ struct ggml_cuda_graph {
     std::vector<cudaGraphNode_t> nodes;
     bool disable_due_to_gpu_arch = false;
     bool warmup_complete = false;
+    float early_p_min = 0.0f;
+    void * early_counts = nullptr;
+    std::vector<uint64_t> select_uids;
+    void * select_data = nullptr;
     uint64_t uid = 0;
     int64_t last_used_time = 0;
     struct node_properties {

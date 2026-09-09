@@ -126,8 +126,10 @@ public:
 
     const llama_kv_cache_context * get_attn() const;
     const llama_memory_recurrent_context * get_recr() const;
+    std::unique_ptr<llama_memory_hybrid_context> for_graph(const llama_ubatch & ubatch, uint32_t n_kv) const;
 
 private:
+    llama_memory_hybrid_context(llama_memory_context_ptr attn, llama_memory_context_ptr recr, const llama_ubatch & ubatch);
     // the index of the next ubatch to process
     size_t i_next = 0;
 

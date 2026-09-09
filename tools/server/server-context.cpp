@@ -1781,7 +1781,7 @@ private:
 
         // initialize samplers
         if (task.need_sampling()) {
-            const bool auto_backend_sampling = common_speculative_gpu_pipeline(params_base) &&
+            const bool auto_backend_sampling = common_speculative_gpu_sampling(params_base) &&
                 task.params.sampling.temp <= 0.0f && task.params.sampling.mirostat == 0 &&
                 llama_model_n_devices(model_tgt) == 1 &&
                 strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(llama_model_get_device(model_tgt, 0))), "CUDA") == 0;
@@ -3702,7 +3702,9 @@ private:
                     ret = llama_decode(ctx_tgt, batch_view);
                 }
             } else {
-                ret = llama_decode(ctx_tgt, batch_view);
+                if (!spec || slots.size() != 1 || !ctx_dft || !llama_decode_nextn_verify(ctx_tgt, ctx_dft, batch_view, &ret)) {
+                    ret = llama_decode(ctx_tgt, batch_view);
+                }
             }
             if (ret == 0 && process_before_sync) {
                 spec_ok = common_speculative_process(spec.get(), batch_view);

@@ -1609,7 +1609,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
     }
 }
 
-static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
+static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched, bool synchronize = true) {
     bool backend_ids_changed = false;
     for (int i = 0; i < sched->graph.n_nodes; i++) {
         if (sched->node_backend_ids[i] != sched->prev_node_backend_ids[i] &&
@@ -1647,8 +1647,10 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
 
         // the re-allocation may cause the split inputs to be moved to a different address
         // synchronize without ggml_backend_sched_synchronize to avoid changing cur_copy
-        for (int i = 0; i < sched->n_backends; i++) {
-            ggml_backend_synchronize(sched->backends[i]);
+        if (synchronize) {
+            for (int i = 0; i < sched->n_backends; i++) {
+                ggml_backend_synchronize(sched->backends[i]);
+            }
         }
 
         ggml_gallocr_reserve_n(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids);
@@ -2079,6 +2081,95 @@ bool ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgra
     sched->is_alloc = true;
 
     return true;
+}
+
+bool ggml_backend_sched_graph_prepare(ggml_backend_sched_t sched) {
+    GGML_ASSERT(sched);
+    if (!sched->is_alloc || sched->n_splits != 1 || sched->n_copies != 1 || sched->callback_eval) {
+        return false;
+    }
+
+    auto & split = sched->splits[0];
+    auto backend = sched->backends[split.backend_id];
+    auto device = ggml_backend_get_device(backend);
+    if (!device) {
+        return false;
+    }
+    auto reg = ggml_backend_dev_backend_reg(device);
+    if (!reg) {
+        return false;
+    }
+    auto prepare = (ggml_backend_graph_prepare_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_graph_prepare");
+    return prepare && prepare(backend, &split.graph);
+}
+
+bool ggml_backend_sched_alloc_graph_after(ggml_backend_sched_t sched, struct ggml_cgraph * graph, ggml_backend_event_t last_use) {
+    GGML_ASSERT(sched && !sched->is_alloc && sched->n_copies == 1);
+    if (last_use) {
+        ggml_backend_event_synchronize(last_use);
+    }
+    sched->cur_copy = sched->next_copy = 0;
+    ggml_backend_sched_split_graph(sched, graph);
+    sched->is_alloc = ggml_backend_sched_alloc_splits(sched, false);
+    return sched->is_alloc;
+}
+
+bool ggml_backend_sched_graph_early_exit(ggml_backend_sched_t sched, struct ggml_tensor * const * scores, int n_steps, float p_min, struct ggml_tensor * counts) {
+    GGML_ASSERT(sched);
+    if (!sched->is_alloc || sched->n_splits != 1 || sched->n_copies != 1 || sched->callback_eval) {
+        return false;
+    }
+    auto & split = sched->splits[0];
+    auto backend = sched->backends[split.backend_id];
+    auto device = ggml_backend_get_device(backend);
+    auto reg = device ? ggml_backend_dev_backend_reg(device) : nullptr;
+    auto prepare = reg ? (ggml_backend_graph_early_exit_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_graph_early_exit") : nullptr;
+    return prepare && prepare(backend, &split.graph, scores, n_steps, p_min, counts);
+}
+
+bool ggml_backend_sched_graph_select(ggml_backend_sched_t const * prefixes, ggml_backend_sched_t const * scheds, int n_graphs, struct ggml_tensor * selector) {
+    if (n_graphs < 1) {
+        return false;
+    }
+    ggml_backend_t backend = nullptr;
+    std::vector<ggml_cgraph *> pre(n_graphs), graphs(n_graphs);
+    std::vector<ggml_tensor *> inputs, copies;
+    ggml_backend_set_inputs_t set_inputs = nullptr;
+    for (int i = 0; i < n_graphs; ++i) {
+        for (int j = 0; j < 2; ++j) {
+            auto * sched = j ? scheds[i] : prefixes[i];
+            if (!sched && !j) {
+                continue;
+            }
+            if (!sched || !sched->is_alloc || sched->n_splits != 1 || sched->n_copies != 1 || sched->callback_eval) {
+                return false;
+            }
+            auto & split = sched->splits[0];
+            auto * current = sched->backends[split.backend_id];
+            if (backend && current != backend) {
+                return false;
+            }
+            backend = current;
+            set_inputs = sched->set_inputs[split.backend_id];
+            (j ? graphs : pre)[i] = &split.graph;
+            for (int k = 0; k < split.n_inputs; ++k) {
+                auto * input = split.inputs[k];
+                auto * copy = tensor_copy(input, split.backend_id, sched->cur_copy);
+                if (!ggml_backend_buffer_is_host(input->buffer) || copy->buffer->buft != ggml_backend_get_default_buffer_type(backend)) {
+                    return false;
+                }
+                inputs.push_back(input);
+                copies.push_back(copy);
+            }
+        }
+    }
+    auto device = ggml_backend_get_device(backend);
+    auto reg = device ? ggml_backend_dev_backend_reg(device) : nullptr;
+    auto prepare = reg ? (ggml_backend_graph_select_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_graph_select") : nullptr;
+    if ((!inputs.empty() && !set_inputs) || !prepare || !prepare(backend, pre.data(), graphs.data(), n_graphs, selector)) {
+        return false;
+    }
+    return inputs.empty() || set_inputs(backend, copies.data(), inputs.data(), inputs.size());
 }
 
 enum ggml_status ggml_backend_sched_graph_compute(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {

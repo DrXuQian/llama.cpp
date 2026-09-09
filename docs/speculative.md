@@ -8,24 +8,29 @@ llama.cpp supports speculative decoding, a technique that can significantly acce
 
 MTP and EAGLE3 use GPU acceptance and draft/target prefetch automatically when supported. No optimization environment variables are needed. The server places input embeddings on the selected CUDA device unless a tensor override specifies otherwise, and enables target backend sampling for greedy requests. CUDA input transfers use asynchronous staging and CUDA waits use spin scheduling by default.
 
-The complete pipeline currently supports Qwen3.5/Qwen3.6 MTP and Qwen3 dense/MoE EAGLE3 targets on one CUDA device, with full GPU offload, one slot, 2 to 8 draft tokens, greedy sampling, Flash Attention, and unquantized KV. Eligible contexts up to 8192 tokens use a fixed KV graph size automatically. Other configurations keep the applicable optimizations and fall back when a stage cannot be prefetched. Temperature, parallelism, context size, explicit tensor placement, and Flash Attention settings remain under user control. The default `-fa auto` is sufficient when the backend supports FA; the server's automatic slot count is four, so select `-np 1` for this pipeline.
+The complete pipeline currently supports Qwen3.5/Qwen3.6 MTP and Qwen3 dense/MoE EAGLE3 targets on one CUDA device, with full GPU offload, one slot, 2 to 8 draft tokens, greedy sampling, Flash Attention, and unquantized KV. Eligible contexts up to 8192 tokens use a fixed KV graph size automatically. Other configurations keep the applicable optimizations and fall back when a stage cannot be prefetched. Temperature, parallelism, context size, explicit tensor placement, and Flash Attention settings remain under user control. The default `-fa auto` is sufficient when the backend supports FA. When `-np` is omitted, the server selects one slot for the configured MTP/EAGLE3 GPU pipeline; an explicit slot count is respected. Other configurations retain the automatic four-slot default.
 
 For example:
 
 ```bash
 llama-server -m Qwen3.6-35B-A3B-MTP.gguf --spec-type draft-mtp \
-    -ngl 99 -np 1 -c 8192 --temp 0 --spec-draft-n-max 4
+    -ngl 99 -c 8192 --temp 0
 
 llama-server -m Qwen3-30B-A3B.gguf -md Qwen3-30B-A3B-eagle3.gguf \
-    --spec-type draft-eagle3 -ngl 99 -ngld 99 -np 1 -c 8192 \
-    --temp 0 --spec-draft-n-max 4
+    --spec-type draft-eagle3 -ngl 99 -ngld 99 -c 8192 --temp 0
 ```
 
 Request-level sampling settings also apply: a nonzero temperature or grammar can prevent the full pipeline. Once target prefetch succeeds, the log reports `GPU NextN pipeline active; target submitted before CPU acceptance` at the normal log level. CPU acceptance and output bookkeeping still run after GPU work has been submitted.
 
+The existing `--spec-draft-p-min` option enables confidence early stopping; for example, `--spec-draft-p-min 0.5`. With CUDA 12.8 or newer, supported chains make this decision on the GPU and select the next target verification width with a conditional CUDA graph. The CPU reads the length for bookkeeping after the next target has been submitted. The default threshold of zero keeps ordinary speculation. The threshold uses the existing top-10-normalized draft confidence, not a calibrated acceptance probability.
+
+Fixed graph shapes use a GPU-computed logical KV length and attention work partition, avoiding graph recapture at each KV growth boundary. Target graphs retain their own scheduler and sampler state across requests with matching sampling configuration; other control changes invalidate the cache. Initial graph preparation and CUDA dispatch/transfer intervals remain, so this does not guarantee literally zero GPU idle time.
+
 Use `--no-spec-gpu-pipeline` to disable automatic target sampling, input placement, fixed KV sizing, and acceptance prefetch. Explicit `--backend-sampling` and tensor overrides still apply, and the CUDA transfer and scheduling improvements remain enabled. The former `LLAMA_NEXTN_TARGET_PREFETCH`, `LLAMA_MTP_TARGET_PREFETCH`, `LLAMA_KV_CACHE_FIXED_SIZE`, `GGML_CUDA_ASYNC_INPUTS`, and `GGML_CUDA_SCHEDULE_SPIN` environment variables are no longer read.
 
 Fixed KV sizing and prefetch have memory and compute costs; reducing CPU-wait gaps does not guarantee higher token throughput. Spin scheduling can increase CPU use while waiting for the GPU.
+
+Single-query attention in a bounded graph uses the vector kernel, including at a logical KV length of 8192 where the ordinary CUDA heuristic can select the MMA kernel. Both paths implement the same attention operation, but their floating-point results are not bit-identical at that boundary. Use `--no-spec-gpu-pipeline` when comparing against the ordinary kernel selection.
 
 ## Implementations
 

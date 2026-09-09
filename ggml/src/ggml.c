@@ -5516,6 +5516,19 @@ void ggml_flash_attn_ext_set_n_kv_max(
     ggml_set_op_params_i32(a, 4, n_kv_max);
 }
 
+void ggml_flash_attn_ext_set_mask_bounds(struct ggml_tensor * a, bool value) {
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
+    ggml_set_op_params_i32(a, 5, value);
+}
+
+void ggml_flash_attn_ext_set_kv_indices(struct ggml_tensor * a, struct ggml_tensor * indices) {
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
+    GGML_ASSERT(indices && (indices->type == GGML_TYPE_I32 || indices->type == GGML_TYPE_I64));
+    GGML_ASSERT(ggml_is_vector(indices) && ggml_is_contiguous(indices) && ggml_nelements(indices) > 0);
+    a->src[5] = indices;
+    ggml_flash_attn_ext_set_mask_bounds(a, true);
+}
+
 void ggml_flash_attn_ext_add_sinks(
         struct ggml_tensor * a,
         struct ggml_tensor * sinks) {

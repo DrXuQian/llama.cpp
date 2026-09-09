@@ -2459,6 +2459,12 @@ extern "C" {
             struct ggml_tensor * a,
             int32_t              n_kv_max);
 
+    // Allow backends to skip fully masked trailing K/V tiles.
+    GGML_API void ggml_flash_attn_ext_set_mask_bounds(struct ggml_tensor * a, bool value);
+
+    // The last index must bound all unmasked K/V entries. Indices must be a contiguous I32 or I64 vector.
+    GGML_API void ggml_flash_attn_ext_set_kv_indices(struct ggml_tensor * a, struct ggml_tensor * indices);
+
     GGML_API void ggml_flash_attn_ext_add_sinks(
             struct ggml_tensor * a,
             struct ggml_tensor * sinks);

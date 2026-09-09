@@ -237,6 +237,15 @@ llama_memory_hybrid_context::llama_memory_hybrid_context(
     status(llama_memory_status_combine(ctx_attn->get_status(), ctx_recr->get_status())) {
 }
 
+llama_memory_hybrid_context::llama_memory_hybrid_context(llama_memory_context_ptr attn, llama_memory_context_ptr recr, const llama_ubatch & ubatch) :
+    ubatches{ ubatch }, ctx_attn(std::move(attn)), ctx_recr(std::move(recr)), status(LLAMA_MEMORY_STATUS_SUCCESS) {
+}
+
+std::unique_ptr<llama_memory_hybrid_context> llama_memory_hybrid_context::for_graph(const llama_ubatch & ubatch, uint32_t n_kv) const {
+    return std::unique_ptr<llama_memory_hybrid_context>(new llama_memory_hybrid_context(
+        get_attn()->for_graph(ubatch, n_kv), std::make_unique<llama_memory_recurrent_context>(*get_recr()), ubatch));
+}
+
 bool llama_memory_hybrid_context::next() {
     assert(status == LLAMA_MEMORY_STATUS_SUCCESS);
 

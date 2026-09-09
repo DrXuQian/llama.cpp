@@ -1701,7 +1701,7 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
         mparams.kv_overrides = params.kv_overrides.data();
     }
 
-    if (common_speculative_gpu_pipeline(params) && params.n_gpu_layers != 0) {
+    if (common_speculative_gpu_sampling(params) && params.n_gpu_layers != 0) {
         std::vector<ggml_backend_dev_t> devices;
         if (!params.devices.empty()) {
             for (auto * dev : params.devices) {

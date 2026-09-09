@@ -138,7 +138,9 @@ template <>
 llama_model_eagle3::graph<true>::graph(const llama_model & model, const llm_graph_params & params) : llm_graph_context(params) {
     ggml_tensor * cur = nullptr;
 
-    cur = build_inp_embd_enc();
+    cur = params.nextn_features[0] ?
+        ggml_concat(ctx0, ggml_concat(ctx0, params.nextn_features[0], params.nextn_features[1], 0), params.nextn_features[2], 0) :
+        build_inp_embd_enc();
 
     // RMSNorm on the fused target features before fc
     if (hparams.norm_before_fc) {
@@ -149,6 +151,9 @@ llama_model_eagle3::graph<true>::graph(const llama_model & model, const llm_grap
     // Feature fusion layer
     cur = build_lora_mm(model.fc, cur);
     cb(cur, "fc_out", -1);
+    if (params.nextn_hidden) {
+        cur = ggml_cpy(ctx0, cur, params.nextn_hidden);
+    }
 
     // Output: g_embeddings e.g. [4096, n_tokens]
     // store in t_h_nextn (same as MTP) so can be read via llama_get_embeddings_nextn(ctx_dft)
