@@ -338,6 +338,5 @@ int main(int argc, char ** argv) {
     run_upload_case(12, 257, true);
     printf("KPACK_UPLOAD_HOST PASS formats=5 slots=2 slot_MiB=8 source_reuse=PASS tail_async=PASS teardown=PASS device_validation=0\n");
     printf("KPACK_BUFFER_HOST PASS formats=5 chunked_experts=1000 delayed_D2H_compute=PASS device_validation=0\n");
-    printf("KPACK_SF_LIFETIME_HOST PASS once_per_weight=1 memory_decline=1 separate_ready=1 blocked_D2H_independent=1 device_validation=0\n");
     return 0;
 }
