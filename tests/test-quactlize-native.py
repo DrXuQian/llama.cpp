@@ -1,9 +1,109 @@
 import copy
+import json
+from pathlib import Path
+import re
+import subprocess
+import tempfile
+from types import SimpleNamespace
 import unittest
+from unittest.mock import MagicMock, patch
+import quactlize_native as native
 from quactlize_native import timings, selection, summarize, PATTERN
 
 
 class NativeEvidence(unittest.TestCase):
+    def test_startup_failure_keeps_arm_phase_and_process_status(self):
+        for returncode in (None, -6):
+            with (
+                self.subTest(returncode=returncode),
+                tempfile.TemporaryDirectory() as temp,
+            ):
+                args = SimpleNamespace(
+                    binary=Path("unused-server"),
+                    model=Path("unused-model"),
+                    cache=Path("unused-cache"),
+                    context=4096,
+                    batch=128,
+                    output=Path(temp),
+                )
+                proc = MagicMock()
+                proc.poll.return_value = returncode
+                proc.returncode = returncode
+                if returncode is None:
+                    proc.wait.side_effect = lambda **kwargs: setattr(
+                        proc, "returncode", -15
+                    )
+                with (
+                    patch.object(native.subprocess, "Popen", return_value=proc),
+                    patch.object(
+                        native,
+                        "request",
+                        side_effect=ConnectionResetError(104, "connection reset"),
+                    ) as request,
+                ):
+                    with self.assertRaisesRegex(
+                        ValueError, "1-native phase=startup-health"
+                    ):
+                        native.run_arm(args, 1, "native", None)
+                failure = json.loads(
+                    (args.output / "1-native.failure.json").read_text()
+                )
+                self.assertEqual(failure["returncode_before_cleanup"], returncode)
+                self.assertEqual(failure["log"], str(args.output / "1-native.log"))
+                self.assertEqual(request.call_count, int(returncode is None))
+                self.assertEqual(proc.terminate.call_count, int(returncode is None))
+                proc.kill.assert_not_called()
+
+    def test_tensor_override_matches_complete_weight_names(self):
+        positive = ["output.weight"] + [
+            f"blk.{i}.ffn_{part}_exps.weight"
+            for i in range(40)
+            for part in ("gate", "up", "down", "gate_up")
+        ]
+        negative = [
+            f"blk.{i}.{part}.weight"
+            for i in range(40)
+            for part in ("attn_output", "attn_q", "attn_k", "attn_v", "ffn_up_shexp")
+        ] + [
+            "token_embd.weight",
+            "output.bias",
+            "output.weight.extra",
+            "prefixoutput.weight",
+            "blk.3.ffn_down_exps.bias",
+            "prefix.blk.3.ffn_down_exps.weight",
+        ]
+        names = positive + negative
+        want = [True] * len(positive) + [False] * len(negative)
+        self.assertEqual([bool(re.search(PATTERN, name)) for name in names], want)
+        # Exercise the same C++ regex_search semantics as the loader.
+        source = r"""
+#include <iostream>
+#include <regex>
+#include <string>
+int main(int argc, char ** argv) {
+    const std::regex pattern(argv[1]);
+    for (int i = 2; i < argc; ++i) {
+        std::cout << std::regex_search(std::string(argv[i]), pattern) << '\n';
+    }
+}
+"""
+        with tempfile.TemporaryDirectory() as temp:
+            binary = str(Path(temp) / "regex-search")
+            subprocess.run(
+                ["c++", "-std=c++17", "-x", "c++", "-", "-o", binary],
+                input=source,
+                text=True,
+                check=True,
+                capture_output=True,
+            )
+            got = subprocess.check_output([binary, PATTERN, *names], text=True)
+            self.assertEqual(got.splitlines(), [str(int(value)) for value in want])
+            legacy = subprocess.check_output(
+                [binary, r"(ffn_.*_exps|output\.weight)", "blk.3.attn_output.weight"],
+                text=True,
+            )
+            self.assertEqual(legacy, "1\n")
+
     def test_timers(self):
         p = dict(
             prompt=[1] * 128, n_predict=16, temperature=0.0, ignore_eos=True, seed=1
