@@ -4,7 +4,6 @@
 #define ggml_quactlize_gemv_config test_gemv_config
 #define ggml_quactlize_prefill_route test_prefill_route
 #define ggml_quactlize_artifact_for test_artifact_for
-#define ggml_quactlize_prepare_scales test_prepare_scales
 #define ggml_quactlize_execution_prepare_graph test_prepare_graph
 #define ggml_quactlize_execution_run test_execution_run
 #include "../ggml/src/ggml-cuda/quactlize-execution.cu"
@@ -12,7 +11,6 @@
 #undef ggml_quactlize_gemv_config
 #undef ggml_quactlize_prefill_route
 #undef ggml_quactlize_artifact_for
-#undef ggml_quactlize_prepare_scales
 #undef ggml_quactlize_execution_prepare_graph
 #undef ggml_quactlize_execution_run
 
@@ -27,15 +25,6 @@ static void require(bool value) {
 bool test_artifact_for(const ggml_tensor * t, ggml_quactlize_artifact * out) {
     if (t != test_weight) return false;
     *out = test_art;
-    return true;
-}
-bool test_prepare_scales(const ggml_tensor *) {
-    if (!test_art.scale) {
-        ++scale_prepares;
-        test_art.scale = (const uint16_t *) test_art.units;
-        test_art.zero = test_art.scale;
-        test_art.scale_ready = test_art.ready;
-    }
     return true;
 }
 bool test_gemv_config(const qkg_call_v1 &, qkg_config_v1 * out) {
@@ -76,7 +65,8 @@ static __global__ void tag_gemm(qk_call_v1 c) {
     }
     for (int n=threadIdx.x; n<c.n; n+=blockDim.x) {
         ((half *) c.output)[int64_t(r)*c.n+n] = __float2half(
-            __half2float(((const half *) c.a)[int64_t(r)*c.k]) + 8*(expert+1) + n%8);
+            __half2float(((const half *) c.a)[int64_t(r)*c.k]) + 8*(expert+1) + n%8 +
+            (c.zero ? __half2float(*(const half *) c.metadata) + __half2float(*(const half *) c.zero) : 0));
     }
 }
 static int fake_run(void * p, void * stream) {
@@ -84,9 +74,11 @@ static int fake_run(void * p, void * stream) {
     tag_gemm<<<c.m,128,0,(cudaStream_t) stream>>>(c);
     return cudaGetLastError() == cudaSuccess ? 0 : 1;
 }
-static int fake_gemv_query(const qkg_call_v1 *, const qkg_config_v1 *,
+static int fake_gemv_query(const qkg_call_v1 * c, const qkg_config_v1 *,
                          const quactlize_ppu_placed_arrangement_v2 *, qkg_sizes_v1 * s) {
     *s = {};
+    s->sf_plane_bytes = uint64_t(c->experts)*c->n*c->k/32*2;
+    s->units_bytes = 16;
     return 0;
 }
 static __global__ void tag_gemv(qkg_call_v1 c) {
@@ -102,9 +94,20 @@ static int fake_gemv_run(const qkg_call_v1 * c, const qkg_config_v1 *,
     tag_gemv<<<c->rows,128,0,(cudaStream_t) c->stream>>>(*c);
     return cudaGetLastError() == cudaSuccess ? 0 : 1;
 }
+static __global__ void tag_prepass(const float * units, half * scale, half * zero) {
+    *scale = __float2half(*units);
+    *zero = __float2half(2 * *units);
+}
+static int fake_sf_prepare(int, int, int, int, const uint8_t * units, uint64_t,
+                          uint16_t * scale, uint16_t * zero, uint64_t,
+                          const quactlize_ppu_placed_arrangement_v2 *, void * stream) {
+    ++scale_prepares;
+    tag_prepass<<<1,1,0,(cudaStream_t) stream>>>((const float *) units, (half *) scale, (half *) zero);
+    return cudaGetLastError() == cudaSuccess ? 0 : 1;
+}
 const ggml_quactlize_execution_api * test_execution_library() {
     static const ggml_quactlize_execution_api api = {"stub",fake_open,fake_close,fake_query,
-        fake_prepare,fake_run,fake_destroy,fake_error,fake_gemv_query,fake_gemv_run,nullptr};
+        fake_prepare,fake_run,fake_destroy,fake_error,fake_gemv_query,fake_gemv_run,fake_sf_prepare,nullptr};
     return &api;
 }
 
@@ -142,7 +145,7 @@ static void run_case(bool grouped, int tokens, int channels) {
         graph->n_nodes=1; graph->nodes[0]=out;
         test_prepare_graph(ctx,graph);
         test_prepare_graph(ctx,graph);
-        require(prepares==(gemv ? 0 : 1) && queries==prepares && scale_prepares==(sf ? 1 : 0));
+        require(prepares==(gemv ? 0 : 1) && queries==prepares && scale_prepares==0);
         require(gemv_lookups==(gemv ? 1 : 0) && prefill_lookups==(auto_prefill ? 1 : 0));
         cudaGraph_t capture;
         cudaGraphExec_t instance;
@@ -158,6 +161,11 @@ static void run_case(bool grouped, int tokens, int channels) {
             CUDA_CHECK(cudaMemcpyAsync(a->data,input.data(),ggml_nbytes(a),cudaMemcpyHostToDevice,ctx.stream()));
             if (ids) CUDA_CHECK(cudaMemcpyAsync(ids->data,router.data(),ggml_nbytes(ids),cudaMemcpyHostToDevice,ctx.stream()));
             CUDA_CHECK(cudaMemsetAsync(out->data,0xa5,ggml_nbytes(out),ctx.stream()));
+            if (sf) {
+                auto & plan = prepare(ctx,test_weight,a,ids,out);
+                CUDA_CHECK(cudaMemsetAsync(plan.scale,0x7e,plan.sf_plane_bytes,ctx.stream()));
+                CUDA_CHECK(cudaMemsetAsync(plan.zero,0x7e,plan.sf_plane_bytes,ctx.stream()));
+            }
             if (replay%2) require(test_execution_run(ctx,test_weight,a,ids,out));
             else CUDA_CHECK(cudaGraphLaunch(instance,ctx.stream()));
             CUDA_CHECK(cudaMemcpyAsync(output.data(),out->data,ggml_nbytes(out),cudaMemcpyDeviceToHost,ctx.stream()));
@@ -165,12 +173,12 @@ static void run_case(bool grouped, int tokens, int channels) {
             size_t bad=0;
             for (int r=0; r<rows; ++r) for (int col=0; col<n; ++col) {
                 int ar=grouped ? r/topk*channels+r%topk%channels : r;
-                float want=input[size_t(ar)*k]+8*(grouped ? router[r]+1 : 1)+col%8;
+                float want=input[size_t(ar)*k]+8*(grouped ? router[r]+1 : 1)+col%8+(sf ? 3*replay : 0);
                 bad+=output[size_t(r)*n+col]!=want;
             }
             require(bad==0);
         }
-        require(prepares==(gemv ? 0 : 1) && queries==prepares && scale_prepares==(sf ? 1 : 0));
+        require(prepares==(gemv ? 0 : 1) && queries==prepares && scale_prepares==(sf ? 3 : 0));
         require(gemv_lookups==(gemv ? 1 : 0) && prefill_lookups==(auto_prefill ? 1 : 0));
         CUDA_CHECK(cudaGraphExecDestroy(instance));
         CUDA_CHECK(cudaGraphDestroy(capture));

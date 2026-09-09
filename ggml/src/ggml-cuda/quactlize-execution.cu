@@ -52,6 +52,9 @@ struct Plan {
     void * handle = nullptr;
     half * a = nullptr;
     half * out = nullptr;
+    uint16_t * scale = nullptr;
+    uint16_t * zero = nullptr;
+    uint64_t sf_plane_bytes = 0, units_bytes = 0;
     int32_t * ids_src = nullptr;
     int32_t * ids_dst = nullptr;
     int32_t * bounds = nullptr;
@@ -71,6 +74,12 @@ struct Execution {
 
     Execution(const ggml_quactlize_execution_api * api, int device) : api(api), device(device) {
         if (api->open(api->root, &runtime) != QKS_OK) GGML_ABORT("[quactlize] dispatch open: %s", api->error());
+        if (api->enable_jit) {
+            qks_jit_options_v1 options{1, sizeof(options), getenv("QUACTLIZE_KPACK_JIT_PYTHON"),
+                getenv("QUACTLIZE_KPACK_JIT_HELPER"), getenv("PPU_SDK"), getenv("QUACTLIZE_KPACK_JIT_CACHE")};
+            if (api->enable_jit(runtime, &options) != QKS_OK)
+                GGML_ABORT("[quactlize] JIT setup requires absolute PYTHON/HELPER/PPU_SDK/CACHE paths: %s", api->error());
+        }
     }
     ~Execution() {
         ggml_cuda_set_device(device);
@@ -179,9 +188,23 @@ Plan & prepare(ggml_backend_cuda_context & ctx, const ggml_tensor * weight,
         if (mode == RouteMode::Sf || prefill_choice == 1) {
             r.route = ids ? QK_GROUPED_SF : QK_DENSE_SF;
             status = owner.api->query(owner.runtime, &r, &p->choice);
-            if (status == QKS_OK && ggml_quactlize_prepare_scales(weight)) {
+            if (status == QKS_OK) {
+                // Size query only. Values are expanded on the compute stream
+                // before every GEMM; no per-weight scale allocation or event.
+                qkg_call_v1 meta{};
+                meta.version=1; meta.size=sizeof(meta); meta.qtype=art.qtype;
+                meta.n=art.n; meta.k=art.k; meta.experts=art.experts; meta.rows=1;
+                meta.mode=art.experts == 1 ? QKG_DENSE : QKG_GROUPED;
+                meta.input_type=QKG_F16; meta.channels=1; meta.topk=1;
+                meta.a_row_stride=art.k; meta.out_row_stride=art.n;
+                qkg_config_v1 config{1, sizeof(config), 16, 4, 1};
+                qkg_sizes_v1 sizes{};
+                if (owner.api->gemv_query(&meta, &config, &art.arrangement, &sizes) != QKG_OK ||
+                    !sizes.sf_plane_bytes || sizes.sf_plane_bytes > SIZE_MAX / 4)
+                    GGML_ABORT("[quactlize] %s: SF scratch size query failed", weight->name);
                 p->sf = true;
-                GGML_ASSERT(ggml_quactlize_artifact_for(weight, &p->art));
+                p->sf_plane_bytes = sizes.sf_plane_bytes;
+                p->units_bytes = sizes.units_bytes;
             } else if (status != QKS_OK && status != QKS_MISS) {
                 GGML_ABORT("[quactlize] %s: SF selection failed: %s", weight->name, owner.api->error());
             }
@@ -201,9 +224,17 @@ Plan & prepare(ggml_backend_cuda_context & ctx, const ggml_tensor * weight,
             size_t index_bytes = ids ? align256(size_t(p->rows) * sizeof(int32_t)) : 0;
             size_t bound_bytes = ids ? align256(size_t(art.experts + 1) * sizeof(int32_t)) : 0;
             size_t head = a_bytes + out_bytes + 2 * index_bytes + bound_bytes;
+            size_t plane_bytes = align256(p->sf_plane_bytes);
+            GGML_ASSERT(2 * plane_bytes <= SIZE_MAX - head);
+            size_t scale_offset = head;
+            head += 2 * plane_bytes;
             GGML_ASSERT(p->choice.workspace_bytes <= SIZE_MAX - head);
             uint8_t * storage = owner.storage(stream, head + p->choice.workspace_bytes);
             p->a = (half *) storage; p->out = (half *) (storage + a_bytes);
+            if (p->sf) {
+                p->scale = (uint16_t *) (storage + scale_offset);
+                p->zero = (uint16_t *) (storage + scale_offset + plane_bytes);
+            }
             if (ids) {
                 p->ids_src = (int32_t *) (storage + a_bytes + out_bytes);
                 p->ids_dst = (int32_t *) ((uint8_t *) p->ids_src + index_bytes);
@@ -214,8 +245,8 @@ Plan & prepare(ggml_backend_cuda_context & ctx, const ggml_tensor * weight,
             c.group_size = art.arrangement.group_size; c.device = p->choice.device; c.compute_units = p->choice.compute_units;
             GGML_ASSERT(c.device == ctx.device);
             c.mapping_id = art.arrangement.mapping_id; c.a = p->a; c.low = art.low; c.high = art.high;
-            c.metadata = p->sf ? (const void *) p->art.scale : (const void *) art.units;
-            c.zero = p->sf ? p->art.zero : nullptr; c.output = p->out; c.offsets_device = p->bounds;
+            c.metadata = p->sf ? (const void *) p->scale : (const void *) art.units;
+            c.zero = p->zero; c.output = p->out; c.offsets_device = p->bounds;
             c.workspace = storage + head; c.workspace_bytes = p->choice.workspace_bytes; c.stream = stream;
             if (owner.api->prepare(owner.runtime, &p->choice, &c, &p->handle) != QKS_OK)
                 GGML_ABORT("[quactlize] %s: native prepare: %s", weight->name, owner.api->error());
@@ -259,9 +290,10 @@ bool ggml_quactlize_execution_run(ggml_backend_cuda_context & ctx, const ggml_te
     auto & p = prepare(ctx, weight, input, ids, output);
     if (p.legacy) return false;
     cudaStream_t stream = ctx.stream();
-    auto dependency = p.art;
-    if (p.sf) dependency.ready = p.art.scale_ready;
-    ggml_quactlize_wait_ready(dependency, stream);
+    ggml_quactlize_wait_ready(p.art, stream);
+    if (p.sf && p.api->sf_prepare(p.art.qtype, p.art.n, p.art.k, p.art.experts, p.art.units,
+            p.units_bytes, p.scale, p.zero, p.sf_plane_bytes, &p.art.arrangement, stream) != QKG_OK)
+        GGML_ABORT("[quactlize] %s: per-call SF prepass failed", weight->name);
     if (p.direct) {
         if (p.api->gemv_run(&p.gemv, &p.gemv_config, &p.art.arrangement) != QKG_OK)
             GGML_ABORT("[quactlize] %s: GEMV launch failed", weight->name);
