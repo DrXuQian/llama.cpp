@@ -357,7 +357,7 @@ if (GGML_NCP_QUACTLIZE)
             ${PROJECT_SOURCE_DIR}/ggml/include ${PROJECT_SOURCE_DIR}/ggml/src
             ${PROJECT_SOURCE_DIR}/ggml/src/ggml-cuda ${CUDAToolkit_INCLUDE_DIRS})
         target_link_libraries(test-quactlize-execution PRIVATE ggml-base ggml-cuda CUDA::cudart)
-        foreach(route fq sf gemv)
+        foreach(route auto fq sf gemv)
             add_test(NAME test-quactlize-execution-${route} COMMAND $<TARGET_FILE:test-quactlize-execution>)
             set_tests_properties(test-quactlize-execution-${route} PROPERTIES
                 LABELS "device" TIMEOUT 120 SKIP_RETURN_CODE 77
