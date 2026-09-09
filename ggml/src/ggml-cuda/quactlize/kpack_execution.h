@@ -56,9 +56,19 @@ int quactlize_kpack_gemv_query_v1(qkg_call_v1 const *, qkg_config_v1 const *,
 int quactlize_kpack_gemv_run_v1(qkg_call_v1 const *, qkg_config_v1 const *,
     quactlize_ppu_placed_arrangement_v2 const *);
 
+// Explicit experimental reader, never selected by the v1 entry above.
+// Same call/output/format ABI. Columns=16/32, warps=2/4/8, split=1/2/4/8.
+// Pair affine uses FP16 FMA (one rounding), not the scalar two-rounding
+// oracle. Both accumulate in FP32; independent numerical admission is needed.
+int quactlize_kpack_gemv_pair_query_v1(qkg_call_v1 const *, qkg_config_v1 const *,
+    quactlize_ppu_placed_arrangement_v2 const *, qkg_sizes_v1 *);
+int quactlize_kpack_gemv_pair_run_v1(qkg_call_v1 const *, qkg_config_v1 const *,
+    quactlize_ppu_placed_arrangement_v2 const *);
+
 // Output planes are [E,K/group_size,N], FP16, independently 16-byte aligned.
-// Prepare once per immutable weight, not once per prefill/token. The caller
-// owns allocation, readiness events and lifetime; this API only enqueues.
+// Enqueue before EACH ScaleFirst GEMM on its stream (including graph replay).
+// Reuse scratch allocation, not expanded values across calls. The caller owns
+// allocation and lifetime; this API only enqueues and performs no host wait.
 int quactlize_kpack_sf_prepare_v1(int qtype, int n, int k, int experts,
     uint8_t const * units, uint64_t units_bytes,
     uint16_t * scale, uint16_t * zero, uint64_t plane_bytes,

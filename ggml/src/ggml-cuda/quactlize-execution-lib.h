@@ -14,6 +14,7 @@ struct ggml_quactlize_execution_api {
     decltype(&quactlize_kpack_gemv_query_v1) gemv_query;
     decltype(&quactlize_kpack_gemv_run_v1) gemv_run;
     decltype(&quactlize_kpack_sf_prepare_v1) sf_prepare;
+    decltype(&quactlize_kpack_dispatch_enable_jit_v1) enable_jit;
 };
 
 // QUACTLIZE_KPACK_EXECUTION names the complete native package. An explicit
@@ -22,6 +23,6 @@ const ggml_quactlize_execution_api * ggml_quactlize_execution_library();
 // Exact measured GEMV-pool choice, loaded once from QUACTLIZE_KPACK_GEMV_POLICY.
 // Missing shapes decline; they do not inherit an arbitrary launch recipe.
 bool ggml_quactlize_gemv_config(const qkg_call_v1 & call, qkg_config_v1 * config);
-// Exact FQ/SF comparison: -1 missing, 0 FQ, 1 resident SF. Unknown contexts
+// Exact FQ/SF comparison: -1 missing, 0 FQ, 1 per-call prepass + SF. Unknown contexts
 // retain selected FQ; they do not infer an SF win from token count alone.
 int ggml_quactlize_prefill_route(const qks_request_v1 & request);

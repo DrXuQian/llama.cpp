@@ -1,7 +1,6 @@
 // Execute the production buffer against delayed host queues, not a PPU oracle.
 #include "common.cuh"
 #include "quactlize-lib.h"
-#include "quactlize-execution-lib.h"
 #include <functional>
 #include <map>
 #include <set>
@@ -23,8 +22,6 @@ static bool plant_copy_wait = false;
 static bool plant_upload_wait = false, plant_upload_reuse = false, testing_upload = false;
 static int host_waits = 0, copies = 0, pack_calls = 0, stream_waits = 0;
 static int upload_submissions = 0;
-static int scale_prepasses = 0;
-static bool memory_full = false;
 
 static test_stream * ts(cudaStream_t stream) { return (test_stream *) stream; }
 static test_event * te(cudaEvent_t event) { return (test_event *) event; }
@@ -80,11 +77,6 @@ static cudaError_t test_stream_capture_status(cudaStream_t stream, cudaStreamCap
 static cudaError_t test_event_create(cudaEvent_t * out, unsigned flags) {
     require(flags == cudaEventDisableTiming || flags == 0);
     *out = (cudaEvent_t) new test_event;
-    return cudaSuccess;
-}
-static cudaError_t test_elapsed(float * ms, cudaEvent_t begin, cudaEvent_t end) {
-    require(te(begin)->stream == te(end)->stream && te(end)->stream->cursor >= te(end)->end);
-    *ms = 0.001f;
     return cudaSuccess;
 }
 static cudaError_t test_event_record(cudaEvent_t event, cudaStream_t stream) {
@@ -146,38 +138,6 @@ static cudaError_t test_memset(void * ptr, int value, size_t bytes) {
     return cudaSuccess;
 }
 static cudaError_t test_last_error() { return cudaSuccess; }
-static cudaError_t test_memory(size_t * free_bytes, size_t * total_bytes) {
-    *total_bytes = size_t(32) << 30;
-    *free_bytes = memory_full ? size_t(1) << 20 : size_t(16) << 30;
-    return cudaSuccess;
-}
-
-static int test_gemv_sizes(const qkg_call_v1 * c, const qkg_config_v1 *,
-                          const quactlize_ppu_placed_arrangement_v2 * a, qkg_sizes_v1 * out) {
-    *out = {};
-    out->sf_plane_bytes = uint64_t(c->experts) * c->n * c->k / a->group_size * 2;
-    out->units_bytes = ggml_quactlize_units_bytes(c->qtype, c->n, c->k) * c->experts;
-    return 0;
-}
-static int test_sf_prepare(int, int, int, int, const uint8_t * units, uint64_t,
-                          uint16_t * scale, uint16_t * zero, uint64_t bytes,
-                          const quactlize_ppu_placed_arrangement_v2 *, void * stream) {
-    require(units && scale && zero && bytes);
-    ++scale_prepasses;
-    ts((cudaStream_t) stream)->work.push_back([=]() {
-        for (size_t i = 0; i < bytes / 2; ++i) { scale[i] = 0x3c00; zero[i] = 0; }
-    });
-    return 0;
-}
-static const ggml_quactlize_execution_api * test_execution_library() {
-    static const auto api = [] {
-        ggml_quactlize_execution_api a{};
-        a.gemv_query = test_gemv_sizes;
-        a.sf_prepare = test_sf_prepare;
-        return a;
-    }();
-    return &api;
-}
 
 static int test_prepare(int qtype, const uint8_t * raw, uint8_t * low, uint8_t * high, uint8_t * units,
                         int n, int k, int experts, const quactlize_ppu_placed_arrangement_v2 * arr, void * stream) {
@@ -212,14 +172,11 @@ static int test_prepare(int qtype, const uint8_t * raw, uint8_t * low, uint8_t *
 #define cudaEventRecord test_event_record
 #define cudaEventSynchronize test_event_sync
 #define cudaEventDestroy test_event_destroy
-#define cudaEventElapsedTime test_elapsed
 #define cudaStreamWaitEvent test_wait
 #define cudaMemcpyAsync test_copy
 #define cudaPointerGetAttributes test_attributes
 #define cudaMemset test_memset
 #define cudaGetLastError test_last_error
-#define cudaMemGetInfo test_memory
-#define ggml_quactlize_execution_library test_execution_library
 #define ggml_quactlize_prepare_device test_prepare
 #include "../ggml/src/ggml-cuda/quactlize-buft.cu"
 
@@ -276,25 +233,6 @@ static void run_case(int qtype, int experts) {
     CUDA_CHECK(cudaStreamSynchronize(compute));
     require(copies == copied);
 
-    // ScaleFirst publishes a separate ready event once. Its GPU work and
-    // compute must remain independent of the deliberately pending backcopy.
-    const int prior_scales = scale_prepasses;
-    const int scale_waits = host_waits;
-    memory_full = true;
-    require(!ggml_quactlize_prepare_scales(weight));
-    require(scale_prepasses == prior_scales);
-    memory_full = false;
-    require(ggml_quactlize_prepare_scales(weight));
-    require(ggml_quactlize_prepare_scales(weight));
-    require(scale_prepasses == prior_scales + 1 && host_waits == scale_waits);
-    ggml_quactlize_artifact sf;
-    require(ggml_quactlize_artifact_for(weight, &sf));
-    require(sf.scale && sf.zero && sf.scale_ready && sf.scale_ready != sf.ready);
-    sf.ready = sf.scale_ready;
-    ggml_quactlize_wait_ready(sf, compute);
-    require(host_waits == scale_waits && copies == copied);
-    CUDA_CHECK(cudaStreamSynchronize(compute));
-    require(sf.scale[0] == 0x3c00 && sf.zero[0] == 0 && copies == copied);
 
     const size_t raw_e = bytes / experts;
     const size_t low_e = (size_t) (art.high ? art.high - art.low : art.units - art.low) / experts;

@@ -1,7 +1,6 @@
 // The K-pack extra buffer type. See quactlize-buft.cuh for why this is a buffer type and not a cache.
 
 #include "quactlize-buft.cuh"
-#include "quactlize-execution-lib.h"
 
 #include "ggml-backend-impl.h"
 
@@ -10,7 +9,6 @@
 #include <cstdlib>
 #include <cstring>
 #include <map>
-#include <mutex>
 #include <vector>
 
 #ifdef GGML_NCP_QUACTLIZE
@@ -54,13 +52,6 @@ struct qz_upload_slot {
     bool pending = false;
 };
 
-struct qz_scale_timing {
-    std::string name;
-    int qtype;
-    int64_t n, k, experts;
-    cudaEvent_t begin, end;
-};
-
 struct qz_buffer_context {
     int    device;
     void * dev_ptr;
@@ -74,9 +65,6 @@ struct qz_buffer_context {
     std::vector<void *> scratch_allocations;
     std::array<qz_upload_slot, 2> upload_slots;
     unsigned upload_slot = 0;
-    std::mutex scale_mutex;
-    std::vector<void *> scale_allocations;
-    std::vector<qz_scale_timing> scale_timings;
 };
 
 static void qz_init_streams(qz_buffer_context * ctx) {
@@ -87,9 +75,9 @@ static void qz_init_streams(qz_buffer_context * ctx) {
     }
 }
 
-static cudaEvent_t qz_record_ready(qz_buffer_context * ctx, bool timing = false) {
+static cudaEvent_t qz_record_ready(qz_buffer_context * ctx) {
     cudaEvent_t event;
-    CUDA_CHECK(cudaEventCreateWithFlags(&event, timing ? 0 : cudaEventDisableTiming));
+    CUDA_CHECK(cudaEventCreateWithFlags(&event, cudaEventDisableTiming));
     CUDA_CHECK(cudaEventRecord(event, ctx->pack_stream));
     ctx->ready_events.push_back(event);
     return event;
@@ -104,21 +92,11 @@ static void qz_buffer_free_buffer(ggml_backend_buffer_t buffer) {
             CUDA_CHECK(cudaStreamSynchronize(ctx->pack_stream));
             CUDA_CHECK(cudaStreamSynchronize(ctx->copy_stream));
         }
-        for (const auto & timing : ctx->scale_timings) {
-            float ms = 0;
-            CUDA_CHECK(cudaEventElapsedTime(&ms, timing.begin, timing.end));
-            GGML_LOG_INFO("[quactlize-prepass] tensor=%s q=%d n=%" PRId64 " k=%" PRId64
-                " experts=%" PRId64 " gpu_us=%.3f scope=GPU_KERNEL_INTERVAL once=1\n",
-                timing.name.c_str(), timing.qtype, timing.n, timing.k, timing.experts, ms * 1000.0);
-        }
         for (cudaEvent_t event : ctx->ready_events) {
             CUDA_CHECK(cudaEventDestroy(event));
         }
         for (void * scratch : ctx->scratch_allocations) {
             CUDA_CHECK(cudaFree(scratch));
-        }
-        for (void * scales : ctx->scale_allocations) {
-            CUDA_CHECK(cudaFree(scales));
         }
         for (auto & slot : ctx->upload_slots) {
             if (slot.reusable) { CUDA_CHECK(cudaEventDestroy(slot.reusable)); }
@@ -540,7 +518,6 @@ bool ggml_quactlize_artifact_for(const ggml_tensor * tensor, ggml_quactlize_arti
         return false;
     }
     qz_buffer_context * ctx = (qz_buffer_context *) tensor->buffer->context;
-    std::lock_guard<std::mutex> lock(ctx->scale_mutex);
     auto it = ctx->artifacts.find(tensor);
     if (it == ctx->artifacts.end()) {
         return false;   // in a K-pack buffer but never converted -- must not be read as K-pack
@@ -549,52 +526,6 @@ bool ggml_quactlize_artifact_for(const ggml_tensor * tensor, ggml_quactlize_arti
     return true;
 }
 
-bool ggml_quactlize_prepare_scales(const ggml_tensor * tensor) {
-    const auto * api = ggml_quactlize_execution_library();
-    if (!api || !ggml_quactlize_tensor_is_kpack(tensor)) { return false; }
-    auto * ctx = (qz_buffer_context *) tensor->buffer->context;
-    std::lock_guard<std::mutex> lock(ctx->scale_mutex);
-    auto it = ctx->artifacts.find(tensor);
-    if (it == ctx->artifacts.end()) { return false; }
-    auto & art = it->second;
-    if (art.scale_ready) { return true; }
-    ggml_cuda_set_device(ctx->device);
-    qkg_call_v1 c{};
-    c.version = 1; c.size = sizeof(c); c.qtype = art.qtype;
-    c.n = art.n; c.k = art.k; c.experts = art.experts; c.rows = 1;
-    c.mode = art.experts == 1 ? QKG_DENSE : QKG_GROUPED;
-    c.input_type = QKG_F16; c.channels = 1; c.topk = 1;
-    c.a_row_stride = art.k; c.out_row_stride = art.n;
-    const qkg_config_v1 config{1, sizeof(config), 16, 4, 1};
-    qkg_sizes_v1 sizes{};
-    if (api->gemv_query(&c, &config, &art.arrangement, &sizes) != QKG_OK) { return false; }
-    if (sizes.sf_plane_bytes > SIZE_MAX / 2) { return false; }
-    const size_t bytes = 2 * sizes.sf_plane_bytes;
-    size_t free_bytes = 0, total_bytes = 0;
-    CUDA_CHECK(cudaMemGetInfo(&free_bytes, &total_bytes));
-    const size_t reserve = std::max(size_t(512) << 20, total_bytes / 10);
-    if (free_bytes < reserve || bytes > free_bytes - reserve) {
-        GGML_LOG_DEBUG("[quactlize] %s: SF metadata does not fit reserve; retain FQ\n", tensor->name);
-        return false;
-    }
-    void * allocation = nullptr;
-    const auto alloc_rc = cudaMalloc(&allocation, bytes);
-    if (alloc_rc == cudaErrorMemoryAllocation) { cudaGetLastError(); return false; }
-    CUDA_CHECK(alloc_rc);
-    auto * scale = (uint16_t *) allocation;
-    auto * zero = (uint16_t *) ((uint8_t *) allocation + sizes.sf_plane_bytes);
-    ctx->scale_allocations.push_back(allocation);
-    // pack_stream owns both the immutable units and this one-time prepass.
-    // It never waits for copy_stream or the CPU persistence worker.
-    const cudaEvent_t begin = qz_record_ready(ctx, true);
-    const int rc = api->sf_prepare(art.qtype, art.n, art.k, art.experts, art.units,
-        sizes.units_bytes, scale, zero, sizes.sf_plane_bytes, &art.arrangement, ctx->pack_stream);
-    if (rc != QKG_OK) { GGML_ABORT("[quactlize] %s: scale prepass failed rc=%d", tensor->name, rc); }
-    art.scale = scale; art.zero = zero; art.scale_ready = qz_record_ready(ctx, true);
-    ctx->scale_timings.push_back({tensor->name, art.qtype, art.n, art.k, art.experts, begin, art.scale_ready});
-    GGML_LOG_DEBUG("[quactlize] %s: SF prepass queued once, %.2f MiB\n", tensor->name, bytes / 1048576.0);
-    return true;
-}
 
 bool ggml_quactlize_node_reads_artifact(const ggml_tensor * node) {
     if (node == nullptr) {
@@ -611,10 +542,6 @@ bool ggml_quactlize_node_reads_artifact(const ggml_tensor * node) {
 
 #else  // quactlize off
 
-bool ggml_quactlize_prepare_scales(const ggml_tensor * tensor) {
-    GGML_UNUSED(tensor);
-    return false;
-}
 
 ggml_backend_buffer_type_t ggml_backend_cuda_quactlize_buffer_type(int device) {
     GGML_UNUSED(device);
