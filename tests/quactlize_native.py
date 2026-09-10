@@ -2,6 +2,7 @@
 """Single-request real-model ABBA timings with native selection receipts."""
 
 import argparse
+import copy
 import hashlib
 import json
 import math
@@ -109,7 +110,77 @@ def selection(text, manifest):
     )
 
 
-def run_arm(args, index, arm, tokens):
+def model_selection(args, text):
+    keys = set()
+    for line in text.splitlines():
+        if "[quactlize-plan]" in line:
+            keys.update(re.findall(r"\bbuild=([^\s]+)", line))
+    require(all(re.fullmatch(r"[0-9a-f]{64}", k) for k in keys), "invalid selected build key")
+    packaged = {m["key"]: m for m in args.manifest["modules"]}
+    require(len(packaged) == len(args.manifest["modules"]), "duplicate package build key")
+    modules = []
+    for key in sorted(keys & packaged.keys()):
+        m = packaged[key]
+        relative = "modules/" + key + "/kernel.so"
+        library = (args.bundle / relative).resolve(strict=True)
+        require(m["path"] == relative and library.is_relative_to(args.bundle.resolve()),
+                "selected package module escapes bundle")
+        modules.append(m | dict(path=str(library), origin="package"))
+    missing = keys - packaged.keys()
+    if missing:
+        require(args.jit_cache and args.jit_helper and args.jit_python,
+                "selected parent/build absent from package and no JIT resolver configured")
+        output = subprocess.check_output([
+            str(args.jit_python), str(args.jit_helper), "inspect", "--cache", str(args.jit_cache),
+            "--source-contract", args.manifest["jit_source_contract"], "--keys", *sorted(missing),
+        ], text=True)
+        cached = json.loads(output)["modules"]
+        require(len(cached) == len(missing) and {m["key"] for m in cached} == missing,
+                "cache inspection omitted or duplicated selected modules")
+        for m in cached:
+            path = (args.jit_cache / m["key"] / "kernel.so").resolve(strict=True)
+            require(path == Path(m["path"]) and path.parent.parent == args.jit_cache.resolve(),
+                    "selected JIT module escapes cache")
+        modules.extend(m | dict(origin="jit-cache") for m in cached)
+    for m in modules:
+        with Path(m["path"]).open("rb") as stream:
+            require(hashlib.file_digest(stream, "sha256").hexdigest() == m["sha256"],
+                    "selected module payload changed")
+    evidence = selection(text, dict(modules=modules))
+    evidence["modules"] = modules
+    return evidence
+
+
+class AsysSession:
+    """Collect one completed request after the same process has warmed up."""
+    def __init__(self, executable, output):
+        self.executable = executable
+        self.session = "kpack-proof-" + secrets.token_hex(8)
+        self.report = output / "proof.asysrep"
+        self.log = output / "proof-control.log"
+
+    def command(self, application):
+        return [str(self.executable), "launch", "--trace", "hggc", "--hggc-trace-set", "kernel-activity",
+                "--sample", "none", "--wait", "primary", "--kill", "sigterm", "--show-output", "true",
+                "--session-new", self.session, *application]
+
+    def control(self, action, *options, check=True):
+        with self.log.open("a") as log:
+            subprocess.run([str(self.executable), action, "--session", self.session, *options],
+                           stdout=log, stderr=subprocess.STDOUT, timeout=60, check=check)
+
+    def start(self):
+        self.control("start", "--output", str(self.report))
+
+    def stop(self):
+        self.control("stop")
+
+    def close(self):
+        # Only this uniquely named session; never stop another user's capture.
+        self.control("shutdown", check=False)
+
+
+def run_arm(args, index, arm, tokens, profile=None):
     label = f"{index}-{arm}"
     log_path = args.output / (label + ".log")
     command = server_args(
@@ -146,6 +217,9 @@ def run_arm(args, index, arm, tokens):
         "--api-key",
         key,
     ]
+    if profile:
+        require(len(args.prompts) == 1 and args.repeats == 1, "trace needs one warmup and one captured request")
+        command = profile.command(command)
     save(args.output / (label + ".command.json"), command[:-1] + ["<ephemeral-key>"])
     base = f"http://127.0.0.1:{port}"
     records = []
@@ -227,6 +301,8 @@ def run_arm(args, index, arm, tokens):
                             tokens[str(n)], 20260909, args.generate
                         )
                         payload["ignore_eos"] = True
+                        if profile and repeat == 1:
+                            profile.start()
                         tick = time.monotonic()
                         response = request(
                             base + "/completion", key, payload, timeout=600
@@ -245,10 +321,13 @@ def run_arm(args, index, arm, tokens):
                         records.append(rec)
                         print(
                             f"KPACK_MODEL_PERF arm={label} prompt={n} repeat={repeat} "
+                            f"phase={rec['phase']} included={int(repeat > 0 and profile is None)} "
                             f"prefill_us_per_token={rec['timings']['prefill_us_per_token']:.3f} "
                             f"decode_us_per_token={rec['timings']['decode_us_per_token']:.3f}",
                             flush=True,
                         )
+                        if profile and repeat == 1:
+                            profile.stop()
         except (ValueError, OSError) as error:
             status = proc.poll()
             save(
@@ -265,6 +344,8 @@ def run_arm(args, index, arm, tokens):
                 f"{label} phase={phase}: {error}; server_rc={status}; log={log_path}"
             ) from error
         finally:
+            if profile:
+                profile.close()
             if proc.poll() is None:
                 proc.terminate()
                 try:
@@ -283,7 +364,7 @@ def run_arm(args, index, arm, tokens):
     text = log_path.read_text(errors="replace")
     if arm == "native":
         require("CUDA0_KPACK model buffer size" in text, "no K-pack placement")
-        evidence = selection(text, args.manifest)
+        evidence = model_selection(args, text)
         require(evidence["plans"], "no native dispatch receipts")
     else:
         require(
@@ -312,6 +393,9 @@ def summarize(arms, prompts, repeats):
         "ABBA process denominator differs",
     )
     for n in prompts:
+        for a in arms:
+            require(sum(r["prompt"] == n and r["phase"] == "first-use" for r in a["records"]) == 1,
+                    "each process/shape needs exactly one excluded first-use request")
         groups = {}
         hashes = set()
         for arm in ("reference", "native"):
@@ -352,66 +436,14 @@ def summarize(arms, prompts, repeats):
 
 
 def proof(args):
-    log = args.output / "proof.log"
     report = args.output / "proof.asysrep"
     db = args.output / "proof.sqlite"
-    command = [
-        str(args.asys),
-        "profile",
-        "--trace",
-        "hggc",
-        "--hggc-trace-set",
-        "kernel-activity",
-        "--sample",
-        "none",
-        "--kill",
-        "none",
-        "--show-output",
-        "true",
-        "--output",
-        str(report),
-        str(args.proof_binary),
-        "-m",
-        str(args.model),
-        "--mmap",
-        "-ngl",
-        "99",
-        "--split-mode",
-        "none",
-        "--fit",
-        "off",
-        "--no-conversation",
-        "--no-warmup",
-        "--log-colors",
-        "off",
-        "--verbosity",
-        "4",
-        "-c",
-        "512",
-        "-b",
-        "128",
-        "-ub",
-        "128",
-        "-ot",
-        PATTERN + "=CUDA0_KPACK",
-        "--kpack-cache",
-        str(args.cache),
-        "-n",
-        "8",
-        "--temp",
-        "0",
-        "-p",
-        "Explain matrix multiplication in one paragraph. " * 16,
-    ]
-    with log.open("x") as f:
-        subprocess.run(
-            command,
-            stdin=subprocess.DEVNULL,
-            stdout=f,
-            stderr=subprocess.STDOUT,
-            check=True,
-            timeout=900,
-        )
+    capture = copy.copy(args)
+    capture.output = args.output / "proof-request"
+    capture.output.mkdir()
+    capture.context, capture.batch, capture.generate = 512, 128, 8
+    capture.prompts, capture.repeats = [128], 1
+    proof_arm, _ = run_arm(capture, 0, "native", None, profile=AsysSession(args.asys, args.output))
     with (args.output / "proof-export.log").open("x") as f:
         subprocess.run(
             [str(args.asys), "export", "--output", str(db), str(report)],
@@ -419,13 +451,12 @@ def proof(args):
             stderr=subprocess.STDOUT,
             check=True,
         )
-    plans = selection(log.read_text(errors="replace"), args.manifest)
-    keys = {r["build"] for r in plans["plans"] if "build" in r}
-    libraries = [args.bundle / "modules" / k / "kernel.so" for k in sorted(keys)] + [
-        args.bundle / "libquactlize_ppu_execution.so"
-    ]
+    plans = proof_arm["selection"]
+    libraries = [(Path(m["path"]), m["origin"] + "/" + m["key"], m["key"])
+                 for m in plans["modules"]]
+    libraries.append((args.bundle / "libquactlize_ppu_execution.so", "execution", None))
     symbols = {}
-    for library in libraries:
+    for library, label, build in libraries:
         listing = subprocess.check_output(
             [str(args.inspector), "--list-elf", str(library)], text=True
         )
@@ -442,12 +473,12 @@ def proof(args):
                 item = symbols.setdefault(
                     name, dict(name=demangled, libraries=[], ops=[])
                 )
-                item["libraries"].append(str(library.relative_to(args.bundle)))
-                if library.name == "kernel.so":
+                item["libraries"].append(label)
+                if build:
                     ops = {
                         r["op"]
                         for r in plans["plans"]
-                        if r.get("build") == library.parent.name
+                        if r.get("build") == build
                     }
                 else:
                     q = re.search(r"kpack_q(\d+)::", demangled)
@@ -460,19 +491,17 @@ def proof(args):
     total, matched = activity(db, symbols)
     require(matched, "no selected native compute kernel in PPU device trace")
     ops = {op for m in matched for op in symbols[m["mangled"]]["ops"]}
-    require(
-        ops == {"dense", "grouped"},
-        "short proof lacks dense/grouped native compute activity: " + str(ops),
-    )
     # A proof covers its own short request. It is not counted as an untraced
     # performance sample or as device evidence for every ABBA parent.
     result = dict(
-        kernel_execution="PASS_SHORT_REQUEST",
+        kernel_execution="PASS_SHORT_REQUEST" if ops == {"dense", "grouped"} else "PARTIAL_SHORT_REQUEST",
         gpu_kernel_calls=total,
         matched=matched,
         observed_ops=sorted(ops),
+        missing_ops=sorted({"dense", "grouped"} - ops),
         selection=plans,
         timing_scope="PROFILER_ONLY_NOT_PERFORMANCE",
+        capture_scope="SECOND_REQUEST_SAME_PROCESS_FIRST_USE_EXCLUDED",
         all_abba_parents_traced=False,
     )
     save(args.output / "proof.json", result)
@@ -483,7 +512,6 @@ def main():
     p = argparse.ArgumentParser(description=__doc__)
     for name in (
         "binary",
-        "proof-binary",
         "model",
         "cache",
         "bundle",
@@ -497,6 +525,9 @@ def main():
     p.add_argument("--generate", type=int, default=128)
     p.add_argument("--prompts", type=int, nargs="+", default=[128, 512])
     p.add_argument("--repeats", type=int, default=3)
+    p.add_argument("--jit-cache", type=Path)
+    p.add_argument("--jit-helper", type=Path)
+    p.add_argument("--jit-python", type=Path)
     a = p.parse_args()
     require(
         a.repeats >= 2
@@ -507,6 +538,12 @@ def main():
     )
     a.output.mkdir(parents=True, exist_ok=False)
     a.manifest = json.loads((a.bundle / "manifest.json").read_text())
+    if a.manifest.get("jit_required"):
+        for name, value in (("EXECUTION", a.bundle), ("JIT_CACHE", a.jit_cache),
+                            ("JIT_HELPER", a.jit_helper), ("JIT_PYTHON", a.jit_python)):
+            configured = os.environ.get("QUACTLIZE_KPACK_" + name)
+            require(value and configured and Path(configured).resolve() == value.resolve(),
+                    "model/JIT evidence environment differs: " + name)
     save(
         a.output / "protocol.json",
         dict(
@@ -521,6 +558,10 @@ def main():
             dense_scope="Q6 output.weight; Q8_0 remains ordinary GPU",
             tensor_override_pattern=PATTERN,
             first_use_excluded_from_steady=True,
+            first_use_scope="EACH_PROCESS_AND_PROMPT_SHAPE",
+            asys_scope="SECOND_REQUEST_SAME_PROCESS_FIRST_USE_EXCLUDED",
+            jit_cache=str(a.jit_cache) if a.jit_cache else None,
+            module_evidence="SELECTED_PAYLOAD_HASH_AND_SOURCE_BOUND_CACHE_RECEIPT",
         ),
     )
     arms = []
@@ -540,9 +581,13 @@ def main():
     )
     save(a.output / "summary.json", summary)
     proof_result = proof(a)
-    summary.update(status="COMPLETE", kernel_execution=proof_result["kernel_execution"])
+    complete = summary["fully_selected"] and proof_result["kernel_execution"] == "PASS_SHORT_REQUEST"
+    summary.update(status="COMPLETE" if complete else "INCOMPLETE_NATIVE_COVERAGE",
+                   kernel_execution=proof_result["kernel_execution"],
+                   missing_native_ops=proof_result["missing_ops"])
     save(a.output / "summary.json", summary)
     print("KPACK_MODEL_SUMMARY " + json.dumps(summary, sort_keys=True), flush=True)
+    require(complete, "native coverage incomplete; timings, fallbacks and partial trace are preserved")
 
 
 if __name__ == "__main__":
