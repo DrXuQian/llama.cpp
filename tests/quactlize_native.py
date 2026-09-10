@@ -262,7 +262,9 @@ def run_arm(args, index, arm, tokens, profile=None):
                 try:
                     if request(base + "/health", key, timeout=1).get("status") == "ok":
                         break
-                except (URLError, TimeoutError, ValueError):
+                # Readiness probes may reset while the server starts listening.
+                # Retrying stays inside the process/deadline checks, not inference.
+                except (URLError, TimeoutError, ConnectionError, ValueError):
                     pass
                 if time.monotonic() - update > 15:
                     print(
