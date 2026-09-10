@@ -354,22 +354,27 @@ def run_arm(args, index, arm, tokens, profile=None):
                 f"{label} phase={phase}: {error}; server_rc={status}; log={log_path}"
             ) from error
         finally:
-            if profile:
-                profile.close()
-            if proc.poll() is None:
-                proc.terminate()
-                try:
-                    proc.wait(timeout=60)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
-                    proc.wait()
-                    raise ValueError(
-                        f"{label} shutdown exceeded 60 seconds; logs preserved"
-                    )
-            save(
-                args.output / (label + ".process.json"),
-                dict(returncode=proc.returncode),
-            )
+            try:
+                if profile:
+                    # Session shutdown already signals the application. A second
+                    # signal through the launcher interrupts graceful teardown.
+                    profile.close()
+                elif proc.poll() is None:
+                    proc.terminate()
+                if proc.poll() is None:
+                    try:
+                        proc.wait(timeout=60)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                        proc.wait()
+                        raise ValueError(
+                            f"{label} shutdown exceeded 60 seconds; logs preserved"
+                        )
+            finally:
+                save(
+                    args.output / (label + ".process.json"),
+                    dict(returncode=proc.returncode),
+                )
     require(proc.returncode in (0, -15), f"{label} failed rc={proc.returncode}")
     text = log_path.read_text(errors="replace")
     if arm == "native":
