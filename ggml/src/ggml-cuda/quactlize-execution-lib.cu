@@ -73,7 +73,7 @@ bool ggml_quactlize_gemv_config(const qkg_call_v1 & call, qkg_config_v1 * config
             int q,n,k,e,mode,rows,channels,topk,type,columns,warps,split;
             std::string extra;
             if (!(row >> q >> n >> k >> e >> mode >> rows >> channels >> topk >> type >> columns >> warps >> split) ||
-                (row >> extra) || q < 10 || q > 14 || n <= 0 || k <= 0 || e <= 0 || rows <= 0 ||
+                (row >> extra) || (q != 8 && (q < 10 || q > 14)) || n <= 0 || k <= 0 || e <= 0 || rows <= 0 ||
                 channels <= 0 || topk <= 0 || type != QKG_F32 || mode < 0 || mode > 2 ||
                 (columns != 16 && columns != 32) || (warps != 4 && warps != 8) || (split != 1 && split != 4))
                 GGML_ABORT("[quactlize] malformed GEMV policy row: %s", path);

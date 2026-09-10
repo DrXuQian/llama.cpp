@@ -22,6 +22,9 @@ enum { QKG_F16 = 0, QKG_F32 = 1 };
 // Device IDs/bounds are caller-validated inputs, never read back by the API.
 // All weight planes have contiguous, same-index expert slices. high=NULL
 // is required when high_bits=0. The offline arrangement is unchanged.
+// Q8_0 uses its canonical K-pack2 low plane and original FP16 d as units;
+// input F32 is rounded to FP16 in registers, without an activation prepass.
+// Q8 weights are dequantized to FP16 and accumulated into F32 output.
 typedef struct {
     uint32_t version, size;
     int32_t qtype, n, k, experts, rows, mode, input_type, channels, topk;

@@ -58,10 +58,17 @@ int quactlize_kpack_dispatch_run_v1(void* handle, void* stream);
 // Optional, once-per-handle adapter binding, outside capture. A miss leaves
 // the handle unchanged and requires the unfused caller's preparation path.
 int quactlize_kpack_dispatch_bind_llama_indexed_v1(void*,qk_llama_indexed_v1 const*);
-// Small indexed MoE chain. NULL up selects a merged gate/up weight.
-// Handles and disjoint scratch must outlive the chain and device completion.
+// Exact small-decode composition: shared preparation -> gate/up -> ordered
+// FP16 completion + SwiGLU -> down -> ordered reduction/scatter. Passing NULL
+// for up means gate is already merged [E,2N,K], gate first within each expert.
+// Handles must be indexed-bound, with DISJOINT scratch and the same ID input.
+// Create outside capture; retain handles/buffers until chain destruction and
+// device completion. Run has no allocation, tuning, host read or device wait.
+// SF expansion, if needed, is caller-owned and precedes this chain each time.
 int quactlize_kpack_dispatch_moe_create_v1(void* gate,void* up,void* down,void** chain);
 int quactlize_kpack_dispatch_moe_run_v1(void* chain,void* stream);
+// Same chain, but router+preparation are one kernel. The caller must match the
+// complete top-k graph, preserve weights/IDs as outputs and prove input ready.
 int quactlize_kpack_dispatch_moe_run_router_v1(void* chain,qk_llama_router_v1 const*,void* stream);
 void quactlize_kpack_dispatch_moe_destroy_v1(void* chain);
 // Finish all work using a handle before closing it. Runtime and module

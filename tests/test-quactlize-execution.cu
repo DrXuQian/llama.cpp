@@ -18,6 +18,7 @@ static ggml_tensor * test_weight;
 static ggml_quactlize_artifact test_art;
 static int prepares, queries, scale_prepares;
 static int gemv_lookups, prefill_lookups, expected_route;
+static bool measured_gemv;
 
 static void require(bool value) {
     if (!value) GGML_ABORT("KPACK_ADAPTER_DEVICE invariant failed");
@@ -30,7 +31,7 @@ bool test_artifact_for(const ggml_tensor * t, ggml_quactlize_artifact * out) {
 bool test_gemv_config(const qkg_call_v1 &, qkg_config_v1 * out) {
     ++gemv_lookups;
     *out = {1,sizeof(*out),32,4,1};
-    return true;
+    return measured_gemv;
 }
 int test_prefill_route(const qks_request_v1 &) {
     ++prefill_lookups;
@@ -111,16 +112,19 @@ const ggml_quactlize_execution_api * test_execution_library() {
     return &api;
 }
 
-static void run_case(bool grouped, int tokens, int channels) {
+static void run_case(bool grouped, int tokens, int channels, bool recipe=false, bool q8=false) {
     constexpr int k=512, n=256, experts=4;
     const int topk=grouped ? 2 : 1, rows=tokens*topk;
-    const bool gemv = !strcmp(getenv("QUACTLIZE_KPACK_ROUTE"),"gemv");
-    const bool auto_prefill = !strcmp(getenv("QUACTLIZE_KPACK_ROUTE"),"auto") && tokens > 1;
-    const bool sf = !strcmp(getenv("QUACTLIZE_KPACK_ROUTE"),"sf") || auto_prefill;
+    const bool automatic = !strcmp(getenv("QUACTLIZE_KPACK_ROUTE"),"auto");
+    const bool forced_gemv = !strcmp(getenv("QUACTLIZE_KPACK_ROUTE"),"gemv");
+    measured_gemv=forced_gemv || recipe;
+    const bool gemv = forced_gemv || (automatic && recipe);
+    const bool auto_prefill = automatic && !gemv && tokens > 1;
+    const bool sf = !gemv && (!strcmp(getenv("QUACTLIZE_KPACK_ROUTE"),"sf") || auto_prefill);
     expected_route = grouped ? (sf ? QK_GROUPED_SF : QK_GROUPED_FQ) : (sf ? QK_DENSE_SF : QK_DENSE_FQ);
     ggml_context * tensors = ggml_init({1<<20,nullptr,true});
     require(tensors);
-    test_weight = ggml_new_tensor_3d(tensors,GGML_TYPE_Q4_K,k,n,grouped ? experts : 1);
+    test_weight = ggml_new_tensor_3d(tensors,q8 ? GGML_TYPE_Q8_0 : GGML_TYPE_Q4_K,k,n,grouped ? experts : 1);
     ggml_set_name(test_weight,"adapter-weight");
     auto * a=grouped ? ggml_new_tensor_3d(tensors,GGML_TYPE_F32,k,channels,tokens) :
         ggml_new_tensor_2d(tensors,GGML_TYPE_F32,k,tokens);
@@ -132,9 +136,9 @@ static void run_case(bool grouped, int tokens, int channels) {
     CUDA_CHECK(cudaMalloc(&a->data,ggml_nbytes(a)));
     CUDA_CHECK(cudaMalloc(&out->data,ggml_nbytes(out)));
     if (ids) CUDA_CHECK(cudaMalloc(&ids->data,ggml_nbytes(ids)));
-    test_art={}; test_art.qtype=12; test_art.n=n; test_art.k=k; test_art.experts=grouped ? experts : 1;
+    test_art={}; test_art.qtype=q8 ? 8 : 12; test_art.n=n; test_art.k=k; test_art.experts=grouped ? experts : 1;
     test_art.low=(const uint8_t *) a->data; test_art.units=test_art.low;
-    test_art.arrangement.group_size=32; test_art.arrangement.mapping_id=UINT64_C(0x51344b5034540001);
+    test_art.arrangement.group_size=32; test_art.arrangement.mapping_id=q8 ? UINT64_C(0x51384B5032540001) : UINT64_C(0x51344b5034540001);
     CUDA_CHECK(cudaEventCreateWithFlags(&test_art.ready,cudaEventDisableTiming));
     CUDA_CHECK(cudaEventRecord(test_art.ready));
     CUDA_CHECK(cudaEventSynchronize(test_art.ready));
@@ -146,7 +150,7 @@ static void run_case(bool grouped, int tokens, int channels) {
         test_prepare_graph(ctx,graph);
         test_prepare_graph(ctx,graph);
         require(prepares==(gemv ? 0 : 1) && queries==prepares && scale_prepares==0);
-        require(gemv_lookups==(gemv ? 1 : 0) && prefill_lookups==(auto_prefill ? 1 : 0));
+        require(gemv_lookups==((automatic || forced_gemv) ? 1 : 0) && prefill_lookups==(auto_prefill ? 1 : 0));
         cudaGraph_t capture;
         cudaGraphExec_t instance;
         CUDA_CHECK(cudaStreamBeginCapture(ctx.stream(),cudaStreamCaptureModeRelaxed));
@@ -179,7 +183,7 @@ static void run_case(bool grouped, int tokens, int channels) {
             require(bad==0);
         }
         require(prepares==(gemv ? 0 : 1) && queries==prepares && scale_prepares==(sf ? 3 : 0));
-        require(gemv_lookups==(gemv ? 1 : 0) && prefill_lookups==(auto_prefill ? 1 : 0));
+        require(gemv_lookups==((automatic || forced_gemv) ? 1 : 0) && prefill_lookups==(auto_prefill ? 1 : 0));
         CUDA_CHECK(cudaGraphExecDestroy(instance));
         CUDA_CHECK(cudaGraphDestroy(capture));
     }
@@ -199,6 +203,10 @@ int main() {
         run_case(false,tokens,1);
         run_case(true,tokens,1);
         run_case(true,tokens,2);
+    }
+    if (!strcmp(getenv("QUACTLIZE_KPACK_ROUTE"),"auto")) {
+        run_case(false,1,1,true); run_case(true,1,1,true);
+        run_case(false,1,1,true,true); run_case(true,1,1,true,true);
     }
     printf("KPACK_ADAPTER_DEVICE_ALL PASS external_arithmetic=STUB routing_and_capture=PRODUCTION\n");
 }

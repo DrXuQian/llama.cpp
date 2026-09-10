@@ -487,7 +487,7 @@ def proof(args):
         require(len(decoded) == len(names), "demangled symbol count differs")
         for name, demangled in zip(names, decoded):
             if "cutlass::device_kernel<" in demangled or re.search(
-                r"kpack_q(?:10|11|12|13|14)::", demangled
+                r"kpack_q(?:8|10|11|12|13|14)::", demangled
             ):
                 item = symbols.setdefault(
                     name, dict(name=demangled, libraries=[], ops=[])
