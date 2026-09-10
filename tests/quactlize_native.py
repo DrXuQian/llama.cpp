@@ -24,6 +24,14 @@ from quactlize_numerical import require, activity
 PATTERN = r"^(blk\.[0-9]+\.ffn_[a-z0-9_]+_exps\.weight|output\.weight)$"
 
 
+def inventory_pattern(inventory):
+    names = inventory.get("eligible")
+    require(isinstance(names, list) and names
+            and all(isinstance(name, str) and name for name in names)
+            and len(set(names)) == len(names), "invalid trace tensor inventory")
+    return "^(" + "|".join(re.escape(name) for name in names) + ")$"
+
+
 def timings(response, payload):
     require(
         response.get("tokens_evaluated") == len(payload["prompt"]),
@@ -192,7 +200,8 @@ def run_arm(args, index, arm, tokens, profile=None):
         args.batch,
     )
     command[command.index("-ot") + 1] = (
-        PATTERN + "=CUDA0" + ("_KPACK" if arm == "native" else "")
+        getattr(args, "tensor_override_pattern", PATTERN)
+        + "=CUDA0" + ("_KPACK" if arm == "native" else "")
     )
     command += ["--no-warmup"]
     env = {k: v for k, v in os.environ.items() if not k.startswith("LLAMA_ARG_")}
@@ -436,14 +445,23 @@ def summarize(arms, prompts, repeats):
     return result
 
 
+def proof_parameters(args):
+    prompt = getattr(args, "proof_prompt", 128)
+    generate = getattr(args, "proof_generate", 8)
+    require(type(prompt) is int and prompt > 1 and type(generate) is int and generate > 1,
+            "invalid Asys prompt/generation lengths")
+    return dict(context=max(512, ((prompt + generate) // 256 + 1) * 256),
+                batch=prompt, generate=generate, prompts=[prompt], repeats=1)
+
+
 def proof(args):
     report = args.output / "proof.asysrep"
     db = args.output / "proof.sqlite"
     capture = copy.copy(args)
     capture.output = args.output / "proof-request"
     capture.output.mkdir()
-    capture.context, capture.batch, capture.generate = 512, 128, 8
-    capture.prompts, capture.repeats = [128], 1
+    for name, value in proof_parameters(args).items():
+        setattr(capture, name, value)
     proof_arm, _ = run_arm(capture, 0, "native", None, profile=AsysSession(args.asys, args.output))
     with (args.output / "proof-export.log").open("x") as f:
         subprocess.run(
@@ -503,6 +521,9 @@ def proof(args):
         selection=plans,
         timing_scope="PROFILER_ONLY_NOT_PERFORMANCE",
         capture_scope="SECOND_REQUEST_SAME_PROCESS_FIRST_USE_EXCLUDED",
+        prompt_tokens=capture.prompts[0],
+        generated_tokens=capture.generate,
+        prefill_token_batch=capture.batch,
         all_abba_parents_traced=False,
     )
     save(args.output / "proof.json", result)
@@ -526,15 +547,22 @@ def main():
     p.add_argument("--generate", type=int, default=128)
     p.add_argument("--prompts", type=int, nargs="+", default=[128, 512])
     p.add_argument("--repeats", type=int, default=3)
+    p.add_argument("--proof-only", action="store_true", help="warmup and Asys capture without ABBA timings")
+    p.add_argument("--proof-prompt", type=int, default=128)
+    p.add_argument("--proof-generate", type=int, default=8)
+    p.add_argument("--tensor-inventory", type=Path, help="use the benchmark's exact eligible weight names")
     p.add_argument("--jit-cache", type=Path)
     p.add_argument("--jit-helper", type=Path)
     p.add_argument("--jit-python", type=Path)
     a = p.parse_args()
+    a.tensor_override_pattern = (inventory_pattern(json.loads(a.tensor_inventory.read_text()))
+                                 if a.tensor_inventory else PATTERN)
+    capture_parameters = proof_parameters(a)
     require(
-        a.repeats >= 2
+        a.proof_only or (a.repeats >= 2
         and a.generate > 1
         and max(a.prompts) + a.generate < a.context
-        and min(a.prompts) > 1,
+        and min(a.prompts) > 1),
         "invalid benchmark sizes",
     )
     a.output.mkdir(parents=True, exist_ok=False)
@@ -548,16 +576,18 @@ def main():
     save(
         a.output / "protocol.json",
         dict(
-            order=["reference", "native", "native", "reference"],
+            order=["native"] if a.proof_only else ["reference", "native", "native", "reference"],
             request_batch=1,
-            prompts=a.prompts,
-            generate=a.generate,
-            repeats=a.repeats,
-            prefill_token_batch=a.batch,
+            prompts=capture_parameters["prompts"] if a.proof_only else a.prompts,
+            generate=capture_parameters["generate"] if a.proof_only else a.generate,
+            repeats=1 if a.proof_only else a.repeats,
+            prefill_token_batch=capture_parameters["batch"] if a.proof_only else a.batch,
+            proof_only=a.proof_only,
+            proof_parameters=capture_parameters,
             graphs=True,
             native_route="auto",
-            dense_scope="Q6 output.weight; Q8_0 remains ordinary GPU",
-            tensor_override_pattern=PATTERN,
+            dense_scope="BENCHMARK_INVENTORY" if a.tensor_inventory else "Q6 output.weight; Q8_0 remains ordinary GPU",
+            tensor_override_pattern=a.tensor_override_pattern,
             first_use_excluded_from_steady=True,
             first_use_scope="EACH_PROCESS_AND_PROMPT_SHAPE",
             asys_scope="SECOND_REQUEST_SAME_PROCESS_FIRST_USE_EXCLUDED",
@@ -565,6 +595,13 @@ def main():
             module_evidence="SELECTED_PAYLOAD_HASH_AND_SOURCE_BOUND_CACHE_RECEIPT",
         ),
     )
+    if a.proof_only:
+        result = proof(a)
+        save(a.output / "summary.json", dict(status="TRACE_CAPTURED",
+             kernel_execution=result["kernel_execution"], missing_native_ops=result["missing_ops"],
+             performance="NOT_MEASURED", accuracy_admission="NOT_RETESTED"))
+        print("KPACK_MODEL_TRACE " + json.dumps(result, sort_keys=True), flush=True)
+        return
     arms = []
     tokens = None
     for i, arm in enumerate(("reference", "native", "native", "reference")):
