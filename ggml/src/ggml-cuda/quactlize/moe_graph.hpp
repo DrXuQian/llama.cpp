@@ -1,6 +1,7 @@
 #pragma once
 #include "ggml.h"
 #include "ggml-impl.h"
+#include <vector>
 
 namespace quactlize::llama {
 struct MoeGraph {
@@ -54,5 +55,32 @@ inline MoeGraph match_moe(ggml_cgraph const * graph, int start) {
     // Views and intermediate projections must have no outside consumers.
     if (!ggml_can_fuse_subgraph(graph,start,match.count,ops,&output,1)) return {};
     return match;
+}
+
+struct MoeRouterSpan {
+    int chain_start = 0;
+    int count = 0;
+};
+
+inline MoeRouterSpan match_moe_router(ggml_cgraph const * graph, int start,
+    std::vector<ggml_op> ops, int ids_index, int weights_index) {
+    if (!graph || start < 0 || ops.empty() || start + int(ops.size()) > graph->n_nodes ||
+        ids_index < start || ids_index >= start + int(ops.size()) ||
+        weights_index < start || weights_index >= start + int(ops.size())) return {};
+    std::vector<int> outputs{ids_index, weights_index};
+    int next = start + int(ops.size());
+    while (next < graph->n_nodes && (graph->nodes[next]->op == GGML_OP_VIEW ||
+                                    graph->nodes[next]->op == GGML_OP_RESHAPE)) {
+        // Input views remain aliases, not elided intermediate storage. Their
+        // parent may be outside the fused span and have other consumers.
+        outputs.push_back(next);
+        ops.push_back(graph->nodes[next++]->op);
+    }
+    auto chain = match_moe(graph, next);
+    if (!chain.count || chain.gate->src[2] != graph->nodes[ids_index]) return {};
+    for (int j = 0; j < chain.count; ++j) ops.push_back(graph->nodes[next+j]->op);
+    outputs.push_back(next + chain.count - 1);
+    if (!ggml_can_fuse_subgraph(graph, start, int(ops.size()), ops.data(), outputs.data(), int(outputs.size()))) return {};
+    return {next, int(ops.size())};
 }
 } // namespace quactlize::llama
