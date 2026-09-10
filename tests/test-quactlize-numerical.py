@@ -143,6 +143,19 @@ class NumericalEvidence(unittest.TestCase):
         self.edit_db("UPDATE HGPTI_ACTIVITY_KIND_KERNEL SET mangledName=NULL")
         self.assertEqual(self.check()["quactlize_grouped_gemm_calls"], 512)
 
+    def test_all_kernel_times_include_adapters_not_only_compute(self):
+        self.edit_db("INSERT INTO StringIds VALUES(3, '_gather'), (4, 'gather()');"
+                     "INSERT INTO HGPTI_ACTIVITY_KIND_KERNEL VALUES(11000, 11040, 3, 4);")
+        total, kernels = activity(self.db, None)
+        self.assertEqual(total, 513)
+        by_name = {k["name"]: k for k in kernels}
+        self.assertEqual(by_name["gather()"]["total_ns"], 40)
+        self.assertEqual(by_name["exact grouped GEMM"]["total_ns"], 5120)
+        self.assertEqual(activity(self.db, {})[1], [])
+        self.edit_db("UPDATE HGPTI_ACTIVITY_KIND_KERNEL SET mangledName=NULL, demangledName=NULL WHERE start=11000")
+        with self.assertRaisesRegex(ValueError, "unnamed"):
+            activity(self.db, None)
+
     def test_reference_negative_control(self):
         text = self.text.replace('so-quactlize-kpack', 'GENERIC')
         with self.assertRaisesRegex(ValueError, "contradicts"):

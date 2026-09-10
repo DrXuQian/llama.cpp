@@ -34,6 +34,14 @@ class NativeEvidence(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "invalid Asys"):
                 native.proof_parameters(SimpleNamespace(proof_prompt=prompt, proof_generate=generate))
 
+    def test_shared_tokens_are_validated_without_retokenization(self):
+        tokens = {"2": [7, 8]}
+        self.assertIs(native.validate_tokens(tokens, [2]), tokens)
+        for value in ([], {}, {"3": [7, 8]}, {"2": [7]}, {"2": [True, 8]},
+                      {"2": [-1, 8]}, {"2": [1.0, 8]}, {"2": "78"}):
+            with self.subTest(tokens=value), self.assertRaisesRegex(ValueError, "input token file"):
+                native.validate_tokens(value, [2])
+
     def test_proof_only_skips_abba_and_never_claims_performance(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -136,8 +144,12 @@ class NativeEvidence(unittest.TestCase):
                 return "void cutlass::device_kernel<parent>()\n"
             with (patch.object(native.subprocess, "run"),
                   patch.object(native.subprocess, "check_output", side_effect=listing),
-                  patch.object(native, "run_arm", return_value=(dict(selection=selection), None)) as run,
-                  patch.object(native, "activity", return_value=(10, [dict(mangled="_Zparent")]))):
+                  patch.object(native, "run_arm", return_value=(dict(selection=selection,
+                      records=[dict(request_sha256="request", response=dict(content="text"))]),
+                      {"128": list(range(128))})) as run,
+                  patch.object(native, "activity", return_value=(10, [dict(
+                      mangled="_Zparent", name="void cutlass::device_kernel<parent>()",
+                      libraries=[], calls=10, total_ns=200)]))):
                 result = native.proof(args)
             self.assertEqual(run.call_args.args[0].repeats, 1)
             self.assertEqual(run.call_args.args[0].prompts, [128])
@@ -146,6 +158,40 @@ class NativeEvidence(unittest.TestCase):
             self.assertEqual(result["missing_ops"], ["dense"])
             self.assertEqual(result["selection"]["fallbacks"], fallbacks)
             self.assertEqual(json.loads((args.output / "proof.json").read_text()), result)
+            all_times = json.loads((args.output / "kernel-times.json").read_text())
+            self.assertEqual(all_times["sum_kernel_ns"], 200)
+            self.assertIn("NOT_WALL_LATENCY", all_times["scope"])
+
+    def test_reference_trace_uses_original_kernels_and_shared_input(self):
+        for fault in (None, "custom-kernel", "no-native-compute"):
+            with self.subTest(fault=fault), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                token_file = root / "tokens.json"
+                tokens = {"128": list(range(128))}
+                token_file.write_text(json.dumps(tokens))
+                args = SimpleNamespace(output=root, asys=root / "asys", proof_arm="reference",
+                                       proof_tokens=token_file)
+                name = "void mul_mat_vec_q<(ggml_type)8, 1, false, false>()"
+                if fault == "custom-kernel": name = "quactlize::runtime::moe_chain_prepare<T>()"
+                if fault == "no-native-compute": name = "quantize_q8_1()"
+                kernels = [dict(name=name, mangled="_kernel", calls=3, total_ns=120, libraries=[])]
+                with (patch.object(native.subprocess, "run"),
+                      patch.object(native.subprocess, "check_output") as inspector,
+                      patch.object(native, "run_arm", return_value=(dict(selection={}, records=[
+                          dict(request_sha256="shared-request", response=dict(content="answer"))]), tokens)) as run,
+                      patch.object(native, "activity", return_value=(3, kernels))):
+                    if fault:
+                        with self.assertRaisesRegex(ValueError, "reference trace"):
+                            native.proof(args)
+                    else:
+                        result = native.proof(args)
+                        self.assertEqual(result["kernel_execution"], "REFERENCE_COMPUTE_OBSERVED")
+                        self.assertEqual(result["input_tokens_sha256"], native.digest(tokens))
+                        self.assertEqual(result["request_sha256"], "shared-request")
+                        self.assertEqual(result["selection"], {})
+                        self.assertEqual(result["timing_scope"], "PROFILER_ONLY_NOT_PERFORMANCE")
+                    self.assertEqual(run.call_args.args[1:4], (0, "reference", tokens))
+                    inspector.assert_not_called()
 
     def test_startup_failure_keeps_arm_phase_and_process_status(self):
         for returncode in (None, -6):
@@ -340,7 +386,7 @@ int main(int argc, char ** argv) {
             self.assertEqual([c.args[0][1] for c in run.call_args_list], ["start", "stop", "shutdown"])
             self.assertTrue(all(c.args[0][3] == profile.session for c in run.call_args_list))
 
-    def captured_exit(self, exit_status):
+    def captured_exit(self, exit_status, arm="native", shared_tokens=None):
         with tempfile.TemporaryDirectory() as temp:
             args = SimpleNamespace(binary=Path("server"), model=Path("model"), cache=Path("cache"),
                                    context=512, batch=128, generate=8, repeats=1, prompts=[128], output=Path(temp))
@@ -368,7 +414,14 @@ int main(int argc, char ** argv) {
             proc.wait.side_effect = wait
             def launch(command, **kwargs):
                 state["alias"] = command[command.index("--alias")+1]
-                kwargs["stdout"].write("CUDA0_KPACK model buffer size = fixture\n")
+                for key in ("GGML_CUDA_DISABLE_GRAPHS", "GGML_CUDA_DISABLE_FUSION"):
+                    self.assertNotIn(key, kwargs["env"])
+                if arm == "reference":
+                    self.assertFalse(any(k.startswith("QUACTLIZE_KPACK_") for k in kwargs["env"]))
+                    self.assertTrue(command[command.index("-ot")+1].endswith("=CUDA0"))
+                    self.assertNotIn("--kpack-cache", command)
+                else:
+                    kwargs["stdout"].write("CUDA0_KPACK model buffer size = fixture\n")
                 kwargs["stdout"].flush()
                 return proc
             def response(url, key, payload=None, **kwargs):
@@ -377,22 +430,29 @@ int main(int argc, char ** argv) {
                 if url.endswith("/props"):
                     return dict(model_alias=state["alias"], total_slots=1, default_generation_settings=dict(n_ctx=512))
                 if url.endswith("/tokenize"):
+                    self.assertIsNone(shared_tokens)
                     return dict(tokens=list(range(128)))
                 self.assertTrue(url.endswith("/completion"))
+                if shared_tokens: self.assertEqual(payload["prompt"], shared_tokens["128"])
                 events.append("request")
                 return dict(tokens_evaluated=128, tokens_predicted=8, stop=True, truncated=False,
                             timings=dict(cache_n=0, prompt_n=128, predicted_n=8, prompt_ms=1., predicted_ms=1.),
                             generation_settings={k: payload[k] for k in ("n_predict", "temperature", "ignore_eos", "seed")})
-            with (patch.object(native.subprocess, "Popen", side_effect=launch),
+            with (patch.dict(native.os.environ, {"QUACTLIZE_KPACK_EXECUTION": "/fixture",
+                  "QUACTLIZE_KPACK_ROUTE": "gemv", "QUACTLIZE_KPACK_PAIR_WEIGHTS": "1",
+                  "QUACTLIZE_KPACK_JIT_HELPER": "/fixture-helper", "GGML_CUDA_DISABLE_GRAPHS": "1",
+                  "GGML_CUDA_DISABLE_FUSION": "1"}),
+                  patch.object(native.subprocess, "Popen", side_effect=launch),
                   patch.object(native, "request", side_effect=response),
-                  patch.object(native, "model_selection", return_value=dict(plans=[dict(op="grouped")]))):
+                  patch.object(native, "model_selection", return_value=dict(plans=[dict(op="grouped")])) as select):
                 if exit_status == 0:
-                    result, _ = native.run_arm(args, 0, "native", None, profile=profile)
+                    result, _ = native.run_arm(args, 0, arm, shared_tokens, profile=profile)
                     self.assertEqual([r["phase"] for r in result["records"]], ["first-use", "steady"])
+                    if arm == "reference": select.assert_not_called()
                 else:
                     message = "shutdown exceeded 60 seconds" if exit_status == "timeout" else "0-native failed rc=1"
                     with self.assertRaisesRegex(ValueError, message):
-                        native.run_arm(args, 0, "native", None, profile=profile)
+                        native.run_arm(args, 0, arm, shared_tokens, profile=profile)
             self.assertEqual(events, ["request", "start", "request", "stop", "close", "wait"] +
                              (["wait"] if exit_status == "timeout" else []))
             proc.terminate.assert_not_called()
@@ -403,11 +463,16 @@ int main(int argc, char ** argv) {
             else:
                 proc.kill.assert_not_called()
                 proc.wait.assert_called_once_with(timeout=60)
-            self.assertEqual(json.loads((args.output / "0-native.process.json").read_text()),
+            self.assertEqual(json.loads((args.output / f"0-{arm}.process.json").read_text()),
                              dict(returncode=-9 if exit_status == "timeout" else exit_status))
+            self.assertEqual(json.loads((args.output / "input-tokens.json").read_text()),
+                             shared_tokens or {"128": list(range(128))})
 
     def test_capture_starts_only_after_first_request_completed(self):
         self.captured_exit(0)
+
+    def test_reference_restores_native_fusions_and_clears_kpack_environment(self):
+        self.captured_exit(0, "reference", {"128": list(range(900, 1028))})
 
     def test_profile_shutdown_does_not_accept_real_nonzero_exit(self):
         self.captured_exit(1)
