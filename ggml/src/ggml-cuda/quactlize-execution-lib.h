@@ -15,6 +15,11 @@ struct ggml_quactlize_execution_api {
     decltype(&quactlize_kpack_gemv_run_v1) gemv_run;
     decltype(&quactlize_kpack_sf_prepare_v1) sf_prepare;
     decltype(&quactlize_kpack_dispatch_enable_jit_v1) enable_jit;
+    decltype(&quactlize_kpack_dispatch_bind_llama_indexed_v1) bind_indexed;
+    decltype(&quactlize_kpack_dispatch_moe_create_v1) moe_create;
+    decltype(&quactlize_kpack_dispatch_moe_run_v1) moe_run;
+    decltype(&quactlize_kpack_dispatch_moe_run_router_v1) moe_run_router;
+    decltype(&quactlize_kpack_dispatch_moe_destroy_v1) moe_destroy;
 };
 
 // QUACTLIZE_KPACK_EXECUTION names the complete native package. An explicit

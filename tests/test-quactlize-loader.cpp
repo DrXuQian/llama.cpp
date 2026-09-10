@@ -27,6 +27,7 @@ enum qz_kind {
     QZ_GATES,     // the admission guards: identity, registry, capability, byte neutrality
     QZ_CONVERT,   // the conversion itself: threading, the round trip, and the fallback when the split is invalid
     QZ_DEVICE_PACK,
+    QZ_Q8,
 };
 
 struct qz_case {
@@ -50,6 +51,10 @@ struct qz_case {
 // Five positives, one per format; five negatives, each making one guard fire; two deployment conditions. Every
 // negative must flip at least one column to false: a guard that cannot be made to fire is not a guard.
 static const qz_case g_cases[] = {
+    { QZ_Q8, "q8-native", "", 8, true,true,true,true,true,false,"Q8 W8A16 capability and GPU pair ABI" },
+    { QZ_Q8, "q8-no-capability", "QZ_Q8_NO_CAPABILITY=1", 8, false,false,false,true,false,false,"Q8 consumer decline" },
+    { QZ_Q8, "q8-bad-descriptor", "QZ_Q8_BAD_DESCRIPTOR=1", 8, false,false,false,true,false,false,"Q8 registry mismatch" },
+    { QZ_Q8, "q8-no-jit", "QUACTLIZE_KPACK_JIT_HELPER=", 8, false,false,false,true,false,false,"no legacy Q8 fallback" },
     { QZ_DEVICE_PACK, "device-pack-q2", "", 10, true, true, true, true, true, false, "GPU producer Q2, NULL high plane" },
     { QZ_DEVICE_PACK, "device-pack-q3", "", 11, true, true, true, true, true, false, "GPU producer Q3, two planes" },
     { QZ_DEVICE_PACK, "device-pack-q4", "", 12, true, true, true, true, true, false, "GPU producer Q4, NULL high plane" },
@@ -133,6 +138,21 @@ static int run_device_pack(const qz_case & c) {
     const int rc = ggml_quactlize_prepare_device(c.qtype, (const uint8_t *) 1, (uint8_t *) 2,
         arr.high_bits ? (uint8_t *) 3 : nullptr, (uint8_t *) 4, 256, 512, 3, &arr, (void *) 5);
     return rc == (c.want_arrangement ? 0 : 41) ? 0 : 1;
+}
+
+static int check_byte_neutrality(int, const quactlize_ppu_placed_arrangement_v2 &);
+static int run_q8(const qz_case & c) {
+    quactlize_ppu_placed_arrangement_v2 arr{};
+    bool admitted=ggml_quactlize_arrangement_for(8,&arr) && ggml_quactlize_device_pack_available(8);
+    if (admitted!=c.want_available) return 1;
+    if (!admitted) return 0;
+    if (check_byte_neutrality(8,arr)) return 1;
+    if (!ggml_quactlize_dense_any_m_valid(8,256,512,&arr) ||
+        !ggml_quactlize_grouped_any_m_valid(8,256,512,3,&arr) ||
+        ggml_quactlize_dense_any_m_valid(8,255,512,&arr)) return 1;
+    if (run_device_pack(c)) return 1;
+    return !ggml_quactlize_device_pair_available(8) || ggml_quactlize_prepare_device_pair(8,
+        (uint8_t*)1,(uint8_t*)6,(uint8_t*)2,nullptr,(uint8_t*)4,256,512,3,&arr,(void*)5);
 }
 
 // Shapes the byte-neutrality identity has to hold on. N and K are multiples of 256 because the real library admits
@@ -381,7 +401,8 @@ int main(int argc, char ** argv) {
     if (argc >= 3 && strcmp(argv[1], "--case") == 0) {
         for (size_t i = 0; i < g_ncases; ++i) {
             if (strcmp(g_cases[i].name, argv[2]) == 0) {
-                const int f = g_cases[i].kind == QZ_DEVICE_PACK ? run_device_pack(g_cases[i]) :
+                const int f = g_cases[i].kind == QZ_Q8 ? run_q8(g_cases[i]) :
+                              g_cases[i].kind == QZ_DEVICE_PACK ? run_device_pack(g_cases[i]) :
                               g_cases[i].kind == QZ_CONVERT ? run_convert(g_cases[i]) : run_one(g_cases[i]);
                 return f == 0 ? 0 : 1;
             }
@@ -416,7 +437,7 @@ int main(int argc, char ** argv) {
 
         int failures = 0, ran = 0;
         for (size_t i = 0; i < g_ncases; ++i) {
-            if (g_cases[i].kind == QZ_DEVICE_PACK || g_cases[i].hide_bundle || strncmp(g_cases[i].env, "QZ_STUB_", 8) == 0) {
+            if (g_cases[i].kind == QZ_DEVICE_PACK || g_cases[i].qtype==8 || g_cases[i].hide_bundle || strncmp(g_cases[i].env, "QZ_STUB_", 8) == 0) {
                 continue;
             }
             ran++;
@@ -459,9 +480,10 @@ int main(int argc, char ** argv) {
         // other instead of a separate script nobody runs.
         // Production overrides take precedence over LD_LIBRARY_PATH. Clear
         // them only for stub cases; --real and --bench keep their environment.
-        std::string cmd = "env -u QUACTLIZE_PPU_BUNDLE -u QUACTLIZE_PPU_PACK_LIBRARY -u PPU_SDK LD_LIBRARY_PATH='";
+        std::string cmd = "env -u QUACTLIZE_PPU_BUNDLE -u QUACTLIZE_PPU_PACK_LIBRARY -u PPU_SDK -u QUACTLIZE_KPACK_EXECUTION -u QUACTLIZE_KPACK_JIT_HELPER LD_LIBRARY_PATH='";
         cmd += g_cases[i].hide_bundle ? "" : stub_dir;
         cmd += "' ";
+        if (g_cases[i].kind==QZ_Q8) cmd += "QUACTLIZE_KPACK_EXECUTION='"+std::string(stub_dir)+"' QUACTLIZE_KPACK_JIT_HELPER=/stub-helper ";
         cmd += g_cases[i].env;
         cmd += " '";
         cmd += self;

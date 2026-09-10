@@ -31,6 +31,7 @@ static_assert(GGML_TYPE_Q3_K == 11, "quactlize qtype 11 is Q3_K");
 static_assert(GGML_TYPE_Q4_K == 12, "quactlize qtype 12 is Q4_K");
 static_assert(GGML_TYPE_Q5_K == 13, "quactlize qtype 13 is Q5_K");
 static_assert(GGML_TYPE_Q6_K == 14, "quactlize qtype 14 is Q6_K");
+static_assert(GGML_TYPE_Q8_0 == 8, "quactlize qtype 8 is Q8_0");
 
 #define QZ_QTYPE_MIN 10
 #define QZ_QTYPE_MAX 14
@@ -78,7 +79,10 @@ static struct {
     void * handle;
     decltype(&quactlize_ppu_kpack_sizes_for_arrangement_v1) sizes;
     decltype(&quactlize_ppu_prepare_fully_quantized_dev_for_arrangement_v2) prepare;
+    decltype(&quactlize_ppu_kpack_canonical_arrangement_v1) arrangement;
+    decltype(&quactlize_ppu_prepare_gate_up_dev_for_arrangement_v1) pair;
 } g_pack = {};
+static int (*g_q8_supported)(int, int, int, int, uint64_t) = nullptr;
 
 static void qz_load_pack(void) {
     std::string path = "libquactlize_ppu_pack.so";
@@ -101,7 +105,18 @@ static void qz_load_pack(void) {
         dlclose(handle);
         return;
     }
-    g_pack = { handle, sizes, prepare };
+    g_pack = { handle, sizes, prepare,
+        (decltype(g_pack.arrangement)) dlsym(handle, "quactlize_ppu_kpack_canonical_arrangement_v1"),
+        (decltype(g_pack.pair)) dlsym(handle, "quactlize_ppu_prepare_gate_up_dev_for_arrangement_v1") };
+    const char * native = getenv("QUACTLIZE_KPACK_EXECUTION");
+    const char * helper = getenv("QUACTLIZE_KPACK_JIT_HELPER");
+    if (g_pack.arrangement && native && *native && helper && *helper) {
+        void * consumer = dlopen((std::string(native) + "/libquactlize_kpack_dispatch.so").c_str(), RTLD_NOW | RTLD_LOCAL);
+        if (consumer) {
+            g_q8_supported = (decltype(g_q8_supported)) dlsym(consumer, "quactlize_kpack_dispatch_q8_weight_supported_v1");
+            if (!g_q8_supported) dlclose(consumer);
+        }
+    }
 }
 
 // The bundle's format table. Not derivable from the qtype -- fmt0 is Q4_K, not Q2_K -- and each library is asked to
@@ -223,6 +238,10 @@ static qz_lib * qz_get(int qtype) {
 }
 
 extern "C" bool ggml_quactlize_available(int qtype) {
+    if (qtype == GGML_TYPE_Q8_0) {
+        pthread_once(&g_once, qz_init);
+        return g_pack.arrangement && g_q8_supported;
+    }
     return qz_get(qtype) != NULL;
 }
 
@@ -236,6 +255,9 @@ extern "C" int32_t ggml_quactlize_build_packed_format(int qtype) {
 
 extern "C" int32_t ggml_quactlize_grouped_any_m_valid(
         int qtype, int n, int k, int experts, const quactlize_ppu_placed_arrangement_v2 * arrangement) {
+    if (qtype == GGML_TYPE_Q8_0)
+        return ggml_quactlize_available(qtype) && arrangement ?
+            g_q8_supported(n,k,experts,3,arrangement->mapping_id) : 0;
     qz_lib * L = qz_get(qtype);
     if (!L) return -1;
     return L->any_m_grouped(n, k, experts, qtype, arrangement);
@@ -266,6 +288,9 @@ extern "C" int ggml_quactlize_grouped_dev(
 
 extern "C" int32_t ggml_quactlize_dense_any_m_valid(
         int qtype, int n, int k, const quactlize_ppu_placed_arrangement_v2 * arrangement) {
+    if (qtype == GGML_TYPE_Q8_0)
+        return ggml_quactlize_available(qtype) && arrangement ?
+            g_q8_supported(n,k,1,1,arrangement->mapping_id) : 0;
     qz_lib * L = qz_get(qtype);
     if (!L) return -1;
     return L->any_m_dense(n, k, qtype, arrangement);
@@ -304,6 +329,17 @@ static const struct { int qtype, low_bits, high_bits, group_size, packed_format;
 static const int qz_registry_rows = (int) (sizeof(g_registry) / sizeof(g_registry[0]));
 
 extern "C" bool ggml_quactlize_arrangement_for(int qtype, quactlize_ppu_placed_arrangement_v2 * out) {
+    if (qtype == GGML_TYPE_Q8_0) {
+        if (!out || !ggml_quactlize_available(qtype)) return false;
+        quactlize_ppu_placed_arrangement_v2 a{};
+        if (g_pack.arrangement(qtype,&a) || a.version != 2 ||
+            a.layout != QUACTLIZE_PPU_LAYOUT_Q8_KPACK2_TRANSPOSE_V1 || a.bits != 8 || a.high_bits ||
+            a.artifact_tile_k || a.transport_tile_k != 32 || a.group_size != 32 || a.reserved ||
+            a.mapping_id != QUACTLIZE_PPU_Q8_KPACK2_MAPPING_ID ||
+            g_q8_supported(256,512,1,1,a.mapping_id) != 1) return false;
+        *out = a;
+        return true;
+    }
     qz_lib * L = qz_get(qtype);
     if (!L || !L->arrangement || !out) {
         return false;
@@ -373,7 +409,7 @@ extern "C" bool ggml_quactlize_conversion_available(int qtype) {
 extern "C" int ggml_quactlize_device_pack_sizes(
         int qtype, int n, int k, int experts,
         const quactlize_ppu_placed_arrangement_v2 * arrangement, quactlize_ppu_kpack_sizes_v1 * sizes) {
-    if (!qz_get(qtype) || !g_pack.sizes || !arrangement || !sizes || n <= 0 || k <= 0 || experts <= 0) {
+    if (!ggml_quactlize_available(qtype) || !g_pack.sizes || !arrangement || !sizes || n <= 0 || k <= 0 || experts <= 0) {
         return -1;
     }
     if ((int64_t) k > INT64_MAX / experts / n / 8) return -2;
@@ -399,11 +435,20 @@ extern "C" bool ggml_quactlize_device_pack_available(int qtype) {
     return ggml_quactlize_arrangement_for(qtype, &arrangement) && g_pack.prepare &&
            ggml_quactlize_device_pack_sizes(qtype, 256, 512, 1, &arrangement, &sizes) == 0;
 }
+extern "C" bool ggml_quactlize_device_pair_available(int qtype) {
+    return ggml_quactlize_device_pack_available(qtype) && g_pack.pair;
+}
+extern "C" int ggml_quactlize_prepare_device_pair(int qtype,const uint8_t * gate,const uint8_t * up,
+    uint8_t * low,uint8_t * high,uint8_t * units,int n,int k,int experts,
+    const quactlize_ppu_placed_arrangement_v2 * arr,void * stream) {
+    if (!ggml_quactlize_device_pair_available(qtype)) return -1;
+    return g_pack.pair(gate,up,low,high,units,n,k,experts,qtype,arr,stream);
+}
 
 extern "C" int ggml_quactlize_prepare_device(
         int qtype, const uint8_t * blocks, uint8_t * low, uint8_t * high, uint8_t * units,
         int n, int k, int experts, const quactlize_ppu_placed_arrangement_v2 * arrangement, void * stream) {
-    if (!qz_get(qtype) || !g_pack.prepare) {
+    if (!ggml_quactlize_available(qtype) || !g_pack.prepare) {
         return -1;
     }
     return g_pack.prepare(blocks, low, high, units, n, k, experts, qtype, arrangement, stream);
@@ -426,6 +471,12 @@ extern "C" int ggml_quactlize_recover(
 }
 
 extern "C" int64_t ggml_quactlize_units_bytes(int qtype, int n, int k) {
+    if (qtype == GGML_TYPE_Q8_0) {
+        quactlize_ppu_placed_arrangement_v2 a{};
+        quactlize_ppu_kpack_sizes_v1 s{};
+        return ggml_quactlize_arrangement_for(qtype,&a) &&
+            g_pack.sizes(n,k,1,qtype,&a,&s) == 0 ? int64_t(s.units_bytes) : -1;
+    }
     qz_lib * L = qz_get(qtype);
     if (!L || !L->units_bytes) return -1;
     return L->units_bytes(n, k, qtype);
@@ -706,6 +757,9 @@ extern "C" int ggml_quactlize_dense_dev(
 extern "C" bool ggml_quactlize_arrangement_for(int, quactlize_ppu_placed_arrangement_v2 *) { return false; }
 extern "C" bool ggml_quactlize_conversion_available(int) { return false; }
 extern "C" bool ggml_quactlize_device_pack_available(int) { return false; }
+extern "C" bool ggml_quactlize_device_pair_available(int) { return false; }
+extern "C" int ggml_quactlize_prepare_device_pair(int,const uint8_t *,const uint8_t *,uint8_t *,uint8_t *,uint8_t *,
+    int,int,int,const quactlize_ppu_placed_arrangement_v2 *,void *) { return -1; }
 extern "C" int ggml_quactlize_device_pack_sizes(int, int, int, int,
         const quactlize_ppu_placed_arrangement_v2 *, quactlize_ppu_kpack_sizes_v1 *) { return -1; }
 extern "C" int ggml_quactlize_prepare_device(int, const uint8_t *, uint8_t *, uint8_t *, uint8_t *,

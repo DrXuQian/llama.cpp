@@ -38,6 +38,12 @@ struct llama_model_loader {
         int32_t  gguf_index; // tensor table index within the source file
 
         ggml_tensor * tensor;
+        // A synthetic merged tensor has two real source records, never a
+        // fabricated contiguous range. Empty for an ordinary GGUF tensor.
+        std::vector<std::string> paired_sources;
+
+        llama_tensor_weight(ggml_tensor * merged, std::string gate, std::string up)
+            : idx(0), offs(0), gguf_index(-1), tensor(merged), paired_sources{std::move(gate),std::move(up)} {}
 
         llama_tensor_weight(const llama_file * file, uint16_t idx, const struct gguf_context * gguf_ctx, ggml_tensor * tensor) : idx(idx), tensor(tensor) {
             const int tensor_idx = gguf_find_tensor(gguf_ctx,  ggml_get_name(tensor));

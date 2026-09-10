@@ -200,6 +200,7 @@ def run_arm(args, index, arm, tokens, profile=None):
     if arm == "reference":
         env.pop("QUACTLIZE_KPACK_EXECUTION", None)
         env.pop("QUACTLIZE_KPACK_GEMV_POLICY", None)
+        env.pop("QUACTLIZE_KPACK_PAIR_WEIGHTS", None)
     else:
         env["QUACTLIZE_KPACK_ROUTE"] = "auto"
     with socket.socket() as s:
