@@ -56,6 +56,10 @@ Any future multi-round replay must retain recurrent rollback, EOS/token limits, 
 
 These remain private graph/tensor contracts. New algorithms should reuse execution and output ownership without changing the server decode sequence or introducing per-step CPU callbacks. Magic MTP and tree execution are subsequent work, not features added by this refactor.
 
+Ordinary KV attention can consume the token, position, KV-index and mask tensors in `llm_graph_nextn_target`. This permits ancestor-only masks for a tree verification graph. The caller must keep these tensors alive and schedule their computation before model operations. Materializing positions inside the first RoPE sequence can prevent CUDA fusion; 64-bit KV indices preserve the existing fused RoPE/cache-write path. This graph input support does not enable tree proposals, accepted-path KV commit or tree decoding in the server.
+
+Host code that reads encoder output must use the public `llama_get_embeddings_nextn()` getter or finish the output copies before reading the internal buffer. The internal context getter does not synchronize pending device-to-host copies. GPU consumers should retain device tensors and use graph dependencies.
+
 ## Validation
 
 Compare fixed requests and sampler changes against a frozen build, including draft/accept counts. Check model teardown, fallback paths and context boundaries. Measure plain throughput separately from profiled runs.

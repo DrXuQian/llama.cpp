@@ -2881,7 +2881,16 @@ llm_graph_input_attn_kv * llm_graph_context::build_attn_inp_kv() const {
 
     auto inp = build_attn_inp_kv_impl(ctx0, ubatch, hparams, cparams, mctx_cur);
 
-    if (nextn_gpu_kv) {
+    if (nextn_target) {
+        GGML_ASSERT(cparams.flash_attn && nextn_target->kv_idxs && nextn_target->mask);
+        inp->from_graph = true;
+        inp->self_k_idxs = nextn_target->kv_idxs;
+        inp->self_v_idxs = nextn_target->kv_idxs;
+        inp->self_kq_mask = nextn_target->mask;
+        inp->self_kq_mask_cnv = inp->self_kq_mask;
+        ggml_build_forward_expand(gf, inp->self_k_idxs);
+        ggml_build_forward_expand(gf, inp->self_kq_mask);
+    } else if (nextn_gpu_kv) {
         GGML_ASSERT(n_tokens == 1 && cparams.flash_attn);
         auto * position = nextn_kv_positions ? nextn_kv_positions : ggml_cast(ctx0, nextn_positions, GGML_TYPE_F32);
         GGML_ASSERT(ggml_nelements(position) == 1 && position->type == GGML_TYPE_F32);
