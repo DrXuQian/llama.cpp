@@ -340,7 +340,7 @@ int main(int argc, char ** argv) {
             self.assertEqual([c.args[0][1] for c in run.call_args_list], ["start", "stop", "shutdown"])
             self.assertTrue(all(c.args[0][3] == profile.session for c in run.call_args_list))
 
-    def test_capture_starts_only_after_first_request_completed(self):
+    def captured_exit(self, exit_status):
         with tempfile.TemporaryDirectory() as temp:
             args = SimpleNamespace(binary=Path("server"), model=Path("model"), cache=Path("cache"),
                                    context=512, batch=128, generate=8, repeats=1, prompts=[128], output=Path(temp))
@@ -351,9 +351,21 @@ int main(int argc, char ** argv) {
             profile.start.side_effect = lambda: events.append("start")
             def stop():
                 events.append("stop")
-                proc.poll.return_value = proc.returncode = 0
             profile.stop.side_effect = stop
             profile.close.side_effect = lambda: events.append("close")
+            def terminate():
+                state["second_signal"] = True
+            proc.terminate.side_effect = terminate
+            def wait(timeout=None):
+                events.append("wait")
+                if not proc.kill.called:
+                    self.assertEqual(timeout, 60)
+                    if exit_status == "timeout":
+                        raise subprocess.TimeoutExpired("asys launch", timeout)
+                proc.poll.return_value = proc.returncode = (
+                    -9 if proc.kill.called else 1 if state.get("second_signal") else exit_status)
+                return proc.returncode
+            proc.wait.side_effect = wait
             def launch(command, **kwargs):
                 state["alias"] = command[command.index("--alias")+1]
                 kwargs["stdout"].write("CUDA0_KPACK model buffer size = fixture\n")
@@ -374,9 +386,34 @@ int main(int argc, char ** argv) {
             with (patch.object(native.subprocess, "Popen", side_effect=launch),
                   patch.object(native, "request", side_effect=response),
                   patch.object(native, "model_selection", return_value=dict(plans=[dict(op="grouped")]))):
-                result, _ = native.run_arm(args, 0, "native", None, profile=profile)
-            self.assertEqual(events, ["request", "start", "request", "stop", "close"])
-            self.assertEqual([r["phase"] for r in result["records"]], ["first-use", "steady"])
+                if exit_status == 0:
+                    result, _ = native.run_arm(args, 0, "native", None, profile=profile)
+                    self.assertEqual([r["phase"] for r in result["records"]], ["first-use", "steady"])
+                else:
+                    message = "shutdown exceeded 60 seconds" if exit_status == "timeout" else "0-native failed rc=1"
+                    with self.assertRaisesRegex(ValueError, message):
+                        native.run_arm(args, 0, "native", None, profile=profile)
+            self.assertEqual(events, ["request", "start", "request", "stop", "close", "wait"] +
+                             (["wait"] if exit_status == "timeout" else []))
+            proc.terminate.assert_not_called()
+            profile.close.assert_called_once_with()
+            if exit_status == "timeout":
+                proc.kill.assert_called_once_with()
+                self.assertEqual(proc.wait.call_count, 2)
+            else:
+                proc.kill.assert_not_called()
+                proc.wait.assert_called_once_with(timeout=60)
+            self.assertEqual(json.loads((args.output / "0-native.process.json").read_text()),
+                             dict(returncode=-9 if exit_status == "timeout" else exit_status))
+
+    def test_capture_starts_only_after_first_request_completed(self):
+        self.captured_exit(0)
+
+    def test_profile_shutdown_does_not_accept_real_nonzero_exit(self):
+        self.captured_exit(1)
+
+    def test_profile_shutdown_timeout_preserves_status_and_stays_failure(self):
+        self.captured_exit("timeout")
 
 
 if __name__ == "__main__":
