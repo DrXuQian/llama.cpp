@@ -38,6 +38,16 @@ const ggml_quactlize_execution_api * ggml_quactlize_execution_library() {
         QZ_BIND(gemv_query, device, "quactlize_kpack_gemv_query_v1");
         QZ_BIND(gemv_run, device, "quactlize_kpack_gemv_run_v1");
         QZ_BIND(sf_prepare, device, "quactlize_kpack_sf_prepare_v1");
+        result.bind_indexed = reinterpret_cast<decltype(result.bind_indexed)>(
+            dlsym(host,"quactlize_kpack_dispatch_bind_llama_indexed_v1"));
+        result.moe_create = reinterpret_cast<decltype(result.moe_create)>(
+            dlsym(host,"quactlize_kpack_dispatch_moe_create_v1"));
+        result.moe_run = reinterpret_cast<decltype(result.moe_run)>(
+            dlsym(host,"quactlize_kpack_dispatch_moe_run_v1"));
+        result.moe_run_router = reinterpret_cast<decltype(result.moe_run_router)>(
+            dlsym(host,"quactlize_kpack_dispatch_moe_run_router_v1"));
+        result.moe_destroy = reinterpret_cast<decltype(result.moe_destroy)>(
+            dlsym(host,"quactlize_kpack_dispatch_moe_destroy_v1"));
         if (getenv("QUACTLIZE_KPACK_JIT_HELPER")) {
             QZ_BIND(enable_jit, host, "quactlize_kpack_dispatch_enable_jit_v1");
         }

@@ -118,6 +118,10 @@ bool ggml_quactlize_conversion_available(int qtype);
 
 // Independent GPU producer. Missing/incompatible libraries decline without CPU fallback.
 bool ggml_quactlize_device_pack_available(int qtype);
+bool ggml_quactlize_device_pair_available(int qtype);
+int ggml_quactlize_prepare_device_pair(int qtype, const uint8_t * gate, const uint8_t * up,
+    uint8_t * low, uint8_t * high, uint8_t * units, int n, int k, int experts,
+    const quactlize_ppu_placed_arrangement_v2 *, void * stream);
 int ggml_quactlize_device_pack_sizes(
     int qtype, int n, int k, int experts,
     const quactlize_ppu_placed_arrangement_v2 * arrangement, quactlize_ppu_kpack_sizes_v1 * sizes);

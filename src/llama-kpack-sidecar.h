@@ -2,7 +2,7 @@
 
 // Persistent K-pack planes in manifest.json + weights.bin, published atomically.
 // Verified offline bundles retain quactlize.kquant-kpack.bundle v3 and its hashes.
-// Runtime caches use llama.kpack-cache v1: the same plane layout, but NO content
+// Runtime caches write llama.kpack-cache v2 (and read v1): the same plane layout, but NO content
 // hashes. They bind to local source stat identity and tensor metadata instead.
 // Runtime loading trusts payload bytes; corruption is not detected. Neither
 // writing nor loading a runtime cache reads raw GGUF payloads to validate them.
@@ -10,6 +10,7 @@
 #include "ggml.h"
 
 #include <cstdint>
+#include <algorithm>
 #include <cstddef>
 #include <functional>
 #include <map>
@@ -31,6 +32,11 @@ struct llama_kpack_planes {
 
 // What the loader knows about one source tensor, used to bind a bundle record to the GGUF it came from.
 struct llama_kpack_source_tensor {
+    struct component {
+        std::string name;
+        int32_t index = -1;
+        uint64_t offset = 0, bytes = 0;
+    };
     std::string name;
     int32_t     gguf_index  = -1;    // position in the GGUF tensor table
     uint64_t    data_offset = 0;     // absolute byte offset of its data in the file
@@ -38,6 +44,12 @@ struct llama_kpack_source_tensor {
     int32_t     ggml_type   = -1;
     int32_t     rank        = 0;
     int64_t     n = 0, k = 0, experts = 0;   // GGUF [K, N(, E)] -> route terms; experts = 0 for dense
+    std::vector<component> components; // runtime v2 only: gate, then up
+    int32_t order_index() const {
+        int32_t result=gguf_index;
+        for (auto const& part:components) result=result<0?part.index:std::min(result,part.index);
+        return result;
+    }
 };
 
 // ---- reader ----

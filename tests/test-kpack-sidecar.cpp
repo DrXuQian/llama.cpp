@@ -197,6 +197,10 @@ static bool make_planes(made_tensor & t) {
 }
 
 int main() {
+    if (const char * stub=getenv("QZ_STUB_DIR")) {
+        setenv("QUACTLIZE_KPACK_EXECUTION",stub,1);
+        setenv("QUACTLIZE_KPACK_JIT_HELPER","/stub-helper",1);
+    }
     test_sha256();
 
     // ---- a GGUF with one dense and one grouped Q4_K tensor, plus one that is not packable ----
@@ -517,6 +521,139 @@ int main() {
         other->buffer = nullptr;
     }
     rm_bundle(model_cache);
+
+    printf("  [paired nonadjacent sources and warm cache]\n");
+    {
+        cache_mock::reject_copy = cache_mock::reject_wait = 0;
+        auto * gate = ggml_new_tensor_3d(gctx, GGML_TYPE_Q4_K, 512, 256, 2);
+        auto * up = ggml_dup_tensor(gctx, gate);
+        auto * merged = ggml_new_tensor_3d(gctx, GGML_TYPE_Q4_K, 512, 512, 2);
+        ggml_set_name(gate, "blk.1.ffn_gate_exps.weight");
+        ggml_set_name(up, "blk.1.ffn_up_exps.weight");
+        ggml_set_name(merged, "blk.1.ffn_gate_up_exps.weight");
+        memset(gate->data, 0x17, ggml_nbytes(gate));
+        memset(up->data, 0x39, ggml_nbytes(up));
+        auto * pg = gguf_init_empty();
+        // Reverse source order, with unrelated bytes between the two spans.
+        gguf_add_tensor(pg, up); gguf_add_tensor(pg, t_norm); gguf_add_tensor(pg, gate);
+        const std::string source = dir + "/pair.gguf", target = dir + "/pair-cache";
+        gguf_write_to_file(pg, source.c_str(), false);
+        const auto describe = [&](ggml_tensor * t, int index) {
+            llama_kpack_source_tensor s;
+            s.name = ggml_get_name(t); s.gguf_index = index;
+            s.data_offset = gguf_get_meta_size(pg) + gguf_get_tensor_offset(pg, index);
+            s.size_bytes = ggml_nbytes(t); s.ggml_type = t->type; s.rank = 3;
+            s.k = t->ne[0]; s.n = t->ne[1]; s.experts = t->ne[2];
+            return s;
+        };
+        auto gs = describe(gate, 2), us = describe(up, 0), ms = gs;
+        ms.name = ggml_get_name(merged); ms.gguf_index = -1; ms.data_offset = 0;
+        ms.n *= 2; ms.size_bytes *= 2;
+        ms.components = {{gs.name, gs.gguf_index, gs.data_offset, gs.size_bytes},
+                         {us.name, us.gguf_index, us.data_offset, us.size_bytes}};
+        std::vector<llama_kpack_source_tensor> inv = {gs, us, ms};
+        made_tensor mt{ms.name, GGML_TYPE_Q4_K, 512, 512, 2, 3, {}, {}, {}, {}, {}, ms};
+        const size_t expert_bytes = ggml_nbytes(gate)/2;
+        mt.data.resize(ggml_nbytes(merged));
+        for (size_t e = 0; e < 2; ++e) {
+            memcpy(mt.data.data()+2*e*expert_bytes, (uint8_t*)gate->data+e*expert_bytes, expert_bytes);
+            memcpy(mt.data.data()+(2*e+1)*expert_bytes, (uint8_t*)up->data+e*expert_bytes, expert_bytes);
+        }
+        CHECK(make_planes(mt), "merged canonical bytes");
+        merged->buffer = cache_mock::allocate(&cache_mock::device_buft, ggml_nbytes(merged));
+        merged->data = ggml_backend_buffer_get_base(merged->buffer);
+        auto * resident = (uint8_t*)merged->data;
+        memcpy(resident, mt.low.data(), mt.planes.low_bytes);
+        memcpy(resident+mt.planes.low_bytes, mt.units.data(), mt.planes.units_bytes);
+        const std::vector<uint8_t> expected(resident, resident+ggml_nbytes(merged));
+        {
+            llama_kpack_cache cache(target, source, inv);
+            CHECK(!cache.load(merged), "cold pair uses GPU producer");
+            cache.capture(merged); cache.start();
+        }
+        CHECK(stat((target+"/manifest.json").c_str(), &st)==0, "pair cache published");
+        const int copies = cache_mock::copies, allocations = cache_mock::host_allocations;
+        memset(resident, 0xA5, ggml_nbytes(merged));
+        {
+            llama_kpack_cache cache(target, source, inv);
+            CHECK(cache.load(merged), "warm pair loads final planes");
+            cache.start();
+        }
+        CHECK(memcmp(resident, expected.data(), expected.size())==0, "warm merged bytes exact");
+        CHECK(cache_mock::copies==copies && cache_mock::host_allocations==allocations,
+              "warm pair has no repack, staging or D2H");
+        for (int variant=0; variant<7; ++variant) {
+            auto bad=inv;
+            if (variant==0) std::swap(bad[2].components[0],bad[2].components[1]);
+            if (variant==1) bad.erase(bad.begin());
+            if (variant==2) ++bad[0].gguf_index;
+            if (variant==3) ++bad[1].data_offset;
+            if (variant==4) bad[0].ggml_type=GGML_TYPE_Q5_K;
+            if (variant==5) bad[1].n/=2;
+            if (variant==6) bad[2].components[1]=bad[2].components[0];
+            llama_kpack_sidecar_reader reader;
+            CHECK(reader.open(target,err) && !reader.load_unchecked(source,bad,err),
+                  "paired source negative %d: %s",variant,err.c_str());
+        }
+        const auto bytes=read_file(target+"/manifest.json");
+        std::string manifest(bytes.begin(),bytes.end());
+        const auto version=manifest.find("\"schema_version\": 2");
+        CHECK(version!=std::string::npos, "pair uses runtime v2");
+        if (version!=std::string::npos) {
+            manifest.replace(version,19,"\"schema_version\": 1");
+            write_file(target+"/manifest.json",{manifest.begin(),manifest.end()});
+            llama_kpack_sidecar_reader reader;
+            CHECK(!reader.open(target,err), "v1 cannot claim paired provenance");
+        }
+        CHECK(cache_mock::violations==0 && cache_mock::in_flight==0, "no owner-thread wait or unfinished DMA");
+        ggml_backend_buffer_free(merged->buffer); merged->buffer=nullptr;
+        gguf_free(pg); rm_bundle(target); unlink(source.c_str());
+    }
+
+    {
+        printf("  [Q8 resident scale cache]\n");
+        auto * tensor=ggml_new_tensor_2d(gctx,GGML_TYPE_Q8_0,512,256);
+        ggml_set_name(tensor,"output.weight");
+        memset(tensor->data,0,ggml_nbytes(tensor));
+        auto * qg=gguf_init_empty(); gguf_add_tensor(qg,tensor);
+        const std::string source=dir+"/q8.gguf", target=dir+"/q8-cache";
+        gguf_write_to_file(qg,source.c_str(),false);
+        llama_kpack_source_tensor s;
+        s.name=tensor->name;s.gguf_index=0;s.data_offset=gguf_get_meta_size(qg);
+        s.size_bytes=ggml_nbytes(tensor);s.ggml_type=8;s.rank=2;s.n=256;s.k=512;
+        tensor->buffer=cache_mock::allocate(&cache_mock::device_buft,ggml_nbytes(tensor));
+        tensor->data=ggml_backend_buffer_get_base(tensor->buffer);
+        memset(tensor->data,0xD3,ggml_nbytes(tensor));
+        {
+            llama_kpack_cache cache(target,source,{s});cache.capture(tensor);cache.start();
+        }
+        CHECK(stat((target+"/manifest.json").c_str(),&st)==0,"Q8 runtime cache published");
+        memset(tensor->data,0,ggml_nbytes(tensor));
+        {
+            llama_kpack_cache cache(target,source,{s});
+            CHECK(cache.load(tensor),"Q8 one low plane and FP16 scale cache hit");
+        }
+        const auto * ptr=(const uint8_t*)tensor->data;
+        CHECK(std::all_of(ptr,ptr+ggml_nbytes(tensor),[](uint8_t v){return v==0xD3;}),"all Q8 plane bytes restored");
+        ggml_backend_buffer_free(tensor->buffer);tensor->buffer=nullptr;
+        gguf_free(qg);rm_bundle(target);unlink(source.c_str());
+    }
+
+    { // Ordinary runtime caches remain readable by the v1 contract.
+        const std::string target=dir+"/legacy-runtime"; copy_bundle(streamed,target);
+        const auto bytes=read_file(target+"/manifest.json");
+        std::string manifest(bytes.begin(),bytes.end());
+        const auto version=manifest.find("\"schema_version\": 2");
+        CHECK(version!=std::string::npos, "current ordinary writer uses v2");
+        if (version!=std::string::npos) {
+            manifest.replace(version,19,"\"schema_version\": 1");
+            write_file(target+"/manifest.json",{manifest.begin(),manifest.end()});
+            llama_kpack_sidecar_reader reader;
+            CHECK(reader.open(target,err) && reader.load_unchecked(gguf_path,inventory,err),
+                  "legacy runtime v1: %s",err.c_str());
+        }
+        rm_bundle(target);
+    }
 
     // ---- negatives: one wrong thing each ----
     printf("  [negatives]\n");

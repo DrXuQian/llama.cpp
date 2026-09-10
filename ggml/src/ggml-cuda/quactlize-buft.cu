@@ -225,8 +225,8 @@ void ggml_quactlize_set_planes(ggml_tensor * tensor, const ggml_quactlize_planes
                       tensor->ne[2] * tensor->ne[3]);
 }
 
-static void qz_buffer_set_tensor(
-        ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
+static void qz_set_raw(
+        ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, const void * up, size_t offset, size_t size) {
     qz_buffer_context * ctx = (qz_buffer_context *) buffer->context;
 
     // Whole tensor in one call. A non-default buffer type is excluded from the loader's chunked async upload
@@ -280,12 +280,19 @@ static void qz_buffer_set_tensor(
     uint8_t * dst = (uint8_t *) tensor->data;
     for (int64_t first = 0; first < experts; first += batch) {
         const int count = (int) std::min(batch, experts - first);
-        CUDA_CHECK(cudaMemcpyAsync(ctx->scratch, (const uint8_t *) data + first * expert_bytes,
-                                   count * expert_bytes, cudaMemcpyHostToDevice, ctx->pack_stream));
+        const size_t source_expert = up ? expert_bytes/2 : expert_bytes;
+        const size_t source_batch = count*source_expert;
+        CUDA_CHECK(cudaMemcpyAsync(ctx->scratch, (const uint8_t *) data + first*source_expert,
+                                   source_batch, cudaMemcpyHostToDevice, ctx->pack_stream));
+        if (up) CUDA_CHECK(cudaMemcpyAsync(ctx->scratch+source_batch, (const uint8_t *) up+first*source_expert,
+                                          source_batch, cudaMemcpyHostToDevice, ctx->pack_stream));
         if (first + count == experts) {
             CUDA_CHECK(cudaEventRecord(ctx->upload_done, ctx->pack_stream));
         }
-        const int rc = ggml_quactlize_prepare_device(
+        const int rc = up ? ggml_quactlize_prepare_device_pair(
+            qtype,ctx->scratch,ctx->scratch+source_batch,dst+first*(ps.low/experts),
+            ps.high?dst+ps.low+first*(ps.high/experts):nullptr,
+            dst+ps.low+ps.high+first*(ps.units/experts),n/2,k,count,&arr,ctx->pack_stream) : ggml_quactlize_prepare_device(
             qtype, ctx->scratch, dst + first * (ps.low / experts),
             ps.high ? dst + ps.low + first * (ps.high / experts) : nullptr,
             dst + ps.low + ps.high + first * (ps.units / experts),
@@ -310,6 +317,20 @@ static void qz_buffer_set_tensor(
     ctx->artifacts[tensor] = art;
     GGML_LOG_DEBUG("[quactlize] %s: GPU pack queued, %.1f MiB, expert batch=%" PRId64 "\n",
                    tensor->name, size / 1048576.0, batch);
+}
+
+static void qz_buffer_set_tensor(ggml_backend_buffer_t buffer,ggml_tensor * tensor,
+    const void * data,size_t offset,size_t size) {
+    qz_set_raw(buffer,tensor,data,nullptr,offset,size);
+}
+bool ggml_quactlize_pair_supported(ggml_backend_buffer_type_t buft,const ggml_tensor * merged) {
+    return buft && merged && ggml_backend_buft_is_cuda_quactlize(buft) && merged->ne[1]%2==0 &&
+        ggml_quactlize_device_pair_available(merged->type) && ggml_quactlize_can_serve(merged,GGML_OP_MUL_MAT_ID);
+}
+void ggml_quactlize_set_gate_up(ggml_tensor * merged,const void * gate,const void * up,size_t bytes_each) {
+    GGML_ASSERT(merged && merged->buffer && gate && up &&
+        ggml_quactlize_pair_supported(merged->buffer->buft,merged) && bytes_each==ggml_nbytes(merged)/2);
+    qz_set_raw(merged->buffer,merged,gate,up,0,ggml_nbytes(merged));
 }
 
 bool ggml_quactlize_copy_range_async(const ggml_tensor * tensor, void * pinned,
