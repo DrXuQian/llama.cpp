@@ -4675,14 +4675,14 @@ static bool ggml_backend_cuda_graph_prepare(ggml_backend_t backend, ggml_cgraph 
 }
 
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && CUDART_VERSION >= 12080
-static __global__ void ggml_cuda_early_exit(const float * scores, int n, float p_min, int32_t * counts, cudaGraphConditionalHandle next) {
+static __global__ void ggml_cuda_early_exit(const float * scores, int n, float p_min, int32_t * counts, bool first, cudaGraphConditionalHandle next) {
     float sum = 0.0f;
     for (int i = 0; i < n; ++i) {
         sum += expf(scores[i] - scores[0]);
     }
     const bool keep = 1.0f / sum >= p_min;
-    counts[0] += keep;
-    counts[1] += 1;
+    counts[0] = (first ? 0 : counts[0]) + keep;
+    counts[1] = (first ? 0 : counts[1]) + 1;
     if (next) {
         cudaGraphSetConditional(next, keep);
     }
@@ -4738,14 +4738,11 @@ static void ggml_cuda_graph_capture_early(ggml_backend_cuda_context * ctx, ggml_
             body = params.conditional.phGraph_out[0];
         }
         ggml_cuda_graph_capture_begin(ctx, body, {});
-        if (step == 0) {
-            CUDA_CHECK(cudaMemsetAsync(config.early_counts, 0, 2*sizeof(int32_t), ctx->stream()));
-        }
         auto part = ggml_graph_view(cgraph, step ? config.early_ends[step - 1] : 0, config.early_ends[step]);
         ggml_cuda_graph_evaluate_and_capture(ctx, &part, false, false, key);
         auto * scores = config.early_scores[step];
         ggml_cuda_early_exit<<<1, 1, 0, ctx->stream()>>>((const float *) scores->data,
-                ggml_nelements(scores), config.early_p_min, (int32_t *) config.early_counts,
+                ggml_nelements(scores), config.early_p_min, (int32_t *) config.early_counts, step == 0,
                 step + 1 < n_steps ? handles[step] : 0);
         ggml_cuda_graph_capture_end(ctx);
         if (step == 0) {
