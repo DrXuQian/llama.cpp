@@ -331,6 +331,7 @@ struct common_params_speculative_draft {
 
     bool backend_sampling = true; // offload draft sampling to the backend (default: on)
     bool gpu_pipeline = true;
+    bool eagle3_tree = false;
 
     common_params_model mparams;
 

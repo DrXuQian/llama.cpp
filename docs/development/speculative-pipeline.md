@@ -54,11 +54,27 @@ Any future multi-round replay must retain recurrent rollback, EOS/token limits, 
 | Magic MTP | Correct proposal probabilities, random state, block acceptance and residual sampling. |
 | Tree attention | Parent topology, ancestor-only mask and accepted-path state commit. Recurrent models also need per-node state inheritance and rollback. |
 
-These remain private graph/tensor contracts. New algorithms should reuse execution and output ownership without changing the server decode sequence or introducing per-step CPU callbacks. Magic MTP and tree execution are subsequent work, not features added by this refactor.
+These remain private graph/tensor contracts. New algorithms should reuse execution and output ownership without changing the server decode sequence or introducing per-step CPU callbacks. Magic MTP and tree execution for recurrent targets remain subsequent work.
 
-Ordinary KV attention can consume the token, position, KV-index and mask tensors in `llm_graph_nextn_target`. This permits ancestor-only masks for a tree verification graph. The caller must keep these tensors alive and schedule their computation before model operations. Materializing positions inside the first RoPE sequence can prevent CUDA fusion; 64-bit KV indices preserve the existing fused RoPE/cache-write path. This graph input support does not enable tree proposals, accepted-path KV commit or tree decoding in the server.
+Ordinary KV attention can consume the token, position, KV-index and mask tensors in `llm_graph_nextn_target`. This permits ancestor-only masks for a tree verification graph. The caller must keep these tensors alive and schedule their computation before model operations. Materializing positions inside the first RoPE sequence can prevent CUDA fusion; 64-bit KV indices preserve the existing fused RoPE/cache-write path. CUDA conversion from floating positions to 64-bit indices avoids an unsupported direct 32-bit integer conversion.
 
 Host code that reads encoder output must use the public `llama_get_embeddings_nextn()` getter or finish the output copies before reading the internal buffer. The internal context getter does not synchronize pending device-to-host copies. GPU consumers should retain device tensors and use graph dependencies.
+
+## Experimental EAGLE3 tree
+
+`--spec-eagle3-tree` enables four-row tree verification for eligible Qwen3/Qwen3MoE targets with an EAGLE3 head. It requires the existing single-slot, full-GPU, greedy prefetch path, ordinary unquantized fixed KV, `--spec-draft-n-max 3` and `--spec-draft-p-min 0` (both draft values are the defaults). Unsupported settings retain chain verification. `--no-spec-gpu-pipeline` also disables tree execution. No optimization environment variable is used. The startup command's normal GPU pipeline defaults remain unchanged; tree is experimental because throughput depends on the request.
+
+The draft follows three primary tokens and retains the top two candidates and full-vocabulary probabilities at each step. With original IDs `[root, main1, side1, main2, side2, main3, side3]`, the four-node budget admits exactly three topologies: `[0,1,2,3]`, `[0,1,3,4]`, or `[0,1,3,5]`. Strict comparisons of the cumulative scores for IDs 2, 4 and 5 preserve the lower original ID on ties. These are bounded-comb rules, not a general tree selector.
+
+Probability normalization subtracts the known maximum logit and reduces exponentials in two stages using existing GGML operators. Only two probabilities are returned, but the denominator includes the whole vocabulary. This avoids the cooperative large-vocabulary softmax path that reproduced a later SGEMM memory-check failure on the tested CUDA 12.8 / RTX 5090 setup, including a model-free reproducer. Scalar control and tree inputs use separate small device-copy batches. Neither change adds a CPU probability read or synchronization.
+
+This path executes all three draft steps. A conditional upper-bound skip after step two was tested, but its branch-entry idle and mixed throughput results did not justify including it here. Existing confidence stopping remains available on the chain path through `--spec-draft-p-min`; combining it with tree verification needs separate validation.
+
+`llama-spec-tree.h` constructs the ancestor mask, selects the accepted path, and gathers the corresponding KV rows before writing a contiguous accepted prefix. It groups only adjacent equal-shaped KV matrices in the same allocation. Sampled rows, logits and EAGLE features are reordered by the same path. Padding tokens stay inside the vocabulary and force rejection at the path's bonus row. Catch-up uses the linear positions and causal mask after KV commit.
+
+The existing alternating target banks own tree inputs and host snapshots. Resolved proposals join the existing output readback. `common_sampler_sample_and_accept_n` reconciles them after the next target has been submitted, so the server retains its decode/process/accept order. The activation log says `experimental EAGLE3 tree active` only after a target has been queued successfully. Request boundaries, sampler changes and unsupported batches continue to use the existing prefetch guards.
+
+Context shifts notify speculative implementations through `common_speculative_seq_add` after shifting the same KV range. EAGLE3 moves its deferred boundary position and invalidates the previous verification row count. This also fixes chain decoding with explicit context shifting; the hidden boundary vector itself is retained.
 
 ## Validation
 

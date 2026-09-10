@@ -681,6 +681,13 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
 std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, bool grammar_first) {
     GGML_ASSERT(idxs.size() == draft.size() + 1 && "idxs.size() must be draft.size() + 1");
 
+    llama_token resolved[3];
+    const llama_token * proposals = draft.data();
+    if (draft.size() == 3 && idxs[0] == 0 && idxs[1] == 1 && idxs[2] == 2 && idxs[3] == 3 &&
+            llama_get_nextn_verified_draft(ctx, resolved, 3)) {
+        proposals = resolved;
+    }
+
     std::vector<llama_token> result;
     result.reserve(idxs.size());
 
@@ -692,7 +699,7 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
 
         result.push_back(id);
 
-        if (draft[i] != id) {
+        if (proposals[i] != id) {
             break;
         }
     }

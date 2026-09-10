@@ -1218,6 +1218,20 @@ void llama_context::set_nextn_prefetch(bool enabled, bool fixed_kv) {
     spec->set_nextn_prefetch(enabled, fixed_kv);
 }
 
+void llama_context::set_nextn_tree(bool enabled) {
+    if (spec->tree_enabled == enabled) {
+        return;
+    }
+    synchronize();
+    spec->tree_enabled = enabled;
+    spec->invalidate_graphs();
+    set_sched_need_reserve();
+}
+
+bool llama_context::get_nextn_verified_draft(llama_token * tokens, int32_t n) {
+    return spec->verified_draft(tokens, n);
+}
+
 void llama_context::set_nextn_layer_offset(int32_t offset) {
     cparams.nextn_layer_offset = offset;
 }
@@ -4033,6 +4047,14 @@ void llama_set_embeddings_nextn(llama_context * ctx, bool value, bool masked) {
 
 void llama_set_nextn_prefetch(llama_context * ctx, bool enabled, bool fixed_kv) {
     ctx->set_nextn_prefetch(enabled, fixed_kv);
+}
+
+void llama_set_nextn_tree(llama_context * ctx, bool enabled) {
+    ctx->set_nextn_tree(enabled);
+}
+
+bool llama_get_nextn_verified_draft(llama_context * ctx, llama_token * tokens, int32_t n) {
+    return ctx->get_nextn_verified_draft(tokens, n);
 }
 
 void llama_set_nextn_graph_cache(llama_context * ctx, int32_t n_max) {

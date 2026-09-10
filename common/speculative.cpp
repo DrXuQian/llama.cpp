@@ -123,6 +123,9 @@ struct common_speculative_nextn_driver {
     void configure_pipeline() {
         llama_set_nextn_prefetch(params.ctx_tgt, allow_prefetch);
         llama_set_nextn_prefetch(params.ctx_dft, allow_prefetch);
+        const bool tree = params.eagle3_tree && allow_prefetch && params.n_max == 3 && params.p_min == 0.0f;
+        llama_set_nextn_tree(params.ctx_tgt, tree);
+        llama_set_nextn_tree(params.ctx_dft, tree);
         const int n_cache = params.gpu_pipeline && n_seq == 1 && !synthetic &&
             params.p_min > 0.0f && params.n_max >= 2 && params.n_max <= 8 ? params.n_max + 1 : 0;
         llama_set_nextn_graph_cache(params.ctx_tgt, n_cache);
@@ -301,6 +304,8 @@ struct common_speculative_impl {
     virtual void draft(common_speculative_draft_params_vec & dparams) = 0;
 
     virtual void accept(llama_seq_id seq_id, uint16_t n_accepted, bool is_other) = 0;
+
+    virtual void seq_add(llama_seq_id /*seq_id*/, llama_pos /*p0*/, llama_pos /*p1*/, llama_pos /*delta*/) {}
 
     // (optional) serialize/restore per-seq internal state (e.g. eagle3's deferred boundary).
     virtual bool get_state(llama_seq_id /*seq_id*/, std::vector<uint8_t> & /*data*/) const { return false; }
@@ -1021,6 +1026,16 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
     bool need_boundary_stash() const {
         const llama_model * model_tgt = llama_get_model(params.ctx_tgt);
         return llama_model_is_recurrent(model_tgt) || llama_model_is_hybrid(model_tgt);
+    }
+
+    void seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos delta) override {
+        finish_async_verify();
+        auto & pos = pending_pos_last.at(seq_id);
+        if (pos >= p0 && (p1 < 0 || pos < p1)) {
+            pos += delta;
+        }
+        verify_g_rows[seq_id] = 0;
+        catchup_rows = 0;
     }
 
     bool get_state(llama_seq_id seq_id, std::vector<uint8_t> & data) const override {
@@ -3087,6 +3102,14 @@ void common_speculative_resolve_draft(common_speculative * spec) {
     if (spec && spec->impls.size() == 1) {
         if (auto * driver = spec->impls[0]->get_nextn_driver()) {
             driver->resolve_draft();
+        }
+    }
+}
+
+void common_speculative_seq_add(common_speculative * spec, llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos delta) {
+    if (spec) {
+        for (auto & impl : spec->impls) {
+            impl->seq_add(seq_id, p0, p1, delta);
         }
     }
 }
