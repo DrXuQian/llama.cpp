@@ -2454,7 +2454,7 @@ static void ggml_backend_cuda_free(ggml_backend_t backend) {
 
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && CUDART_VERSION >= 12080
 struct ggml_cuda_token_sources {
-    const int32_t * data[12];
+    const int32_t * data[32];
 };
 
 static __global__ void ggml_cuda_gather_tokens(ggml_cuda_token_sources src, int32_t * dst, int count) {
@@ -2503,7 +2503,7 @@ static bool ggml_backend_cuda_get_tensors_async(ggml_backend_t backend, const gg
         return true;
     }
     ggml_cuda_set_device(cuda_ctx->device);
-    bool tokens = count >= 2 && count <= 12 && sizes.size() == count;
+    bool tokens = count >= 2 && count <= 32 && sizes.size() == count;
     for (size_t i = 0; tokens && i < count; i++) {
         tokens = tensors[i]->type == GGML_TYPE_I32 && sizes[i] == sizeof(int32_t) &&
             dst[i] == (char *) dst[0] + i*sizeof(int32_t);
@@ -2804,6 +2804,13 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
 
 static ggml_cuda_graph_key ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
     const auto * first = cgraph->nodes[0];
+    // Input views can be shared by separately allocated graph variants.
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        if (!ggml_cuda_is_view_or_noop(cgraph->nodes[i])) {
+            first = cgraph->nodes[i];
+            break;
+        }
+    }
     return {reinterpret_cast<uintptr_t>(first), cgraph->n_nodes, first->ne[0], first->ne[1], first->ne[2], first->ne[3]};
 }
 

@@ -27,6 +27,20 @@ The existing fast path submits the next target evaluation before the CPU reconci
 
 There are still CPU batch, position and KV mirror checks between calls. The module is not yet a self-contained, repeatedly replayed GPU cycle, and output collection is not a nonblocking `try_collect` API. Moving code into this module does not remove those dependencies or prove zero GPU idle.
 
+### Device control feedback
+
+`llama_nextn_control` owns a persistent device allocation and a pinned snapshot. Each target bank shares one control buffer across its width variants. The buffer stores draft seed position, accepted count, kept/executed draft counts, previous kept count, epoch, step and seed/proposal tokens.
+
+The draft graph derives its next position and acceptance from the previous device control. The next target receives these outputs in one scalar gather. Its recurrent rollback uses the device previous-kept count, and its conditional width selector uses the kept count. A subsequent draft copies that control directly from the completed target bank. Static acceptance weights and position offsets are uploaded when the graph is built.
+
+Ordinary decode or a broken prefetch chain initializes a new epoch from the host batch. The GPU increments the step within that epoch. CPU reconciliation checks the snapshot's epoch, step, accepted count, position and seed instead of repeating the acceptance scan on the supported target-prefetch path. The fallback without a prepared target retains its previous validation.
+
+Snapshot completion has its own event, and control storage remains alive until pending copies finish. Replacing a bank's control allocation invalidates the graphs that captured its old address. These buffers must not come from temporary graph or CUDA pool allocations.
+
+The CUDA graph cache skips leading input views when choosing its tensor anchor. Otherwise, width variants that share a control view and have the same node count can replace each other's captured graph and force repeated capture during decoding.
+
+This feedback does not yet include token quota, EOS, cancellation, output credits or autonomous catch-up scheduling. CPU KV metadata, the MTP draft rejection-mask mapping and graph preparation still run between submissions. Snapshot checks are blocking, and the control gather is still submitted separately from the draft graph. Composing those operations and defining bounded output collection remain necessary before a complete GPU cycle can be replayed.
+
 The next execution change must give submit and collect independent responsibilities: submit consumes device seed/length/position state, while collect only publishes a completed output snapshot. A composed cycle must also retain recurrent rollback, EOS/token limits, context capacity and output-buffer lifetime. Adding asynchronous copies alone does not establish that contract.
 
 ## Extension boundaries

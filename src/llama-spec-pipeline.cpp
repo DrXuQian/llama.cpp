@@ -10,6 +10,55 @@
 #include <algorithm>
 #include <cstring>
 
+struct llama_nextn_control {
+    enum field {
+        POSITION, ACCEPTED, KEPT, EXECUTED, PREVIOUS_KEPT, EPOCH, STEP, N_FIELDS,
+    };
+
+    // Keep captured addresses outside the graph allocator's scratch buffers.
+    ggml_context_ptr ctx;
+    ggml_backend_buffer_ptr device;
+    ggml_backend_buffer_ptr host;
+    ggml_backend_event_ptr consumed;
+    ggml_backend_event_ptr ready;
+    ggml_tensor * storage = nullptr;
+    bool snapshot_pending = false;
+    std::array<ggml_tensor *, N_FIELDS> fields = {};
+    std::array<ggml_tensor *, 9> tokens = {};
+
+    ~llama_nextn_control() {
+        if (snapshot_pending) {
+            ggml_backend_event_synchronize(ready.get());
+        }
+    }
+
+    bool init(ggml_backend_t backend) {
+        auto * dev = ggml_backend_get_device(backend);
+        auto * host_type = dev ? ggml_backend_dev_host_buffer_type(dev) : nullptr;
+        if (!host_type) {
+            return false;
+        }
+        ctx.reset(ggml_init({ (1 + N_FIELDS + tokens.size())*ggml_tensor_overhead(), nullptr, true }));
+        storage = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I32, N_FIELDS + tokens.size());
+        for (int i = 0; i < N_FIELDS; ++i) {
+            fields[i] = ggml_view_1d(ctx.get(), storage, 1, i*sizeof(int32_t));
+        }
+        for (size_t i = 0; i < tokens.size(); ++i) {
+            tokens[i] = ggml_view_1d(ctx.get(), storage, i + 1, N_FIELDS*sizeof(int32_t));
+        }
+        device.reset(ggml_backend_alloc_ctx_tensors(ctx.get(), backend));
+        host.reset(ggml_backend_buft_alloc_buffer(host_type, ggml_nbytes(storage)));
+        consumed.reset(ggml_backend_event_new(dev));
+        ready.reset(ggml_backend_event_new(dev));
+        return device && host && consumed && ready;
+    }
+
+    const int32_t * snapshot() const {
+        ggml_backend_event_synchronize(ready.get());
+        return (const int32_t *) ggml_backend_buffer_get_base(host.get());
+    }
+};
+
 struct llama_nextn_graph {
     llama_token seed_token = LLAMA_TOKEN_NULL;
     llama_pos seed_pos = -1;
@@ -35,12 +84,14 @@ struct llama_nextn_graph {
     ggml_tensor * accepted = nullptr;
     ggml_tensor * selected_token = nullptr;
     ggml_tensor * selected_hidden = nullptr;
-    ggml_tensor * inp_draft = nullptr;
+    ggml_tensor * inp_bonus = nullptr;
     ggml_tensor * inp_weights = nullptr;
     ggml_tensor * inp_positions = nullptr;
     ggml_tensor * inp_position_mask = nullptr;
     ggml_tensor * inp_kv_positions = nullptr;
     ggml_tensor * reject_mask = nullptr;
+    ggml_tensor * step = nullptr;
+    ggml_tensor * kept = nullptr;
     std::vector<ggml_tensor *> positions;
 };
 
@@ -54,10 +105,14 @@ struct llama_nextn_handoff {
 
 struct llama_nextn_lookahead {
     llama_nextn_handoff sampled;
+    llama_nextn_control input;
+    std::shared_ptr<llama_nextn_control> next;
     ggml_backend_event_ptr ready;
     std::vector<llama_token> draft;
     llama_pos pos = -1;
     llama_seq_id seq = -1;
+    int32_t epoch = 0;
+    int32_t step = 0;
 };
 
 struct llama_nextn_target {
@@ -66,7 +121,7 @@ struct llama_nextn_target {
     ggml_context_ptr meta_ctx;
     ggml_backend_sched_ptr meta_sched;
     ggml_cgraph * meta_gf = nullptr;
-    llama_nextn_handoff input;
+    std::shared_ptr<llama_nextn_control> input;
     ggml_backend_event_ptr ready;
     ggml_backend_event_ptr done;
     llm_graph_nextn_target meta;
@@ -74,7 +129,6 @@ struct llama_nextn_target {
     std::unique_ptr<llm_graph_params> controls;
     std::unique_ptr<llm_graph_params> build_controls;
     llama_memory_context_ptr graph_mctx;
-    ggml_tensor * previous_count = nullptr;
     const llama_context * source = nullptr;
     uint64_t generation = 0;
     llama_pos previous_pos = -1;
@@ -172,20 +226,22 @@ bool llama_spec_pipeline::prefetch_nextn_target(llama_context & source) {
             this->targets[index] = std::make_unique<llama_nextn_target>();
         }
         auto & state = *this->targets[index];
-        auto & input = this->targets[bank*10 + n_begin]->input;
-        if (!input.device) {
-            input.ctx.reset(ggml_init({ 13*ggml_tensor_overhead(), nullptr, true }));
-            auto * storage = ggml_new_tensor_1d(input.ctx.get(), GGML_TYPE_I32, 12);
-            input.rows.push_back(ggml_view_1d(input.ctx.get(), storage, 1, 0));
-            input.rows.push_back(ggml_view_1d(input.ctx.get(), storage, 1, sizeof(int32_t)));
-            input.rows.push_back(ggml_view_1d(input.ctx.get(), storage, 1, 2*sizeof(int32_t)));
-            for (int count = 1; count <= 9; ++count) {
-                input.rows.push_back(ggml_view_1d(input.ctx.get(), storage, count, 3*sizeof(int32_t)));
+        auto & shared_input = this->targets[bank*10 + n_begin]->input;
+        if (!shared_input) {
+            auto input = std::make_shared<llama_nextn_control>();
+            if (!input->init(backend)) {
+                return false;
             }
-            input.device.reset(ggml_backend_alloc_ctx_tensors(input.ctx.get(), backend));
-            input.consumed.reset(ggml_backend_event_new(dev));
+            shared_input = std::move(input);
+        }
+        if (state.input != shared_input) {
+            state.build_controls.reset();
+            state.input = shared_input;
+        }
+        auto & input = *state.input;
+        if (!state.ready) {
             state.ready.reset(ggml_backend_event_new(dev));
-            if (!input.device || !input.consumed || !state.ready) {
+            if (!state.ready) {
                 return false;
             }
         }
@@ -265,13 +321,13 @@ bool llama_spec_pipeline::prefetch_nextn_target(llama_context & source) {
                             128, false, lctx.cparams.op_offload));
                 }
             }
-            auto * base = ggml_cast(ctx, input.rows[0], GGML_TYPE_F32);
+            auto * base = ggml_cast(ctx, input.fields[llama_nextn_control::POSITION], GGML_TYPE_F32);
             if (eagle) {
                 base = ggml_scale_bias(ctx, base, 1.0f, 1.0f);
             }
-            auto * accepted = ggml_cast(ctx, input.rows[1], GGML_TYPE_F32);
+            auto * accepted = ggml_cast(ctx, input.fields[llama_nextn_control::ACCEPTED], GGML_TYPE_F32);
             auto * positions = ggml_add(ctx, ggml_arange(ctx, 0, n, 1), base);
-            state.meta.tokens = input.rows[n + 2];
+            state.meta.tokens = input.tokens[n - 1];
             state.meta.kv_idxs = ggml_cast(ctx, positions, GGML_TYPE_I32);
             state.meta.positions = state.meta.kv_idxs;
             if (lctx.model.hparams.n_pos_per_embd() == 4) {
@@ -285,9 +341,8 @@ bool llama_spec_pipeline::prefetch_nextn_target(llama_context & source) {
             auto * query = ggml_reshape_2d(ctx, positions, 1, n);
             state.meta.mask = ggml_cast(ctx, ggml_scale(ctx, ggml_step(ctx, ggml_sub(ctx, columns, query)), -1e30f), GGML_TYPE_F16);
             if (rs) {
-                state.previous_count = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
-                ggml_set_input(state.previous_count);
-                state.meta.rs_copy = ggml_cast(ctx, ggml_sub(ctx, state.previous_count, accepted), GGML_TYPE_I32);
+                auto * previous_count = ggml_cast(ctx, input.fields[llama_nextn_control::PREVIOUS_KEPT], GGML_TYPE_F32);
+                state.meta.rs_copy = ggml_cast(ctx, ggml_sub(ctx, previous_count, accepted), GGML_TYPE_I32);
             }
             auto build_params = params;
             if (eagle) {
@@ -364,10 +419,6 @@ bool llama_spec_pipeline::prefetch_nextn_target(llama_context & source) {
             llama_sampler_backend_begin(entry.second);
         }
         res->set_inputs(&graph_batch);
-        if (state.previous_count) {
-            const float count = previous_n - 1;
-            ggml_backend_tensor_set(state.previous_count, &count, 0, sizeof(count));
-        }
         state.graph_mctx = std::move(graph_mctx);
         state.source = &source;
         state.generation = chain.generation;
@@ -379,25 +430,35 @@ bool llama_spec_pipeline::prefetch_nextn_target(llama_context & source) {
         scheds.push_back(state.sched.get());
     }
     auto & first = *this->targets[bank*10 + n_begin];
-    if (early && !ggml_backend_sched_graph_select(prefixes.data(), scheds.data(), scheds.size(), first.input.rows[2])) {
+    auto & input = *first.input;
+    if (early && !ggml_backend_sched_graph_select(prefixes.data(), scheds.data(), scheds.size(), input.fields[llama_nextn_control::KEPT])) {
         return false;
     }
     ggml_tensor position = *chain.positions[0];
     position.ne[0] = 1;
-    ggml_tensor count = early ? *chain.early_counts : *chain.accepted;
+    ggml_tensor count = early ? *chain.early_counts : *chain.kept;
     count.ne[0] = 1;
-    std::vector<const ggml_tensor *> tensors = { &position, chain.accepted, &count, chain.selected_token };
+    ggml_tensor executed = count;
+    if (early) {
+        executed.data = (int32_t *) executed.data + 1;
+    }
+    auto & previous = source.spec->lookahead->input;
+    std::vector<const ggml_tensor *> tensors = { &position, chain.accepted, &count, &executed,
+        previous.fields[llama_nextn_control::KEPT], previous.fields[llama_nextn_control::EPOCH], chain.step, chain.selected_token };
     tensors.insert(tensors.end(), chain.tokens.begin(), chain.tokens.end());
     std::vector<void *> destinations;
     for (size_t i = 0; i < tensors.size(); ++i) {
-        destinations.push_back((int32_t *) first.input.rows[0]->data + i);
+        destinations.push_back((int32_t *) input.storage->data + i);
     }
-    ggml_backend_event_record(first.input.consumed.get(), backend);
-    ggml_backend_event_wait(producer, first.input.consumed.get());
+    ggml_backend_event_record(input.consumed.get(), backend);
+    ggml_backend_event_wait(producer, input.consumed.get());
     if (!get_batch(producer, tensors.data(), destinations.data(), tensors.size())) {
         return false;
     }
     ggml_backend_event_record(first.ready.get(), producer);
+    ggml_backend_tensor_get_async(producer, input.storage, ggml_backend_buffer_get_base(input.host.get()), 0, ggml_nbytes(input.storage));
+    ggml_backend_event_record(input.ready.get(), producer);
+    input.snapshot_pending = true;
     this->readback->submit();
     this->readback.reset();
     ggml_backend_event_record(this->output_ready.get(), backend);
@@ -423,6 +484,7 @@ bool llama_spec_pipeline::prefetch_nextn_target(llama_context & source) {
     }
     ggml_backend_event_record(first.done.get(), backend);
     this->target_pending = bank*10 + n_begin;
+    source.spec->lookahead->next = first.input;
     if (!this->prefetch_reported) {
         LLAMA_LOG_INFO("%s: GPU NextN pipeline active; target submitted before CPU acceptance\n", __func__);
         this->prefetch_reported = true;
@@ -480,13 +542,16 @@ bool llama_spec_pipeline::decode_nextn_verify(llama_context & source, const llam
                 prepared.generation == chain.generation && lookahead && prepared.previous_pos == lookahead->pos + offset &&
                 lctx.memory->seq_pos_max(chain.seed_seq) == batch.pos[0] - 1 &&
                 prepared.controls && prepared.controls->allow_reuse(controls)) {
-            ggml_backend_event_synchronize(lookahead->ready.get());
-            const auto * sampled = (const llama_token *) ggml_backend_buffer_get_base(lookahead->sampled.host.get());
-            int accepted = 0;
-            while (accepted + 1 < (int) lookahead->draft.size() && sampled[accepted] == lookahead->draft[accepted]) {
-                ++accepted;
-            }
-            consume_target = batch.pos[0] == prepared.previous_pos + accepted + 1 && batch.token[0] == sampled[accepted];
+            const auto * control = prepared.input->snapshot();
+            const int accepted = control[llama_nextn_control::ACCEPTED];
+            consume_target = control[llama_nextn_control::EPOCH] == lookahead->epoch &&
+                control[llama_nextn_control::STEP] == lookahead->step + 1 &&
+                control[llama_nextn_control::KEPT] + 1 == n &&
+                control[llama_nextn_control::PREVIOUS_KEPT] + 1 == prepared.previous_n &&
+                accepted >= 0 && accepted < prepared.previous_n &&
+                batch.pos[0] == prepared.previous_pos + accepted + 1 &&
+                batch.pos[0] == control[llama_nextn_control::POSITION] + offset &&
+                batch.token[0] == control[llama_nextn_control::N_FIELDS];
             auto * hybrid = dynamic_cast<llama_memory_hybrid *>(lctx.memory.get());
             auto * kv = hybrid ? hybrid->get_mem_attn() : static_cast<llama_kv_cache *>(lctx.memory.get());
             const auto & cells = kv->get_cells(0);
@@ -794,7 +859,7 @@ bool llama_spec_pipeline::decode_nextn_prefetch(llama_context & source, const ll
         }
         sampled.consumed.reset(ggml_backend_event_new(dev));
         state->ready.reset(ggml_backend_event_new(dev));
-        if (!sampled.device || !sampled.host || !sampled.consumed || !state->ready) {
+        if (!sampled.device || !sampled.host || !sampled.consumed || !state->ready || !state->input.init(dst_backend)) {
             return false;
         }
         this->lookahead = std::move(state);
@@ -810,6 +875,28 @@ bool llama_spec_pipeline::decode_nextn_prefetch(llama_context & source, const ll
         tensors.push_back(source.gf_res_prev->t_sampled[i]);
         destinations.push_back((llama_token *) sampled->data + i);
     }
+    const auto * active = source.spec->target_active >= 0 ? source.spec->targets[source.spec->target_active].get() : nullptr;
+    if (active && active->input == state.next) {
+        tensors.push_back(active->input->storage);
+        destinations.push_back(state.input.storage->data);
+        ++state.step;
+        LLAMA_LOG_DEBUG("%s: GPU control feedback epoch=%d step=%d\n", __func__, state.epoch, state.step);
+    } else {
+        if (state.pos >= 0) {
+            ggml_backend_event_synchronize(state.sampled.consumed.get());
+        }
+        state.epoch = state.epoch == INT32_MAX ? 1 : state.epoch + 1;
+        state.step = 0;
+        std::array<int32_t, llama_nextn_control::N_FIELDS + 9> initial = {};
+        initial[llama_nextn_control::POSITION] = batch.pos[0];
+        initial[llama_nextn_control::KEPT] = n - 1;
+        initial[llama_nextn_control::EXECUTED] = n - 1;
+        initial[llama_nextn_control::EPOCH] = state.epoch;
+        std::copy_n(batch.token, n, initial.data() + llama_nextn_control::N_FIELDS);
+        ggml_backend_tensor_set(state.input.storage, initial.data(), 0, sizeof(initial));
+        LLAMA_LOG_DEBUG("%s: GPU control bootstrap epoch=%d pos=%d rows=%d\n", __func__, state.epoch, batch.pos[0], n);
+    }
+    state.next.reset();
     if (!get_batch(src_backend, tensors.data(), destinations.data(), tensors.size())) {
         return false;
     }
@@ -856,8 +943,22 @@ bool llama_spec_pipeline::decode_nextn(const llama_batch & seed, int32_t n_draft
             }
             const auto * sampled = (const llama_token *) ggml_backend_buffer_get_base(state.sampled.host.get());
             int accepted = 0;
-            while (accepted + 1 < (int) state.draft.size() && sampled[accepted] == state.draft[accepted]) {
-                ++accepted;
+            if (state.next) {
+                const auto * control = state.next->snapshot();
+                if (control[llama_nextn_control::EPOCH] != state.epoch || control[llama_nextn_control::STEP] != state.step + 1 ||
+                        control[llama_nextn_control::PREVIOUS_KEPT] + 1 != (int) state.draft.size()) {
+                    return false;
+                }
+                accepted = control[llama_nextn_control::ACCEPTED];
+                if (accepted < 0 || accepted >= (int) state.draft.size() ||
+                        control[llama_nextn_control::POSITION] != seed.pos[0] ||
+                        control[llama_nextn_control::N_FIELDS] != seed.token[0]) {
+                    return false;
+                }
+            } else {
+                while (accepted + 1 < (int) state.draft.size() && sampled[accepted] == state.draft[accepted]) {
+                    ++accepted;
+                }
             }
             const auto dim = lctx.model.hparams.n_embd_out();
             const auto * hidden = (const float *) ggml_backend_buffer_get_base(this->handoff->host.get());
@@ -1020,15 +1121,21 @@ bool llama_spec_pipeline::decode_nextn(const llama_batch & seed, int32_t n_draft
                 ggml_set_input(tensor);
                 return tensor;
             };
-            chain.inp_draft = input(GGML_TYPE_I32, n_verify);
+            chain.inp_bonus = input(GGML_TYPE_I32, 1);
             chain.inp_weights = input(GGML_TYPE_F32, n_verify);
             chain.inp_positions = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_pos, n_draft);
             ggml_set_input(chain.inp_positions);
             chain.inp_position_mask = input(GGML_TYPE_F32, n_pos);
             chain.inp_kv_positions = lctx.model.arch == LLM_ARCH_EAGLE3 ? nullptr : input(GGML_TYPE_F32, contexts[0]->get_n_kv());
+            const auto & control = this->lookahead->input;
+            auto * draft = chain.inp_bonus;
+            if (n_verify > 1) {
+                auto * proposals = ggml_view_1d(ctx, control.tokens[n_verify - 1], n_verify - 1, sizeof(llama_token));
+                draft = ggml_concat(ctx, proposals, chain.inp_bonus, 0);
+            }
             auto * sampled = this->lookahead->sampled.rows[n_verify - 1];
             auto * mismatch = ggml_step(ctx, ggml_abs(ctx, ggml_sub(ctx,
-                    ggml_cast(ctx, sampled, GGML_TYPE_F32), ggml_cast(ctx, chain.inp_draft, GGML_TYPE_F32))));
+                    ggml_cast(ctx, sampled, GGML_TYPE_F32), ggml_cast(ctx, draft, GGML_TYPE_F32))));
             // Descending weights make the first mismatch unique, including the bonus row.
             chain.accepted = ggml_argmax(ctx, ggml_mul(ctx, mismatch, chain.inp_weights));
             chain.selected_token = ggml_get_rows(ctx, ggml_reshape_2d(ctx, sampled, 1, n_verify), chain.accepted);
@@ -1036,14 +1143,19 @@ bool llama_spec_pipeline::decode_nextn(const llama_batch & seed, int32_t n_draft
             ggml_set_output(chain.selected_token);
             chain.selected_hidden = ggml_get_rows(ctx, this->handoff->rows[n_verify - 1], chain.accepted);
             auto * accepted_f32 = ggml_cast(ctx, chain.accepted, GGML_TYPE_F32);
+            auto * base = ggml_add(ctx, ggml_cast(ctx, control.fields[llama_nextn_control::POSITION], GGML_TYPE_F32), accepted_f32);
             auto * positions = ggml_cast(ctx, ggml_mul(ctx,
-                    ggml_add(ctx, chain.inp_positions, accepted_f32), chain.inp_position_mask), GGML_TYPE_I32);
+                    ggml_add(ctx, chain.inp_positions, base), chain.inp_position_mask), GGML_TYPE_I32);
             ggml_set_output(positions);
             for (int i = 0; i < n_draft; i++) {
                 chain.positions.push_back(ggml_view_1d(ctx, positions, n_pos, i*n_pos*sizeof(int32_t)));
             }
             chain.reject_mask = chain.inp_kv_positions ? ggml_scale(ctx, ggml_step(ctx,
                     ggml_sub(ctx, chain.inp_kv_positions, accepted_f32)), -1e30f) : nullptr;
+            chain.step = ggml_cast(ctx, ggml_scale_bias(ctx,
+                    ggml_cast(ctx, control.fields[llama_nextn_control::STEP], GGML_TYPE_F32), 1.0f, 1.0f), GGML_TYPE_I32);
+            ggml_set_output(chain.step);
+            ggml_build_forward_expand(res->get_gf(), chain.step);
         }
         for (int i = 0; i < n_draft; i++) {
             auto params = params_for(i);
@@ -1078,7 +1190,7 @@ bool llama_spec_pipeline::decode_nextn(const llama_batch & seed, int32_t n_draft
     } else {
         lctx.n_reused++;
     }
-    if (p_min > 0.0f) {
+    if (prefetch || p_min > 0.0f) {
         if (!chain.early_device) {
             auto * backend = lctx.backend_ptrs[0];
             auto * dev = ggml_backend_get_device(backend);
@@ -1094,40 +1206,46 @@ bool llama_spec_pipeline::decode_nextn(const llama_batch & seed, int32_t n_draft
                 return fail();
             }
         }
-        if (!ggml_backend_sched_graph_early_exit(chain.sched.get(), chain.logits.data(), n_draft, p_min, chain.early_counts)) {
+        chain.kept = chain.early_counts;
+        if (p_min <= 0.0f && !reuse) {
+            const int32_t counts[] = { n_draft, n_draft };
+            ggml_backend_tensor_set(chain.early_counts, counts, 0, sizeof(counts));
+        }
+        if (p_min > 0.0f && !ggml_backend_sched_graph_early_exit(chain.sched.get(), chain.logits.data(), n_draft, p_min, chain.early_counts)) {
             return fail();
         }
     }
-    if (prefetch) {
-        const auto & state = *this->lookahead;
+    if (prefetch && !reuse) {
         std::vector<float> weights(n_verify);
         std::vector<float> positions(lctx.model.hparams.n_pos_per_embd()*n_draft);
         std::vector<float> position_mask(lctx.model.hparams.n_pos_per_embd(), 1.0f);
         if (position_mask.size() == 4) {
             position_mask[3] = 0.0f;
         }
-        std::vector<float> kv_positions(chain.inp_kv_positions ? chain.inp_kv_positions->ne[0] : 0, -1.0f);
         for (int i = 0; i < n_verify; i++) {
             weights[i] = n_verify - i;
         }
         for (int i = 0; i < n_draft; i++) {
             for (uint32_t j = 0; j < lctx.model.hparams.n_pos_per_embd(); j++) {
-                positions[i*lctx.model.hparams.n_pos_per_embd() + j] = state.pos + 1 + i;
+                positions[i*lctx.model.hparams.n_pos_per_embd() + j] = 1 + i;
             }
         }
+        const llama_token bonus = LLAMA_TOKEN_NULL;
+        ggml_backend_tensor_set(chain.inp_bonus, &bonus, 0, sizeof(bonus));
+        ggml_backend_tensor_set(chain.inp_weights, weights.data(), 0, ggml_nbytes(chain.inp_weights));
+        ggml_backend_tensor_set(chain.inp_positions, positions.data(), 0, ggml_nbytes(chain.inp_positions));
+        ggml_backend_tensor_set(chain.inp_position_mask, position_mask.data(), 0, ggml_nbytes(chain.inp_position_mask));
+    }
+    if (prefetch && chain.inp_kv_positions) {
+        const auto & state = *this->lookahead;
+        std::vector<float> kv_positions(chain.inp_kv_positions->ne[0], -1.0f);
         const auto & cells = static_cast<llama_kv_cache *>(lctx.memory.get())->get_cells(seq_id);
         for (size_t i = 0; i < kv_positions.size(); i++) {
             if (cells.seq_has(i, seq_id) && cells.pos_get(i) >= state.pos && cells.pos_get(i) < state.pos + n_verify) {
                 kv_positions[i] = cells.pos_get(i) - state.pos;
             }
         }
-        ggml_backend_tensor_set(chain.inp_draft, state.draft.data(), 0, ggml_nbytes(chain.inp_draft));
-        ggml_backend_tensor_set(chain.inp_weights, weights.data(), 0, ggml_nbytes(chain.inp_weights));
-        ggml_backend_tensor_set(chain.inp_positions, positions.data(), 0, ggml_nbytes(chain.inp_positions));
-        ggml_backend_tensor_set(chain.inp_position_mask, position_mask.data(), 0, ggml_nbytes(chain.inp_position_mask));
-        if (chain.inp_kv_positions) {
-            ggml_backend_tensor_set(chain.inp_kv_positions, kv_positions.data(), 0, ggml_nbytes(chain.inp_kv_positions));
-        }
+        ggml_backend_tensor_set(chain.inp_kv_positions, kv_positions.data(), 0, ggml_nbytes(chain.inp_kv_positions));
     }
     for (int i = 0; i < n_draft; i++) {
         for (size_t j = i ? chain.input_ends[i - 1] : 0; j < chain.input_ends[i]; j++) {
@@ -1418,6 +1536,10 @@ void llama_spec_pipeline::add_memory_usage(std::map<ggml_backend_buffer_type_t, 
         add_buffer(this->features->device);
         add_buffer(this->features->host);
     }
+    if (this->lookahead) {
+        add_buffer(this->lookahead->input.device);
+        add_buffer(this->lookahead->input.host);
+    }
     auto add_early = [&](const std::unique_ptr<llama_nextn_graph> & entry) {
         if (entry) {
             add_buffer(entry->early_device);
@@ -1428,9 +1550,11 @@ void llama_spec_pipeline::add_memory_usage(std::map<ggml_backend_buffer_type_t, 
     for (const auto & entry : this->graph_cache) {
         add_early(entry);
     }
+    std::set<const llama_nextn_control *> controls;
     for (const auto & entry : this->targets) {
-        if (entry) {
-            add_buffer(entry->input.device);
+        if (entry && entry->input && controls.insert(entry->input.get()).second) {
+            add_buffer(entry->input->device);
+            add_buffer(entry->input->host);
         }
     }
 }
