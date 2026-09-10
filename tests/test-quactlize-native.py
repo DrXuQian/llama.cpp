@@ -13,6 +13,59 @@ from quactlize_native import timings, selection, summarize, PATTERN
 
 
 class NativeEvidence(unittest.TestCase):
+    def test_trace_tensor_inventory_uses_exact_names_including_dense_q8(self):
+        names = ["blk.0.attn_q.weight", "blk.0.ffn_gate_exps.weight", "output.weight"]
+        pattern = native.inventory_pattern(dict(eligible=names))
+        for name in names:
+            self.assertIsNotNone(re.search(pattern, name))
+        for name in ("blk.0.attn_output.weight", "prefixoutput.weight", "output.weight.extra"):
+            self.assertIsNone(re.search(pattern, name))
+        for names in ([], ["a", "a"], [None], "output.weight"):
+            with self.assertRaisesRegex(ValueError, "invalid trace tensor inventory"):
+                native.inventory_pattern(dict(eligible=names))
+
+    def test_asys_parameters_support_2048_without_hidden_128_token_clamp(self):
+        self.assertEqual(native.proof_parameters(SimpleNamespace()), dict(
+            context=512, batch=128, generate=8, prompts=[128], repeats=1))
+        self.assertEqual(native.proof_parameters(SimpleNamespace(proof_prompt=2048, proof_generate=16)), dict(
+            context=2304, batch=2048, generate=16, prompts=[2048], repeats=1))
+        self.assertGreater(native.proof_parameters(SimpleNamespace(proof_prompt=2048, proof_generate=256))["context"], 2304)
+        for prompt, generate in ((0, 16), (1, 16), (2048, 0), (2048, 1), (True, 16)):
+            with self.assertRaisesRegex(ValueError, "invalid Asys"):
+                native.proof_parameters(SimpleNamespace(proof_prompt=prompt, proof_generate=generate))
+
+    def test_proof_only_skips_abba_and_never_claims_performance(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            bundle, output = root / "bundle", root / "output"
+            bundle.mkdir()
+            (bundle / "manifest.json").write_text(json.dumps(dict(modules=[])))
+            argv = ["quactlize_native.py", "--bundle", str(bundle), "--output", str(output),
+                    "--proof-only", "--proof-prompt", "2048", "--proof-generate", "16"]
+            inventory = root / "inventory.json"
+            inventory.write_text(json.dumps(dict(eligible=["blk.0.attn_q.weight", "output.weight"])))
+            argv += ["--tensor-inventory", str(inventory)]
+            for name in ("binary", "model", "cache", "asys", "inspector"):
+                argv += ["--" + name, str(root / name)]
+            result = dict(kernel_execution="PARTIAL_SHORT_REQUEST", missing_ops=["dense"])
+            with (patch("sys.argv", argv), patch.object(native, "proof", return_value=result) as proof,
+                  patch.object(native, "run_arm") as run):
+                native.main()
+            run.assert_not_called()
+            proof.assert_called_once()
+            self.assertEqual(proof.call_args.args[0].proof_prompt, 2048)
+            protocol = json.loads((output / "protocol.json").read_text())
+            self.assertEqual(protocol["order"], ["native"])
+            self.assertEqual(protocol["prompts"], [2048])
+            self.assertEqual(protocol["prefill_token_batch"], 2048)
+            self.assertEqual(protocol["dense_scope"], "BENCHMARK_INVENTORY")
+            self.assertIn("attn_q", proof.call_args.args[0].tensor_override_pattern)
+            summary = json.loads((output / "summary.json").read_text())
+            self.assertEqual(summary["status"], "TRACE_CAPTURED")
+            self.assertEqual(summary["performance"], "NOT_MEASURED")
+            self.assertEqual(summary["kernel_execution"], "PARTIAL_SHORT_REQUEST")
+            self.assertEqual(summary["missing_native_ops"], ["dense"])
+
     def module_fixture(self, root, cached):
         key = "a" * 64
         bundle, cache = root / "bundle", root / "cache"
