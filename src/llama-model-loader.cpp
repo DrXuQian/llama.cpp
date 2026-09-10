@@ -5,6 +5,7 @@
 #include "gguf.h"
 #include "llama-hparams.h"
 #include "llama-kpack-cache.h"
+#include "../ggml/src/ggml-cuda/quactlize-sidecar.h"
 
 #include <algorithm>
 #include <array>
@@ -1253,6 +1254,48 @@ struct ggml_tensor * llama_model_loader::create_tensor(
     }
 
     ggml_tensor * t_meta = get_tensor_meta(tn.str().c_str());
+    const char * pair_weights = getenv("QUACTLIZE_KPACK_PAIR_WEIGHTS");
+    if (!t_meta && tn.tensor==LLM_TENSOR_FFN_GATE_UP_EXPS && tn.suffix && !strcmp(tn.suffix,"weight") &&
+        pair_weights && !strcmp(pair_weights,"1") && !(flags & (TENSOR_SKIP|TENSOR_DUPLICATED))) {
+        const std::string gate_name=LLM_TN_IMPL(tn.arch,LLM_TENSOR_FFN_GATE_EXPS,"weight",tn.bid,tn.xid).str();
+        const std::string up_name=LLM_TN_IMPL(tn.arch,LLM_TENSOR_FFN_UP_EXPS,"weight",tn.bid,tn.xid).str();
+        const auto * gate=get_weight(gate_name.c_str());
+        const auto * up=get_weight(up_name.c_str());
+        bool plain=gate && up && gate->paired_sources.empty() && up->paired_sources.empty() &&
+            gate->tensor->type==up->tensor->type && ggml_are_same_shape(gate->tensor,up->tensor) &&
+            ggml_n_dims(gate->tensor)==3 && ne.size()==3 && gate->tensor->ne[1]<=INT64_MAX/2;
+        // Per-projection bias/scales cannot be represented by the plain merged graph.
+        for (const auto & name:{gate_name,up_name}) {
+            const auto prefix=name.substr(0,name.size()-6);
+            for (const auto & entry:weights_map)
+                if (entry.first!=name && entry.first.compare(0,prefix.size(),prefix)==0) plain=false;
+        }
+        if (plain) {
+            ggml_tensor meta=*gate->tensor;
+            meta.ne[1]*=2; meta.nb[2]*=2; meta.nb[3]*=2; ggml_set_name(&meta,tn.str().c_str());
+            for (size_t j=0;j<3;++j) plain &= meta.ne[j]==ne.begin()[j];
+            auto buft=plain ? buft_for_tensor(&meta) : nullptr;
+            if (buft && tensor_buft_overrides) {
+                for (const auto & name:{gate_name,up_name}) for (auto rule=tensor_buft_overrides;rule->pattern;++rule) {
+                    if (std::regex_search(name,std::regex(rule->pattern))) { plain &= rule->buft==buft; break; }
+                }
+            }
+            auto dev=buft ? ggml_backend_buft_get_device(buft) : nullptr;
+            auto reg=dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+            auto accepts=reg ? reinterpret_cast<decltype(&ggml_quactlize_pair_supported)>(
+                ggml_backend_reg_get_proc_address(reg,"ggml_quactlize_pair_supported")) : nullptr;
+            auto setter=reg ? ggml_backend_reg_get_proc_address(reg,"ggml_quactlize_set_gate_up") : nullptr;
+            if (plain && accepts && setter && accepts(buft,&meta)) {
+                auto * tensor=ggml_dup_tensor(ctx_for_buft(buft),&meta);
+                ggml_set_name(tensor,tn.str().c_str());
+                weights_map.emplace(tn.str(),llama_tensor_weight(tensor,gate_name,up_name));
+                n_created+=2;
+                LLAMA_LOG_INFO("[kpack-pair] %s <- {%s,%s} N=%" PRId64 " GPU_PACK\n",
+                    tensor->name,gate_name.c_str(),up_name.c_str(),tensor->ne[1]);
+                return tensor;
+            }
+        }
+    }
     ggml_backend_buffer_type_t buft = buft_for_tensor(t_meta);
     if (buft == nullptr) {
         return nullptr; // return type is ggml_tensor *
@@ -1363,7 +1406,7 @@ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps
 
     // compute the total size of all tensors for progress reporting
     for (const auto & it : weights_map) {
-        size_data += ggml_nbytes(it.second.tensor);
+        if (it.second.paired_sources.empty()) size_data += ggml_nbytes(it.second.tensor);
     }
 }
 
@@ -1376,7 +1419,7 @@ void llama_model_loader::get_mapping_range(size_t * first, size_t * last, void *
     *addr = mapping->addr();
     for (ggml_tensor * tensor = ggml_get_first_tensor(ctx); tensor; tensor = ggml_get_next_tensor(ctx, tensor)) {
         const auto * weight = get_weight(ggml_get_name(tensor));
-        if (!weight || weight->idx != idx) {
+        if (!weight || !weight->paired_sources.empty() || weight->idx != idx) {
             continue;
         }
         *first = std::min(*first, weight->offs);
@@ -1386,6 +1429,7 @@ void llama_model_loader::get_mapping_range(size_t * first, size_t * last, void *
 
 void llama_model_loader::load_data_for(struct ggml_tensor * cur) const {
     const auto & w = require_weight(ggml_get_name(cur));
+    if (!w.paired_sources.empty()) throw std::runtime_error("paired weights require backend GPU loading");
 
     if (use_mmap) {
         const auto & mapping = mappings.at(w.idx);
@@ -1539,6 +1583,35 @@ bool llama_model_loader::load_all_data(
 
         if (kpack_cache && kpack_cache->load(cur)) {
             size_done += n_size;
+            continue;
+        }
+
+        if (!weight->paired_sources.empty()) {
+            auto dev=ggml_backend_buft_get_device(ggml_backend_buffer_get_type(cur->buffer));
+            auto setter=reinterpret_cast<decltype(&ggml_quactlize_set_gate_up)>(
+                ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(dev),"ggml_quactlize_set_gate_up"));
+            if (!setter || weight->paired_sources.size()!=2) throw std::runtime_error("paired GPU loader is unavailable");
+            std::vector<uint8_t> buffers[2];
+            const void * data[2]{};
+            for (int j=0;j<2;++j) {
+                const auto & src=require_weight(weight->paired_sources[j].c_str());
+                if (ggml_nbytes(src.tensor)!=n_size/2 || !src.paired_sources.empty())
+                    throw std::runtime_error("paired source geometry differs");
+                if (use_mmap) data[j]=static_cast<uint8_t*>(mappings.at(src.idx)->addr())+src.offs;
+                else {
+                    buffers[j].resize(n_size/2);
+                    files.at(src.idx)->seek(src.offs,SEEK_SET);
+                    files.at(src.idx)->read_raw(buffers[j].data(),buffers[j].size());
+                    data[j]=buffers[j].data();
+                }
+                if (check_tensors && !ggml_validate_row_data(cur->type,data[j],n_size/2))
+                    throw std::runtime_error("paired source tensor has invalid data");
+            }
+            // Setter waits only for H2D source consumption; final packing and
+            // background D2H use their existing, independent stream lifetimes.
+            setter(cur,data[0],data[1],n_size/2);
+            if (kpack_cache) kpack_cache->capture(cur);
+            size_done+=n_size;
             continue;
         }
 

@@ -1497,6 +1497,10 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 src.ggml_type = w.tensor->type; src.rank = ggml_n_dims(w.tensor);
                 src.k = w.tensor->ne[0]; src.n = w.tensor->ne[1];
                 src.experts = src.rank == 3 ? w.tensor->ne[2] : 0;
+                for (const auto & name:w.paired_sources) {
+                    const auto & part=ml.require_weight(name.c_str());
+                    src.components.push_back({name,part.gguf_index,part.offs,ggml_nbytes(part.tensor)});
+                }
                 inventory.push_back(std::move(src));
             }
             pimpl->kpack_cache = std::make_unique<llama_kpack_cache>(

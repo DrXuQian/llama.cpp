@@ -3995,6 +3995,32 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
 }
 
 // try and fuse nodes and return the number of nodes to skip
+#ifdef GGML_NCP_QUACTLIZE
+static int ggml_cuda_try_fuse_quactlize_router(ggml_backend_cuda_context & ctx, ggml_cgraph * graph,
+    int start, std::vector<ggml_op> ops, int ids_index, int weights_index,
+    const ggml_tensor * logits, ggml_tensor * weights, ggml_tensor * ids,
+    const ggml_tensor * clamp, const ggml_tensor * scale, const ggml_tensor * bias,
+    const ggml_cuda_topk_moe_args & args) {
+    if (logits->ne[0]!=256 || logits->type!=GGML_TYPE_F32 || !ggml_is_contiguous(logits) ||
+        (bias && (bias->type!=GGML_TYPE_F32 || !ggml_is_contiguous(bias)))) return 0;
+    int next=start+int(ops.size());
+    while (next<graph->n_nodes && (graph->nodes[next]->op==GGML_OP_VIEW || graph->nodes[next]->op==GGML_OP_RESHAPE)) {
+        ops.push_back(graph->nodes[next++]->op);
+    }
+    const int count=ggml_quactlize_execution_moe_nodes(graph,next);
+    if (!count) return 0;
+    for (int j=0;j<count;++j) ops.push_back(graph->nodes[next+j]->op);
+    const int outputs[3]={ids_index,weights_index,next+count-1};
+    if (!ggml_can_fuse_subgraph(graph,start,ops.size(),ops.data(),outputs,3) ||
+        !ggml_cuda_check_fusion_memory_ranges(graph,start,ops.size(),outputs,3)) return 0;
+    const qk_llama_router_v1 router{1,sizeof(router),int(args.sigmoid),int(clamp!=nullptr),
+        int(args.delayed_softmax),0,clamp?ggml_get_op_params_f32(clamp,0):-INFINITY,
+        scale?ggml_get_op_params_f32(scale,0):1.f,static_cast<float const*>(logits->data),
+        bias?static_cast<float const*>(bias->data):nullptr,static_cast<float*>(weights->data)};
+    return ggml_quactlize_execution_moe_router_run(ctx,graph,next,router,ids) ? int(ops.size())-1 : 0;
+}
+#endif
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
     static bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
@@ -4003,6 +4029,14 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     ggml_tensor * node = cgraph->nodes[i];
+
+#ifdef GGML_NCP_QUACTLIZE
+    if (const int count = ggml_quactlize_execution_moe_nodes(cgraph,i)) {
+        const int output = i+count-1;
+        if (ggml_cuda_check_fusion_memory_ranges(cgraph,i,count,&output,1) &&
+            ggml_quactlize_execution_moe_run(*cuda_ctx,cgraph,i)) return count-1;
+    }
+#endif
 
     //topk-moe
     if (cgraph->nodes[i]->op == GGML_OP_UNARY || cgraph->nodes[i]->op == GGML_OP_SOFT_MAX ||
@@ -4052,6 +4086,10 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 if (ggml_can_fuse_subgraph(cgraph, i, ops.size(), ops.data(), out_nodes, 2) &&
                         ggml_cuda_should_use_topk_moe(node, logits, weights, ids) &&
                         ggml_cuda_check_fusion_memory_ranges(cgraph, i, ops.size(), out_nodes, 2, /*is_topk_moe=*/true)) {
+#ifdef GGML_NCP_QUACTLIZE
+                    if (int skipped=ggml_cuda_try_fuse_quactlize_router(*cuda_ctx,cgraph,i,ops,out_nodes[0],out_nodes[1],
+                            logits,weights,ids,clamp,scale,bias,args)) return skipped;
+#endif
                     ggml_cuda_op_topk_moe(*cuda_ctx, logits, weights, ids, clamp, scale, bias, args);
                     return ops.size() - 1;
                 }
@@ -4067,6 +4105,10 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 if (ggml_can_fuse_subgraph(cgraph, i, ops.size(), ops.data(), out_nodes, 2) &&
                         ggml_cuda_should_use_topk_moe(softmax, logits, weights, ids) &&
                         ggml_cuda_check_fusion_memory_ranges(cgraph, i, ops.size(), out_nodes, 2, /*is_topk_moe=*/true)) {
+#ifdef GGML_NCP_QUACTLIZE
+                    if (int skipped=ggml_cuda_try_fuse_quactlize_router(*cuda_ctx,cgraph,i,ops,out_nodes[0],out_nodes[1],
+                            logits,weights,ids,clamp,scale,bias,args)) return skipped;
+#endif
                     ggml_cuda_op_topk_moe(*cuda_ctx, logits, weights, ids, clamp, scale, bias, args);
                     return ops.size() - 1;
                 }
@@ -5852,6 +5894,8 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     if (strcmp(name, "ggml_quactlize_set_planes") == 0) {
         return (void *) ggml_quactlize_set_planes;
     }
+    if (strcmp(name, "ggml_quactlize_pair_supported") == 0) return (void *) ggml_quactlize_pair_supported;
+    if (strcmp(name, "ggml_quactlize_set_gate_up") == 0) return (void *) ggml_quactlize_set_gate_up;
     if (strcmp(name, "ggml_quactlize_copy_range_async") == 0) {
         return (void *) ggml_quactlize_copy_range_async;
     }

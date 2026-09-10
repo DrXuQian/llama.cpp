@@ -221,6 +221,7 @@ bool is_hex64(const std::string & s) {
 // The k-quant names as the GGUF Python package spells them (GGMLQuantizationType.name): what the schema stores.
 const char * kquant_type_name(int32_t t) {
     switch (t) {
+        case GGML_TYPE_Q8_0: return "Q8_0";
         case GGML_TYPE_Q2_K: return "Q2_K";
         case GGML_TYPE_Q3_K: return "Q3_K";
         case GGML_TYPE_Q4_K: return "Q4_K";
@@ -237,8 +238,8 @@ std::string upper_type_name(int32_t t) {
 }
 
 // The layout policy the schema records per format: Q4_K rides its own descriptor, every other k-quant the shared one.
-const char * layout_name_for(int32_t t) { return t == GGML_TYPE_Q4_K ? "q4-kpack4" : "kquant-kpack"; }
-int32_t      layout_id_for(int32_t t)   { return t == GGML_TYPE_Q4_K ? 1 : 2; }
+const char * layout_name_for(int32_t t) { return t == GGML_TYPE_Q8_0 ? "q8-kpack2" : t == GGML_TYPE_Q4_K ? "q4-kpack4" : "kquant-kpack"; }
+int32_t      layout_id_for(int32_t t)   { return t == GGML_TYPE_Q8_0 ? 4 : t == GGML_TYPE_Q4_K ? 1 : 2; }
 
 // Python's json.dumps(separators=(",", ":")) for one string: ensure_ascii, the short escapes json.dumps uses, and
 // \uXXXX (surrogate pairs above the BMP) for everything else. The binding digest is over this exact encoding.
@@ -399,6 +400,59 @@ bool get_string(const json & v, std::string & out, const char * what, std::strin
     return true;
 }
 
+using source_component = llama_kpack_source_tensor::component;
+ojson source_record(llama_kpack_source_tensor const& src) {
+    if (src.components.empty()) return {{"index",src.gguf_index},{"data_offset",src.data_offset},{"size_bytes",src.size_bytes}};
+    ojson parts=ojson::array();
+    for (auto const& part:src.components) parts.push_back({{"name",part.name},{"index",part.index},
+        {"data_offset",part.offset},{"size_bytes",part.bytes}});
+    return {{"kind","gate-up"},{"size_bytes",src.size_bytes},{"components",parts}};
+}
+bool source_ranges(json const& source,bool local,bool allow_pair,int64_t raw_bytes,
+    std::vector<source_component>& parts,std::string& error) {
+    bool pair=source.contains("components");
+    int64_t bytes;
+    if (pair) {
+        if (!allow_pair || !keys_exactly(source,{"kind","size_bytes","components"},"paired source",error) ||
+            source["kind"]!="gate-up" || !source["components"].is_array() || source["components"].size()!=2) {
+            error="invalid paired source record"; return false;
+        }
+    } else if (!keys_exactly(source,local?std::initializer_list<const char*>{"index","data_offset","size_bytes"}:
+            std::initializer_list<const char*>{"index","data_offset","size_bytes","sha256","binding_sha256"},"source_tensor",error)) return false;
+    if (!get_positive(source["size_bytes"],bytes,"source size",error) || bytes!=raw_bytes || (pair && bytes%2)) {
+        error="source size differs from canonical GGUF size"; return false;
+    }
+    for (int j=0;j<(pair?2:1);++j) {
+        const auto& item=pair?source["components"][j]:source;
+        source_component part; int64_t index,offset,size;
+        if (pair && (!keys_exactly(item,{"name","index","data_offset","size_bytes"},"component",error) ||
+            !get_string(item["name"],part.name,"component name",error))) return false;
+        if (!get_nonneg(item["index"],index,"source index",error) || index>INT32_MAX ||
+            !get_nonneg(item["data_offset"],offset,"source offset",error) ||
+            !get_positive(item["size_bytes"],size,"source bytes",error) || size!=bytes/(pair?2:1)) {
+            error="invalid source component geometry"; return false;
+        }
+        part.index=int32_t(index); part.offset=offset; part.bytes=size; parts.push_back(part);
+    }
+    if (pair && parts[0].name==parts[1].name) { error="paired source names must differ"; return false; }
+    return true;
+}
+bool admit_source_ranges(std::vector<source_component> const& parts,uint64_t file_size,
+    std::set<int32_t>& indices,std::map<uint64_t,uint64_t>& ranges,std::string& error) {
+    for (auto const& part:parts) {
+        if (part.offset>file_size || part.bytes>file_size-part.offset || !indices.insert(part.index).second) {
+            error="duplicate source index or source outside GGUF"; return false;
+        }
+        auto next=ranges.lower_bound(part.offset);
+        if ((next!=ranges.end() && next->first<part.offset+part.bytes) ||
+            (next!=ranges.begin() && std::prev(next)->second>part.offset)) {
+            error="source components overlap"; return false;
+        }
+        ranges.emplace(part.offset,part.offset+part.bytes);
+    }
+    return true;
+}
+
 // Plane geometry from a record's own numbers: what the schema calls canonical shapes. bits/high_bits come from the
 // record's arrangement (checked against the library by the loader); the packed-unit factor is derived from the
 // units span the way quactlize derives it -- metadata bytes per superblock, paired when that is not a multiple of 4.
@@ -416,6 +470,16 @@ bool derive_geometry(int64_t n, int64_t k, int64_t experts, bool grouped, int32_
     g.low_bytes  = g.e1 * n * k * bits / 8;
     g.high_bytes = high_bits ? g.e1 * n * k * high_bits / 8 : 0;
     g.units_bytes = units_bytes_total;
+    if (bits == 8) {
+        if (high_bits || units_bytes_total != g.e1*n*k/16) {
+            error = "Q8_0 requires only one FP16 scale per 32 codes"; return false;
+        }
+        g.spu = 1; g.ub = 16;
+        g.low_shape = {g.e1,k/2,n,2};
+        g.high_shape = {0};
+        g.units_shape = grouped ? std::vector<int64_t>{g.e1,k/32,n,2} : std::vector<int64_t>{k/32,n,2};
+        return true;
+    }
     if (units_bytes_total <= 0 || units_bytes_total % g.e1) { error = "units plane does not divide by experts"; return false; }
     const int64_t units_e = units_bytes_total / g.e1;
     if ((units_e * 256) % (n * k)) { error = "units plane is not a whole number of bytes per superblock"; return false; }
@@ -505,7 +569,8 @@ bool llama_kpack_sidecar_reader::open(const std::string & dir, std::string & err
     }
     if (!keys_exactly(m, { "schema", "schema_version", "arrangement_version", "model", "selection", "source",
                            "storage", "tensors", "skipped" }, "K-pack manifest", error)) { return false; }
-    const bool local = m["schema"] == KPACK_CACHE_SCHEMA && m["schema_version"] == 1;
+    const bool local = m["schema"] == KPACK_CACHE_SCHEMA && (m["schema_version"] == 1 || m["schema_version"] == 2);
+    const bool paired_cache=local && m["schema_version"]==2;
     pimpl->local_cache = local;
     if (!local && (m["schema"] != KPACK_SCHEMA || m["schema_version"] != KPACK_VERSION)) {
         error = "unsupported K-pack bundle schema/version"; return false;
@@ -568,6 +633,8 @@ bool llama_kpack_sidecar_reader::open(const std::string & dir, std::string & err
     uint64_t expected_region = 0;
     int64_t  prev_index = -1;
     uint64_t prev_end = 0;
+    std::set<int32_t> source_indices;
+    std::map<uint64_t,uint64_t> source_intervals;
     for (size_t i = 0; i < m["tensors"].size(); ++i) {
         const json & r = m["tensors"][i];
         llama_kpack_sidecar_record rec;
@@ -623,14 +690,10 @@ bool llama_kpack_sidecar_reader::open(const std::string & dir, std::string & err
         const int64_t raw_bytes = (int64_t) ggml_row_size((ggml_type) rec.ggml_type, rec.k) * rec.n * (grouped ? rec.experts : 1);
 
         const json & s = r["source_tensor"];
-        if (!keys_exactly(s, local ? std::initializer_list<const char *>{"index", "data_offset", "size_bytes"} :
-                                   std::initializer_list<const char *>{"index", "data_offset", "size_bytes", "sha256", "binding_sha256"},
-                          "source_tensor", error)) { return false; }
-        int64_t sidx, soff, ssize;
-        if (!get_nonneg(s["index"], sidx, "source_tensor.index", error) ||
-            !get_nonneg(s["data_offset"], soff, "source_tensor.data_offset", error) ||
-            !get_positive(s["size_bytes"], ssize, "source_tensor.size_bytes", error)) { return false; }
-        if (ssize != raw_bytes) { error = pre + "source tensor size is not the canonical GGUF size"; return false; }
+        std::vector<source_component> parts;
+        if (!source_ranges(s,local,paired_cache&&grouped,raw_bytes,parts,error) ||
+            !admit_source_ranges(parts,pimpl->source_size,source_indices,source_intervals,error)) return false;
+        int64_t sidx=parts[0].index,soff=parts[0].offset,ssize=raw_bytes;
         std::string ssha, sbind;
         if (!local && (!get_string(s["sha256"], ssha, "source_tensor.sha256", error) || !is_hex64(ssha) ||
             !get_string(s["binding_sha256"], sbind, "source_tensor.binding_sha256", error) || !is_hex64(sbind))) {
@@ -688,8 +751,8 @@ bool llama_kpack_sidecar_reader::open(const std::string & dir, std::string & err
         // ordering across records
         if (by_name.count(rec.name)) { error = "duplicate tensor name in K-pack manifest: " + rec.name; return false; }
         if (rec.region_offset != expected_region) { error = pre + "region is not in canonical manifest order"; return false; }
-        if (sidx <= prev_index) { error = "K-pack source tensor indices must be strictly increasing"; return false; }
-        if ((uint64_t) soff < prev_end) { error = "K-pack source tensor byte ranges must be ordered and disjoint"; return false; }
+        if (!paired_cache && sidx <= prev_index) { error = "K-pack source tensor indices must be strictly increasing"; return false; }
+        if (!paired_cache && (uint64_t) soff < prev_end) { error = "K-pack source tensor byte ranges must be ordered and disjoint"; return false; }
         expected_region += rec.region_size;
         prev_index = sidx; prev_end = (uint64_t) soff + (uint64_t) ssize;
 
@@ -724,12 +787,26 @@ bool llama_kpack_sidecar_reader::check_source_metadata(
         const auto & t = *it->second;
         const json & s = pimpl->manifest["tensors"][by_name.at(rec.name)]["source_tensor"];
         const bool grouped = rec.route_class == "grouped";
-        if (t.gguf_index != s["index"].get<int64_t>() || t.data_offset != s["data_offset"].get<uint64_t>() ||
-            t.size_bytes != s["size_bytes"].get<uint64_t>() || t.ggml_type != rec.ggml_type ||
+        if (t.size_bytes != s["size_bytes"].get<uint64_t>() || t.ggml_type != rec.ggml_type ||
             t.rank != (grouped ? 3 : 2) || t.n != rec.n || t.k != rec.k || t.experts != (grouped ? rec.experts : 0)) {
             error = "sidecar tensor " + rec.name + ": identity (index/offset/size/type/shape) disagrees with the GGUF";
             return false;
         }
+        if (!t.components.empty()) {
+            if (t.components.size()!=2 || s!=json(source_record(t))) { error="paired source identity differs"; return false; }
+            for (auto const& part:t.components) {
+                auto child=inv.find(part.name);
+                if (child==inv.end()) { error="paired source is absent from inventory"; return false; }
+                auto const& c=*child->second;
+                if (!c.components.empty() || c.gguf_index!=part.index || c.data_offset!=part.offset || c.size_bytes!=part.bytes ||
+                    c.rank!=3 || c.ggml_type!=t.ggml_type || c.k!=t.k || t.n%2 || c.n!=t.n/2 || c.experts!=t.experts) {
+                    error="paired source type/shape/index/offset differs"; return false;
+                }
+            }
+            continue;
+        }
+        if (s.contains("components") || t.gguf_index!=s["index"].get<int64_t>() ||
+            t.data_offset!=s["data_offset"].get<uint64_t>()) { error="source index/offset differs"; return false; }
         if (t.data_offset > pimpl->source_size || t.size_bytes > pimpl->source_size - t.data_offset) {
             error = "sidecar tensor " + rec.name + " range is outside the GGUF"; return false;
         }
@@ -840,6 +917,8 @@ struct llama_kpack_sidecar_writer::impl {
     int64_t     prev_index = -1;
     uint64_t    prev_end = 0;
     std::set<std::string> names;
+    std::set<int32_t> source_indices;
+    std::map<uint64_t,uint64_t> source_intervals;
     mapped_file source;
     std::string source_path;
 
@@ -921,6 +1000,7 @@ void llama_kpack_sidecar_writer::skip(const std::string & name, const std::strin
 bool llama_kpack_sidecar_writer::add(const llama_kpack_source_tensor & src, const void * source_data,
                                      const llama_kpack_planes & planes, std::string & error) {
     if (!source_data) { error = "source data is null"; return false; }
+    if (!src.components.empty() && !pimpl->local_cache) { error="paired sources require runtime cache v2"; return false; }
     const read_chunk read = [&](size_t offset, size_t, std::string & why) -> const uint8_t * {
         const uint8_t * ptrs[] = { planes.low, planes.high, planes.units };
         const size_t sizes[] = { planes.low_bytes, planes.high_bytes, planes.units_bytes };
@@ -941,7 +1021,8 @@ bool llama_kpack_sidecar_writer::add(const llama_kpack_source_tensor & src, cons
 bool llama_kpack_sidecar_writer::add_stream(const llama_kpack_source_tensor & src, const llama_kpack_planes & planes,
         const read_chunk & read, size_t chunk_bytes, const cancelled & cancel, std::string & error) {
     const auto & source = pimpl->source;
-    if (source.fd < 0 || src.data_offset > source.size || src.size_bytes > source.size - src.data_offset) {
+    if (source.fd < 0 || (src.components.empty() &&
+        (src.data_offset > source.size || src.size_bytes > source.size - src.data_offset))) {
         error = "source range is outside the bound file"; return false;
     }
     return add_record(src, "", planes, read, chunk_bytes, cancel, error);
@@ -960,8 +1041,9 @@ bool llama_kpack_sidecar_writer::add_record(const llama_kpack_source_tensor & sr
     if (!(src.rank == 2 || src.rank == 3) || (grouped && src.experts <= 0) || (!grouped && src.experts != 0)) {
         error = pre + "rank/experts disagree"; return false;
     }
-    if (src.gguf_index <= I.prev_index) { error = pre + "records must be added in increasing GGUF index order"; return false; }
-    if (src.data_offset < I.prev_end) { error = pre + "source byte ranges must be ascending and disjoint"; return false; }
+    if (!I.local_cache && src.gguf_index <= I.prev_index) { error = pre + "records must be added in increasing GGUF index order"; return false; }
+    if (!I.local_cache && src.data_offset < I.prev_end) { error = pre + "source byte ranges must be ascending and disjoint"; return false; }
+    if (!src.components.empty() && (!I.local_cache || !grouped)) { error="paired source requires grouped runtime cache"; return false; }
     if (!I.names.insert(src.name).second) { error = pre + "duplicate tensor"; return false; }
 
     geometry g;
@@ -973,6 +1055,11 @@ bool llama_kpack_sidecar_writer::add_record(const llama_kpack_source_tensor & sr
     }
     const uint64_t raw_bytes = ggml_row_size((ggml_type) src.ggml_type, src.k) * (uint64_t) src.n * (uint64_t) g.e1;
     if (src.size_bytes != raw_bytes) { error = pre + "source size is not the canonical GGUF size"; return false; }
+    if (I.local_cache) {
+        std::vector<source_component> parts;
+        if (!source_ranges(source_record(src),true,grouped,raw_bytes,parts,error) ||
+            !admit_source_ranges(parts,I.source.fd>=0?I.source.size:UINT64_MAX,I.source_indices,I.source_intervals,error)) return false;
+    }
 
     // region
     const uint64_t region_offset = align_up(I.pos);
@@ -1027,8 +1114,7 @@ bool llama_kpack_sidecar_writer::add_record(const llama_kpack_source_tensor & sr
         { "spans", spans },
     };
     if (I.local_cache) {
-        rec["source_tensor"].erase("sha256");
-        rec["source_tensor"].erase("binding_sha256");
+        rec["source_tensor"]=source_record(src);
     }
     I.tensors.push_back(std::move(rec));
     I.prev_index = src.gguf_index;
@@ -1070,6 +1156,13 @@ bool llama_kpack_sidecar_writer::finish(const std::string & model_label, const s
         if (!mf.still_same(error)) { abort(); return false; }
         for (const auto & r : I.tensors) {
             const auto & s = r["source_tensor"];
+            if (s.contains("components")) {
+                for (const auto & part:s["components"]) {
+                    uint64_t off=part["data_offset"],bytes=part["size_bytes"];
+                    if (off>src_size || bytes>src_size-off) { error="paired source outside file"; abort(); return false; }
+                }
+                continue;
+            }
             const uint64_t off = s["data_offset"].get<uint64_t>(), bytes = s["size_bytes"].get<uint64_t>();
             if (off > src_size || bytes > src_size - off) { error = "source range is outside file"; abort(); return false; }
         }
@@ -1128,7 +1221,7 @@ bool llama_kpack_sidecar_writer::finish(const std::string & model_label, const s
     };
     if (I.local_cache) {
         manifest["schema"] = KPACK_CACHE_SCHEMA;
-        manifest["schema_version"] = 1;
+        manifest["schema_version"] = 2;
         manifest["source"].erase("sha256");
         manifest["source"]["identity"] = identity;
         manifest["storage"].erase("sha256");
@@ -1198,7 +1291,7 @@ bool llama_kpack_background_writer::start(std::vector<llama_kpack_write_job> job
         error = "background writer cannot start"; return false;
     }
     std::sort(jobs.begin(), jobs.end(), [](const llama_kpack_write_job & a, const llama_kpack_write_job & b) {
-        return a.source.gguf_index < b.source.gguf_index;
+        return a.source.order_index() < b.source.order_index();
     });
     std::set<std::string> names;
     for (const auto & job : jobs) {

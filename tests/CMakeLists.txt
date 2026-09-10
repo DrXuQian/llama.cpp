@@ -284,6 +284,11 @@ if (GGML_NCP_QUACTLIZE)
         list(APPEND QUACTLIZE_STUB_TARGETS quactlize-stub-${variant})
     endforeach()
     target_compile_definitions(quactlize-stub-pack-incomplete PRIVATE QZ_PACK_OMIT_PREPARE)
+    add_library(quactlize-stub-native MODULE test-quactlize-pack-stub.c)
+    target_include_directories(quactlize-stub-native PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src/ggml-cuda)
+    set_target_properties(quactlize-stub-native PROPERTIES OUTPUT_NAME "quactlize_kpack_dispatch"
+        LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/quactlize-stub")
+    list(APPEND QUACTLIZE_STUB_TARGETS quactlize-stub-native)
 
     set(QUACTLIZE_LOADER_TU
         ${PROJECT_SOURCE_DIR}/ggml/src/ggml-cuda/quactlize-lib.cu

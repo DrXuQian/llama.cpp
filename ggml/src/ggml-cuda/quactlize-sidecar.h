@@ -17,6 +17,9 @@ bool ggml_quactlize_plane_layout(const ggml_tensor * tensor, size_t * low_bytes,
 // Loading-thread only. CPU inputs are consumed before return; uploads may still
 // be in flight in buffer-owned pinned slots. Consumers must use artifact.ready.
 void ggml_quactlize_set_planes(ggml_tensor * tensor, const ggml_quactlize_planes * planes);
+// Whole same-qtype gate/up sources, each [E,N/2,K]. No CPU concatenation.
+bool ggml_quactlize_pair_supported(ggml_backend_buffer_type_t, const ggml_tensor * merged);
+void ggml_quactlize_set_gate_up(ggml_tensor * merged, const void * gate, const void * up, size_t bytes_each);
 
 // Offset addresses the resident [low][high][units] allocation. The destination
 // must be pinned, and completion must belong to the tensor's device. Caller owns

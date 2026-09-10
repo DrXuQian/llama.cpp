@@ -57,9 +57,11 @@ typedef struct quactlize_ppu_placed_arrangement_v1 {
 #define QUACTLIZE_PPU_LAYOUT_Q4_KPACK4_TRANSPOSE_V1 1
 #define QUACTLIZE_PPU_LAYOUT_KQUANT_KPACK_TRANSPOSE_V1 2
 #define QUACTLIZE_PPU_LAYOUT_Q4_N16K64_DIRECT_V1 3
+#define QUACTLIZE_PPU_LAYOUT_Q8_KPACK2_TRANSPOSE_V1 4
 #define QUACTLIZE_PPU_Q4_KPACK4_MAPPING_ID UINT64_C(0x51344b5034540001)
 #define QUACTLIZE_PPU_KQUANT_KPACK_MAPPING_ID UINT64_C(0x514b504b54000001)
 #define QUACTLIZE_PPU_Q4_N16K64_DIRECT_MAPPING_ID UINT64_C(0x51344e3136440001)
+#define QUACTLIZE_PPU_Q8_KPACK2_MAPPING_ID UINT64_C(0x51384b5032540001)
 
 // Host-only identity of the loaded binary. The default/ScaleFirst library returns -1; format-selected fully
 // quantized builds return FMT0..FMT4. Loaders must compare this value with the filename/manifest role before using
