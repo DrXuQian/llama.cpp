@@ -12,6 +12,9 @@ struct llama_context;
 struct llama_memory_breakdown_data;
 
 struct llama_nextn_graph;
+struct llama_nextn_control;
+struct llama_nextn_draft_body;
+class llama_kv_cache_context;
 struct llama_nextn_handoff;
 struct llama_nextn_lookahead;
 struct llama_nextn_target;
@@ -39,6 +42,13 @@ private:
     void set_nextn_prefetch(bool enabled, bool fixed_kv);
     void set_nextn_graph_cache(int32_t n_max);
     void release_target();
+    bool prepare_draft_graph(llama_nextn_graph & chain,
+            const std::vector<std::unique_ptr<llama_kv_cache_context>> & contexts, int n_draft, bool prefetch,
+            float p_min, int n_verify, bool gpu_kv, const llama_nextn_control * input,
+            ggml_tensor * sampled, ggml_tensor * input_hidden, llama_pos verify_pos);
+    void collect_draft_outputs(llama_nextn_graph & chain, const llama_batch & seed, bool prefetch);
+    bool prepare_nextn_draft(llama_context & source, llama_nextn_target & target, int n, bool target_rebuilt,
+            std::shared_ptr<llama_nextn_draft_body> & shared);
     bool prepare_nextn_catchup(llama_context & source, llama_nextn_target & target, int n, bool target_rebuilt);
     llm_graph_result * consume_target(const llama_ubatch & ubatch, llama_memory_context_i * mctx);
     uint32_t graph_cache_limit() const { return graph_cache_max; }
@@ -57,8 +67,8 @@ private:
     llama_context & lctx;
     uint32_t graph_cache_max = 0;
 
-    std::unique_ptr<llama_nextn_graph> graph;
-    std::array<std::unique_ptr<llama_nextn_graph>, 10> graph_cache;
+    std::shared_ptr<llama_nextn_graph> graph;
+    std::array<std::shared_ptr<llama_nextn_graph>, 10> graph_cache;
     uint32_t graph_active = 0;
     std::unique_ptr<llama_nextn_handoff> handoff;
     std::unique_ptr<llama_nextn_handoff> features;

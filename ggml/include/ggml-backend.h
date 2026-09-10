@@ -353,6 +353,7 @@ extern "C" {
     GGML_API bool                 ggml_backend_sched_graph_prepare(ggml_backend_sched_t sched);
     GGML_API bool                 ggml_backend_sched_graph_early_exit(ggml_backend_sched_t sched, struct ggml_tensor * const * scores, int n_steps, float p_min, struct ggml_tensor * counts);
     // Each branch contains n_stages consecutive schedulers; null stages are skipped. Replay through primary.
+    // The selector must be in [0, n_graphs). Identical trailing stages run once after the selected branch.
     GGML_API bool                 ggml_backend_sched_graph_select(ggml_backend_sched_t primary, ggml_backend_sched_t const * stages, int n_graphs, int n_stages, struct ggml_tensor * selector);
     GGML_API enum ggml_status     ggml_backend_sched_graph_compute(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
     GGML_API enum ggml_status     ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sched, struct ggml_cgraph * graph);

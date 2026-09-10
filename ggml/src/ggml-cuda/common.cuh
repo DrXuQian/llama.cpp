@@ -1257,6 +1257,11 @@ struct ggml_cuda_graph {
     bool warmup_complete = false;
     float early_p_min = 0.0f;
     void * early_counts = nullptr;
+    uint64_t early_uid = 0;
+    uint64_t early_revision = 0;
+    uint64_t early_instance_revision = 0;
+    std::vector<int> early_ends;
+    std::vector<ggml_tensor *> early_scores;
     std::vector<uint64_t> select_uids;
     void * select_data = nullptr;
     uint64_t uid = 0;
