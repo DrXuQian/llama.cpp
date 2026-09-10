@@ -219,7 +219,7 @@ class NativeEvidence(unittest.TestCase):
                     patch.object(
                         native,
                         "request",
-                        side_effect=ConnectionResetError(104, "connection reset"),
+                        side_effect=PermissionError(13, "permission denied"),
                     ) as request,
                 ):
                     with self.assertRaisesRegex(
@@ -234,6 +234,55 @@ class NativeEvidence(unittest.TestCase):
                 self.assertEqual(request.call_count, int(returncode is None))
                 self.assertEqual(proc.terminate.call_count, int(returncode is None))
                 proc.kill.assert_not_called()
+
+    def test_health_reset_does_not_hide_process_exit_or_startup_deadline(self):
+        for stopped in (True, False):
+            with self.subTest(stopped=stopped), tempfile.TemporaryDirectory() as temp:
+                args = SimpleNamespace(binary=Path("server"), model=Path("model"), cache=Path("cache"),
+                                       context=512, batch=128, output=Path(temp))
+                proc = MagicMock()
+                if stopped:
+                    statuses = iter((None, -6))
+                    proc.poll.side_effect = lambda: next(statuses, -6)
+                    proc.returncode = -6
+                else:
+                    proc.poll.return_value = proc.returncode = None
+                    proc.wait.side_effect = lambda **kwargs: setattr(proc, "returncode", -15)
+                with (patch.object(native.subprocess, "Popen", return_value=proc),
+                      patch.object(native, "request", side_effect=ConnectionResetError(104, "connection reset")) as request,
+                      patch.object(native.time, "sleep") as sleep,
+                      patch.object(native.time, "monotonic", side_effect=[0, 0, 0, 901])):
+                    reason = "server exited" if stopped else "startup exceeded 900 seconds"
+                    with self.assertRaisesRegex(ValueError, reason):
+                        native.run_arm(args, 0, "native", None)
+                request.assert_called_once()
+                sleep.assert_called_once_with(1)
+                failure = json.loads((args.output / "0-native.failure.json").read_text())
+                self.assertEqual(failure["phase"], "startup-health")
+                self.assertEqual(failure["returncode_before_cleanup"], -6 if stopped else None)
+                proc.kill.assert_not_called()
+
+    def test_completion_reset_is_not_retried_as_readiness(self):
+        with tempfile.TemporaryDirectory() as temp:
+            args = SimpleNamespace(binary=Path("server"), model=Path("model"), cache=Path("cache"),
+                                   context=512, batch=128, generate=8, repeats=1, prompts=[128], output=Path(temp))
+            proc = MagicMock()
+            proc.poll.return_value = proc.returncode = None
+            proc.wait.side_effect = lambda **kwargs: setattr(proc, "returncode", -15)
+            props = dict(model_alias="native-fixture", total_slots=1, default_generation_settings=dict(n_ctx=512))
+            with (patch.object(native.subprocess, "Popen", return_value=proc),
+                  patch.object(native.secrets, "token_hex", return_value="fixture"),
+                  patch.object(native.time, "sleep") as sleep,
+                  patch.object(native, "request", side_effect=[dict(status="ok"), props,
+                               ConnectionResetError(104, "completion reset")]) as request):
+                with self.assertRaisesRegex(ValueError, "phase=completion-prompt-128-repeat-0"):
+                    native.run_arm(args, 0, "native", {"128": list(range(128))})
+            self.assertEqual(request.call_count, 3)
+            sleep.assert_not_called()
+            proc.terminate.assert_called_once_with()
+            failure = json.loads((args.output / "0-native.failure.json").read_text())
+            self.assertIn("completion reset", failure["error"])
+            self.assertFalse((args.output / "0-native.selection.json").exists())
 
     def test_tensor_override_matches_complete_weight_names(self):
         positive = ["output.weight"] + [
@@ -386,7 +435,7 @@ int main(int argc, char ** argv) {
             self.assertEqual([c.args[0][1] for c in run.call_args_list], ["start", "stop", "shutdown"])
             self.assertTrue(all(c.args[0][3] == profile.session for c in run.call_args_list))
 
-    def captured_exit(self, exit_status, arm="native", shared_tokens=None):
+    def captured_exit(self, exit_status, arm="native", shared_tokens=None, health_errors=()):
         with tempfile.TemporaryDirectory() as temp:
             args = SimpleNamespace(binary=Path("server"), model=Path("model"), cache=Path("cache"),
                                    context=512, batch=128, generate=8, repeats=1, prompts=[128], output=Path(temp))
@@ -424,8 +473,12 @@ int main(int argc, char ** argv) {
                     kwargs["stdout"].write("CUDA0_KPACK model buffer size = fixture\n")
                 kwargs["stdout"].flush()
                 return proc
+            pending_health = iter(health_errors)
             def response(url, key, payload=None, **kwargs):
                 if url.endswith("/health"):
+                    error = next(pending_health, None)
+                    if error is not None:
+                        raise error
                     return dict(status="ok")
                 if url.endswith("/props"):
                     return dict(model_alias=state["alias"], total_slots=1, default_generation_settings=dict(n_ctx=512))
@@ -444,6 +497,7 @@ int main(int argc, char ** argv) {
                   "GGML_CUDA_DISABLE_FUSION": "1"}),
                   patch.object(native.subprocess, "Popen", side_effect=launch),
                   patch.object(native, "request", side_effect=response),
+                  patch.object(native.time, "sleep") as sleep,
                   patch.object(native, "model_selection", return_value=dict(plans=[dict(op="grouped")])) as select):
                 if exit_status == 0:
                     result, _ = native.run_arm(args, 0, arm, shared_tokens, profile=profile)
@@ -453,6 +507,7 @@ int main(int argc, char ** argv) {
                     message = "shutdown exceeded 60 seconds" if exit_status == "timeout" else "0-native failed rc=1"
                     with self.assertRaisesRegex(ValueError, message):
                         native.run_arm(args, 0, arm, shared_tokens, profile=profile)
+            self.assertEqual(sleep.call_count, len(health_errors))
             self.assertEqual(events, ["request", "start", "request", "stop", "close", "wait"] +
                              (["wait"] if exit_status == "timeout" else []))
             proc.terminate.assert_not_called()
@@ -470,6 +525,12 @@ int main(int argc, char ** argv) {
 
     def test_capture_starts_only_after_first_request_completed(self):
         self.captured_exit(0)
+
+    def test_transient_health_reset_recovers_before_warmup_and_capture(self):
+        from http.client import RemoteDisconnected
+        self.captured_exit(0, health_errors=(ConnectionResetError(104, "connection reset"),
+                                            ConnectionRefusedError(111, "not listening"),
+                                            RemoteDisconnected("not ready")))
 
     def test_reference_restores_native_fusions_and_clears_kpack_environment(self):
         self.captured_exit(0, "reference", {"128": list(range(900, 1028))})
