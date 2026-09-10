@@ -172,11 +172,11 @@ Plan & prepare(ggml_backend_cuda_context & ctx, const ggml_tensor * weight,
     auto p = std::make_unique<Plan>();
     p->api = owner.api; p->art = art; p->rows = tokens * topk; p->tokens = tokens; p->topk = topk;
     const RouteMode mode = route_mode();
-    // Automatic decode uses selected FQ; GEMV remains an explicit diagnostic.
-    p->direct = mode == RouteMode::Gemv && art.qtype != GGML_TYPE_Q8_0;
-    if (art.qtype == GGML_TYPE_Q8_0 && (mode == RouteMode::Gemv || mode == RouteMode::Fq))
-        GGML_ABORT("[quactlize] Q8_0 requires W8A16 with resident FP16 scale, route=auto or sf");
-    if (p->direct) {
+    // Auto uses an exact measured SIMT recipe when present; otherwise retain
+    // the selected tensor-core path. Forced FQ/SF never consult this policy.
+    if (art.qtype == GGML_TYPE_Q8_0 && mode == RouteMode::Fq)
+        GGML_ABORT("[quactlize] Q8_0 requires W8A16 with resident FP16 scale");
+    if (mode == RouteMode::Auto || mode == RouteMode::Gemv) {
         auto & c = p->gemv;
         c.version = 1; c.size = sizeof(c); c.qtype = art.qtype; c.n = art.n; c.k = art.k;
         c.experts = art.experts; c.rows = p->rows; c.mode = ids ? QKG_INDEXED : QKG_DENSE;
@@ -196,8 +196,9 @@ Plan & prepare(ggml_backend_cuda_context & ctx, const ggml_tensor * weight,
         if (rc != QKG_OK) GGML_ABORT("[quactlize] %s: GEMV query failed rc=%d", weight->name, rc);
         c.workspace = owner.storage(stream, sizes.workspace_bytes); c.workspace_bytes = sizes.workspace_bytes;
         GGML_LOG_INFO("[quactlize-plan] tensor=%s op=%s route=gemv q=%d rows=%d n=%" PRId64 " k=%" PRId64
-            " columns=%d warps=%d split=%d selection=MEASURED_GEMV_POOL\n", weight->name, ids ? "grouped" : "dense",
-            art.qtype, p->rows, art.n, art.k, p->gemv_config.columns, p->gemv_config.warps, p->gemv_config.split);
+            " columns=%d warps=%d split=%d selection=MEASURED_GEMV_POOL activation=FP16 scale_resident=%d\n", weight->name, ids ? "grouped" : "dense",
+            art.qtype, p->rows, art.n, art.k, p->gemv_config.columns, p->gemv_config.warps, p->gemv_config.split,
+            int(art.qtype == GGML_TYPE_Q8_0));
     } else {
         qks_request_v1 r{1, sizeof(r), art.qtype, ids ? QK_GROUPED_FQ : QK_DENSE_FQ,
             p->rows, int(art.n), int(art.k), int(art.experts), int(tokens), art.arrangement.mapping_id};
