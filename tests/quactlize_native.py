@@ -32,6 +32,14 @@ def inventory_pattern(inventory):
     return "^(" + "|".join(re.escape(name) for name in names) + ")$"
 
 
+def validate_tokens(tokens, prompts):
+    require(isinstance(tokens, dict) and set(tokens) == {str(n) for n in prompts}
+            and all(isinstance(tokens[str(n)], list) and len(tokens[str(n)]) == n
+                    and all(type(t) is int and t >= 0 for t in tokens[str(n)]) for n in prompts),
+            "input token file does not match requested prompts")
+    return tokens
+
+
 def timings(response, payload):
     require(
         response.get("tokens_evaluated") == len(payload["prompt"]),
@@ -206,10 +214,9 @@ def run_arm(args, index, arm, tokens, profile=None):
     command += ["--no-warmup"]
     env = {k: v for k, v in os.environ.items() if not k.startswith("LLAMA_ARG_")}
     env.pop("GGML_CUDA_DISABLE_GRAPHS", None)
+    env.pop("GGML_CUDA_DISABLE_FUSION", None)
     if arm == "reference":
-        env.pop("QUACTLIZE_KPACK_EXECUTION", None)
-        env.pop("QUACTLIZE_KPACK_GEMV_POLICY", None)
-        env.pop("QUACTLIZE_KPACK_PAIR_WEIGHTS", None)
+        env = {k: v for k, v in env.items() if not k.startswith("QUACTLIZE_KPACK_")}
     else:
         env["QUACTLIZE_KPACK_ROUTE"] = "auto"
     with socket.socket() as s:
@@ -301,7 +308,8 @@ def run_arm(args, index, arm, tokens, profile=None):
                     ),
                     "invalid tokenization",
                 )
-                save(args.output / "input-tokens.json", tokens)
+            validate_tokens(tokens, args.prompts)
+            save(args.output / "input-tokens.json", tokens)
             startup = time.monotonic() - begin
             with (args.output / (label + ".jsonl")).open("x") as rows:
                 for n in args.prompts:
@@ -467,7 +475,11 @@ def proof(args):
     capture.output.mkdir()
     for name, value in proof_parameters(args).items():
         setattr(capture, name, value)
-    proof_arm, _ = run_arm(capture, 0, "native", None, profile=AsysSession(args.asys, args.output))
+    arm = getattr(args, "proof_arm", "native")
+    source_tokens = getattr(args, "proof_tokens", None)
+    tokens = (validate_tokens(json.loads(source_tokens.read_text()), capture.prompts)
+              if source_tokens else None)
+    proof_arm, tokens = run_arm(capture, 0, arm, tokens, profile=AsysSession(args.asys, args.output))
     with (args.output / "proof-export.log").open("x") as f:
         subprocess.run(
             [str(args.asys), "export", "--output", str(db), str(report)],
@@ -475,6 +487,28 @@ def proof(args):
             stderr=subprocess.STDOUT,
             check=True,
         )
+    total, kernels = activity(db, None)
+    save(args.output / "kernel-times.json", dict(
+        arm=arm, gpu_kernel_calls=total, scope="ALL_CAPTURED_KERNELS_PROFILER_ONLY_NOT_WALL_LATENCY",
+        sum_kernel_ns=sum(k["total_ns"] for k in kernels),
+        kernels=sorted(kernels, key=lambda k: (-k["total_ns"], k["name"]))))
+    captured = proof_arm["records"][-1]
+    common = dict(
+        arm=arm, gpu_kernel_calls=total, timing_scope="PROFILER_ONLY_NOT_PERFORMANCE",
+        capture_scope="SECOND_REQUEST_SAME_PROCESS_FIRST_USE_EXCLUDED",
+        prompt_tokens=capture.prompts[0], generated_tokens=capture.generate,
+        prefill_token_batch=capture.batch, input_tokens_sha256=digest(tokens),
+        request_sha256=captured["request_sha256"],
+        response_sha256=digest(captured["response"].get("content", "")))
+    if arm == "reference":
+        require(not any("quactlize" in k["name"] or re.search(r"kpack_q\d+::", k["name"])
+                        for k in kernels), "reference trace contains K-pack execution")
+        native_matvec = [k for k in kernels if re.search(r"\bmul_mat_(?:vec_q|vec_f|q)\s*<", k["name"])]
+        require(native_matvec, "reference trace has no native llama matrix/vector kernel")
+        result = common | dict(kernel_execution="REFERENCE_COMPUTE_OBSERVED", matched=native_matvec,
+                               missing_ops=[], selection={}, all_abba_parents_traced=False)
+        save(args.output / "proof.json", result)
+        return result
     plans = proof_arm["selection"]
     libraries = [(Path(m["path"]), m["origin"] + "/" + m["key"], m["key"])
                  for m in plans["modules"]]
@@ -531,6 +565,7 @@ def proof(args):
         prefill_token_batch=capture.batch,
         all_abba_parents_traced=False,
     )
+    result.update(common)
     save(args.output / "proof.json", result)
     return result
 
@@ -553,6 +588,9 @@ def main():
     p.add_argument("--prompts", type=int, nargs="+", default=[128, 512])
     p.add_argument("--repeats", type=int, default=3)
     p.add_argument("--proof-only", action="store_true", help="warmup and Asys capture without ABBA timings")
+    p.add_argument("--proof-arm", choices=("native", "reference"), default="native",
+                   help="trace route; reference retains the original llama CUDA kernels and fusions")
+    p.add_argument("--proof-tokens", type=Path, help="reuse exact input-tokens.json from a matched trace")
     p.add_argument("--proof-prompt", type=int, default=128)
     p.add_argument("--proof-generate", type=int, default=8)
     p.add_argument("--tensor-inventory", type=Path, help="use the benchmark's exact eligible weight names")
@@ -560,6 +598,8 @@ def main():
     p.add_argument("--jit-helper", type=Path)
     p.add_argument("--jit-python", type=Path)
     a = p.parse_args()
+    require(a.proof_only or (a.proof_arm == "native" and a.proof_tokens is None),
+            "proof arm/token overrides require --proof-only")
     a.tensor_override_pattern = (inventory_pattern(json.loads(a.tensor_inventory.read_text()))
                                  if a.tensor_inventory else PATTERN)
     capture_parameters = proof_parameters(a)
@@ -581,13 +621,15 @@ def main():
     save(
         a.output / "protocol.json",
         dict(
-            order=["native"] if a.proof_only else ["reference", "native", "native", "reference"],
+            order=[a.proof_arm] if a.proof_only else ["reference", "native", "native", "reference"],
             request_batch=1,
             prompts=capture_parameters["prompts"] if a.proof_only else a.prompts,
             generate=capture_parameters["generate"] if a.proof_only else a.generate,
             repeats=1 if a.proof_only else a.repeats,
             prefill_token_batch=capture_parameters["batch"] if a.proof_only else a.batch,
             proof_only=a.proof_only,
+            proof_arm=a.proof_arm,
+            proof_tokens=str(a.proof_tokens) if a.proof_tokens else None,
             proof_parameters=capture_parameters,
             graphs=True,
             native_route="auto",
