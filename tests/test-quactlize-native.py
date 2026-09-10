@@ -1,9 +1,11 @@
 import copy
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
 import subprocess
+import sys
 import tempfile
 from types import SimpleNamespace
 import unittest
@@ -435,6 +437,32 @@ int main(int argc, char ** argv) {
             self.assertEqual([c.args[0][1] for c in run.call_args_list], ["start", "stop", "shutdown"])
             self.assertTrue(all(c.args[0][3] == profile.session for c in run.call_args_list))
 
+    def test_profile_target_replaces_stale_route_environment_before_exec(self):
+        from quactlize_profile_env import select
+        with tempfile.TemporaryDirectory() as temp:
+            profile = native.AsysSession(Path("/asys"), Path(temp))
+            stale = dict(os.environ, QUACTLIZE_KPACK_EXECUTION="stale-reference",
+                         QUACTLIZE_KPACK_PAIR_WEIGHTS="0", LLAMA_ARG_MODEL="wrong-model",
+                         GGML_CUDA_DISABLE_GRAPHS="1", NSIGHT_TEST_INJECTION="preserved")
+            app = [sys.executable, "-I", "-c",
+                   "import json,os; print(json.dumps(dict(os.environ),sort_keys=True))"]
+            for arm in ("reference", "native"):
+                settings = dict(PATH=os.environ["PATH"], CUDA_VISIBLE_DEVICES="0")
+                if arm == "native":
+                    settings.update(QUACTLIZE_KPACK_EXECUTION="/bundle with spaces,$literal",
+                                    QUACTLIZE_KPACK_JIT_HELPER="/repo/helper.py",
+                                    QUACTLIZE_KPACK_PAIR_WEIGHTS="1")
+                command = profile.command(app, settings)
+                # Model a daemon launching with the PREVIOUS arm's environment.
+                target = command[command.index(sys.executable):]
+                run = subprocess.run(target, env=stale, text=True, capture_output=True, check=True)
+                receipt, actual = run.stdout.splitlines()
+                self.assertEqual(json.loads(receipt.removeprefix("KPACK_PROFILE_ENV ")), settings)
+                environment = json.loads(actual)
+                self.assertEqual(select(environment), settings)
+                self.assertEqual(environment["NSIGHT_TEST_INJECTION"], "preserved")
+                self.assertEqual(stale["QUACTLIZE_KPACK_EXECUTION"], "stale-reference")
+
     def captured_exit(self, exit_status, arm="native", shared_tokens=None, health_errors=()):
         with tempfile.TemporaryDirectory() as temp:
             args = SimpleNamespace(binary=Path("server"), model=Path("model"), cache=Path("cache"),
@@ -442,7 +470,7 @@ int main(int argc, char ** argv) {
             events, state = [], {}
             proc, profile = MagicMock(), MagicMock()
             proc.poll.return_value, proc.returncode = None, None
-            profile.command.side_effect = lambda c: c
+            profile.command.side_effect = lambda c, env: c
             profile.start.side_effect = lambda: events.append("start")
             def stop():
                 events.append("stop")
