@@ -102,7 +102,7 @@ def activity(db, symbols):
         columns = {row[1] for row in con.execute("PRAGMA table_info(HGPTI_ACTIVITY_KIND_KERNEL)")}
         require({"start", "end", "mangledName", "demangledName"} <= columns,
                 "missing Asight device-kernel activity table/columns; API events are not execution evidence")
-        by_demangled = {value["name"]: key for key, value in symbols.items()}
+        by_demangled = {value["name"]: key for key, value in (symbols or {}).items()}
         rows = con.execute('''
             SELECT m.value, d.value, COUNT(*), SUM(k.end-k.start), MIN(k.end-k.start)
             FROM HGPTI_ACTIVITY_KIND_KERNEL k
@@ -115,6 +115,11 @@ def activity(db, symbols):
         for mangled, demangled, count, duration, minimum in rows:
             require(minimum is not None and minimum > 0, "incomplete/nonpositive kernel activity duration")
             total += count
+            if symbols is None:
+                require(mangled or demangled, "unnamed GPU kernel activity")
+                matched.append({"mangled": mangled, "name": demangled or mangled,
+                                "libraries": [], "calls": count, "total_ns": duration})
+                continue
             key = mangled if mangled in symbols else by_demangled.get(demangled)
             if key:
                 matched.append({"mangled": key, "name": symbols[key]["name"],
