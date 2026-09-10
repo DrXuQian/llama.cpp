@@ -874,7 +874,8 @@ bool llama_spec_pipeline::prefetch_nextn_target(llama_context & source) {
         destinations.push_back((int32_t *) input.storage->data + i);
     }
     const size_t n_control = tensors.size();
-    std::array<ggml_tensor, 3> tree_candidates;
+    std::array<ggml_tensor, 4> tree_candidates;
+    std::array<ggml_tensor, 4> tree_probabilities;
     if (tree) {
         tensors.push_back(chain.selected_token);
         destinations.push_back(first.tree->tokens->data);
@@ -883,9 +884,21 @@ bool llama_spec_pipeline::prefetch_nextn_target(llama_context & source) {
             tree_candidates[i].ne[0] = 2;
             tensors.push_back(&tree_candidates[i]);
             destinations.push_back((int32_t *) first.tree->tokens->data + 1 + 2*i);
-            tensors.push_back(chain.tree_scores[i]);
+            tree_probabilities[i] = *chain.tree_scores[i];
+            tree_probabilities[i].ne[0] = 2;
+            tensors.push_back(&tree_probabilities[i]);
             destinations.push_back((float *) first.tree->scores->data + 1 + 2*i);
         }
+        tree_candidates[3] = tree_candidates[0];
+        tree_candidates[3].ne[0] = 1;
+        tree_candidates[3].data = (int32_t *) tree_candidates[3].data + 2;
+        tree_probabilities[3] = tree_probabilities[0];
+        tree_probabilities[3].ne[0] = 1;
+        tree_probabilities[3].data = (float *) tree_probabilities[3].data + 2;
+        tensors.push_back(&tree_candidates[3]);
+        destinations.push_back((int32_t *) first.tree->tokens->data + 7);
+        tensors.push_back(&tree_probabilities[3]);
+        destinations.push_back((float *) first.tree->scores->data + 7);
     }
     if (first.catchup_seed) {
         tensors.push_back(chain.selected_hidden);
@@ -1705,8 +1718,8 @@ bool llama_spec_pipeline::prepare_draft_graph(llama_nextn_graph & chain,
             ggml_build_forward_expand(res->get_gf(), chain.tokens.back());
             chain.hidden.push_back(res->get_h_nextn());
             if (tree) {
-                auto * top_two = ggml_view_1d(ctx, ids, 2, 0);
-                auto * probabilities = llama_spec_tree::probabilities(ctx, logits, top_two, llama_spec_tree::row(ctx, values, 0));
+                auto * candidates = ggml_view_1d(ctx, ids, i ? 2 : 3, 0);
+                auto * probabilities = llama_spec_tree::probabilities(ctx, logits, candidates, llama_spec_tree::row(ctx, values, 0));
                 if (i) {
                     probabilities = ggml_mul(ctx, probabilities, llama_spec_tree::row(ctx, chain.tree_scores.back(), 0));
                 }

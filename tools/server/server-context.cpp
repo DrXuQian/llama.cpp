@@ -493,7 +493,17 @@ struct server_slot {
         //       also, need to leave space for 1 extra token to allow context shifts
         int n_draft_max = n_ctx - prompt.n_tokens() - 2;
 
-        if (n_remaining() > 0) {
+        const auto & draft = task->params.speculative.draft;
+        const auto & types = task->params.speculative.types;
+        const bool keep_tree_budget = stats.n_gen > 1 && draft.eagle3_tree && draft.gpu_pipeline &&
+            draft.n_max == 3 && draft.p_min == 0.0f && llama_n_seq_max(ctx_tgt) == 1 &&
+            std::find(types.begin(), types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3) != types.end() &&
+            std::all_of(types.begin(), types.end(), [](auto type) { return type == COMMON_SPECULATIVE_TYPE_NONE || type == COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3; }) &&
+            !llama_model_is_recurrent(llama_get_model(ctx_tgt)) && !llama_model_is_hybrid(llama_get_model(ctx_tgt)) &&
+            task->params.sampling.backend_sampling && task->params.sampling.temp <= 0.0f &&
+            common_speculative_get_synth_probs(spec).empty();
+        // Keep the running tree graph at the output boundary; sampling limits the committed prefix.
+        if (n_remaining() > 0 && !keep_tree_budget) {
             n_draft_max = std::min(n_draft_max, n_remaining() - 1);
         }
 
@@ -3955,7 +3965,7 @@ private:
                 GGML_ASSERT(slot.spec_i_batch.size() == n_draft + 1);
                 const auto & synth_probs = common_speculative_get_synth_probs(spec.get());
                 auto accepted = synth_probs.empty()
-                    ? common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft)
+                    ? common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft, false, slot.n_remaining())
                     : server_sample_and_accept_synth(
                             slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft,
                             synth_probs, slot.spec_synth_rng, slot.spec_is_replay);

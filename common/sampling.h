@@ -81,9 +81,10 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
 //
 // requires: idxs.size() == draft.size() + 1
 //
-// returns at least 1 token, up to idxs.size()
+// returns at least 1 token, up to idxs.size(); a positive max_tokens also limits the bonus token
 //
 std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, bool grammar_first = false);
+std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, bool grammar_first, int32_t max_tokens);
 
 // assume idxs == [ 0, 1, 2, ..., draft.size() ]
 std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const llama_tokens & draft, bool grammar_first = false);

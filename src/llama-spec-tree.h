@@ -7,7 +7,7 @@
 #include <array>
 #include <vector>
 
-// A three-step, width-two comb, pruned to four ancestor-closed target rows.
+// A three-step comb, pruned to four ancestor-closed target rows.
 struct llama_spec_tree {
     ggml_context_ptr constants;
     ggml_backend_buffer_ptr device;
@@ -19,43 +19,45 @@ struct llama_spec_tree {
     ggml_tensor * depths = nullptr;
     ggml_tensor * ancestors = nullptr;
     ggml_tensor * paths = nullptr;
+    ggml_tensor * parents = nullptr;
     ggml_tensor * original = nullptr;
     ggml_tensor * membership = nullptr;
     llm_graph_nextn_target linear = {};
 
     bool init(ggml_backend_t backend) {
-        constants.reset(ggml_init({ 7*ggml_tensor_overhead(), nullptr, true }));
+        constants.reset(ggml_init({ 8*ggml_tensor_overhead(), nullptr, true }));
         auto * ctx = constants.get();
-        tokens = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 7);
-        scores = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 7);
-        topologies = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 4, 3);
-        memberships = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 7, 3);
-        depths = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 7);
-        ancestors = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 7, 9);
-        paths = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 4, 7);
+        tokens = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 8);
+        scores = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 8);
+        topologies = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 4, 4);
+        memberships = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 8, 4);
+        depths = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 8);
+        ancestors = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 8, 10);
+        paths = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 4, 8);
+        parents = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 8);
         device.reset(ggml_backend_alloc_ctx_tensors(ctx, backend));
         host.reset(ggml_backend_buft_alloc_buffer(ggml_backend_dev_host_buffer_type(ggml_backend_get_device(backend)), 4*sizeof(llama_token)));
         if (!device || !host) {
             return false;
         }
-        const int32_t topology[] = {0, 1, 2, 3, 0, 1, 3, 4, 0, 1, 3, 5};
-        const int parent[] = {0, 0, 0, 1, 1, 3, 3};
-        const float depth[] = {0, 1, 1, 2, 2, 3, 3};
-        std::array<float, 21> members = {};
-        std::array<float, 63> ancestor;
+        const int32_t topology[] = {0, 1, 2, 3, 0, 1, 3, 4, 0, 1, 3, 5, 0, 1, 2, 7};
+        const int32_t parent[] = {0, 0, 0, 1, 1, 3, 3, 0};
+        const float depth[] = {0, 1, 1, 2, 2, 3, 3, 1};
+        std::array<float, 32> members = {};
+        std::array<float, 80> ancestor;
         ancestor.fill(-1e30f);
-        std::fill_n(ancestor.data(), 7, 0.0f);
-        std::array<int32_t, 28> path;
-        for (int t = 0; t < 3; ++t) {
+        std::fill_n(ancestor.data(), 8, 0.0f);
+        std::array<int32_t, 32> path;
+        for (int t = 0; t < 4; ++t) {
             for (int q = 0; q < 4; ++q) {
-                members[t*7 + topology[t*4 + q]] = 1.0f;
+                members[t*8 + topology[t*4 + q]] = 1.0f;
             }
         }
-        for (int q = 0; q < 7; ++q) {
+        for (int q = 0; q < 8; ++q) {
             std::vector<int> branch;
             for (int p = q;; p = parent[p]) {
                 branch.push_back(p);
-                ancestor[(p + 1)*7 + q] = 0.0f;
+                ancestor[(p + 1)*8 + q] = 0.0f;
                 if (!p) {
                     break;
                 }
@@ -70,6 +72,7 @@ struct llama_spec_tree {
         ggml_backend_tensor_set(depths, depth, 0, sizeof(depth));
         ggml_backend_tensor_set(ancestors, ancestor.data(), 0, sizeof(ancestor));
         ggml_backend_tensor_set(paths, path.data(), 0, sizeof(path));
+        ggml_backend_tensor_set(parents, parent, 0, sizeof(parent));
         return true;
     }
 
@@ -119,8 +122,12 @@ struct llama_spec_tree {
         auto * ba = ggml_step(ctx, ggml_sub(ctx, b, a));
         auto * ca = ggml_step(ctx, ggml_sub(ctx, c, a));
         auto * cb = ggml_step(ctx, ggml_sub(ctx, c, b));
-        auto * choice = ggml_cast(ctx, ggml_add(ctx, ba,
-                ggml_mul(ctx, ggml_mul(ctx, ca, cb), ggml_scale_bias(ctx, ba, -1, 2))), GGML_TYPE_I32);
+        auto * choice = ggml_add(ctx, ba,
+                ggml_mul(ctx, ggml_mul(ctx, ca, cb), ggml_scale_bias(ctx, ba, -1, 2)));
+        // Three root children win only when the third child beats the second primary node.
+        auto * wide = ggml_step(ctx, ggml_sub(ctx, row(ctx, scores, 7), row(ctx, scores, 3)));
+        choice = ggml_cast(ctx, ggml_add(ctx, ggml_mul(ctx, choice, ggml_scale_bias(ctx, wide, -1, 1)),
+                ggml_scale(ctx, wide, 3)), GGML_TYPE_I32);
         original = flat(ctx, ggml_get_rows(ctx, topologies, choice));
         membership = flat(ctx, ggml_get_rows(ctx, memberships, choice));
         meta.tokens = at(ctx, tokens, original);
@@ -130,7 +137,7 @@ struct llama_spec_tree {
         auto * query = ggml_cont(ctx, ggml_transpose(ctx, ggml_get_rows(ctx,
                 ggml_cont(ctx, ggml_transpose(ctx, ancestors)), original)));
         auto * columns = join(ctx, {ggml_fill(ctx, base, 0),
-                ggml_scale_bias(ctx, ggml_cast(ctx, original, GGML_TYPE_F32), 1, 1), ggml_fill(ctx, base, 8)});
+                ggml_scale_bias(ctx, ggml_cast(ctx, original, GGML_TYPE_F32), 1, 1), ggml_fill(ctx, base, 9)});
         auto * relative = ggml_clamp(ctx, ggml_scale_bias(ctx, ggml_sub(ctx, ggml_arange(ctx, 0, n_kv, 1), base), 1, 1), 0, 5);
         auto * indices = ggml_cast(ctx, at(ctx, columns, ggml_cast(ctx, relative, GGML_TYPE_I32)), GGML_TYPE_I32);
         meta.mask = ggml_cast(ctx, ggml_cont(ctx, ggml_transpose(ctx, ggml_get_rows(ctx, query, indices))), GGML_TYPE_F16);
@@ -147,18 +154,18 @@ struct llama_spec_tree {
         auto f32 = [&](ggml_tensor * t) { return ggml_cast(ctx, t, GGML_TYPE_F32); };
         auto i32 = [&](ggml_tensor * t) { return ggml_cast(ctx, t, GGML_TYPE_I32); };
         auto scatter = [&](ggml_tensor * values) {
-            auto * empty = ggml_reshape_2d(ctx, ggml_fill(ctx, ggml_arange(ctx, 0, 7, 1), -1), 1, 7);
+            auto * empty = ggml_reshape_2d(ctx, ggml_fill(ctx, ggml_arange(ctx, 0, 8, 1), -1), 1, 8);
             return flat(ctx, ggml_set_rows(ctx, empty, ggml_reshape_2d(ctx, values, 1, 4), original));
         };
         auto * sampled = scatter(f32(join(ctx, res.t_sampled)));
         auto * compact = scatter(ggml_arange(ctx, 0, 4, 1));
-        const int parent[] = {0, 0, 0, 1, 1, 3, 3};
-        std::vector<ggml_tensor *> valid = {ggml_fill(ctx, row(ctx, sampled, 0), 1)};
-        for (int i = 1; i < 7; ++i) {
-            auto * mismatch = ggml_step(ctx, ggml_abs(ctx, ggml_sub(ctx, f32(row(ctx, tokens, i)), row(ctx, sampled, parent[i]))));
-            valid.push_back(ggml_mul(ctx, ggml_mul(ctx, ggml_scale_bias(ctx, mismatch, -1, 1), row(ctx, membership, i)), valid[parent[i]]));
-        }
-        auto * selected = ggml_argmax(ctx, ggml_mul(ctx, join(ctx, valid), ggml_scale_bias(ctx, depths, 1, 1)));
+        auto * mismatch = ggml_step(ctx, ggml_abs(ctx, ggml_sub(ctx, f32(tokens), at(ctx, sampled, parents))));
+        auto * matches = ggml_mul(ctx, ggml_scale_bias(ctx, mismatch, -1, 1), membership);
+        matches = join(ctx, {ggml_fill(ctx, row(ctx, sampled, 0), 1), ggml_view_1d(ctx, matches, 7, sizeof(float))});
+        // A padded path is valid only if every ancestor matches, including repeated leaf rows.
+        auto * path_matches = ggml_reshape_2d(ctx, at(ctx, matches, flat(ctx, paths)), 4, 8);
+        auto * valid = flat(ctx, ggml_step(ctx, ggml_scale_bias(ctx, ggml_sum_rows(ctx, path_matches), 1, -3.5f)));
+        auto * selected = ggml_argmax(ctx, ggml_mul(ctx, valid, ggml_scale_bias(ctx, depths, 1, 1)));
         auto * accepted = at(ctx, depths, selected);
         auto * path = flat(ctx, ggml_get_rows(ctx, paths, selected));
         auto * path_rows = i32(at(ctx, compact, path));
