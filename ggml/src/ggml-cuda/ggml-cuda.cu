@@ -41,6 +41,9 @@
 #include "ggml-cuda/ncp-lib.h"
 #include "ggml-cuda/quactlize-buft.cuh"
 #include "ggml-cuda/quactlize-execution.cuh"
+#ifdef GGML_NCP_QUACTLIZE
+#include "ggml-cuda/quactlize/moe_graph.hpp"
+#endif
 #include "ggml-cuda/norm.cuh"
 #include "ggml-cuda/opt-step-adamw.cuh"
 #include "ggml-cuda/opt-step-sgd.cuh"
@@ -4003,21 +4006,16 @@ static int ggml_cuda_try_fuse_quactlize_router(ggml_backend_cuda_context & ctx, 
     const ggml_cuda_topk_moe_args & args) {
     if (logits->ne[0]!=256 || logits->type!=GGML_TYPE_F32 || !ggml_is_contiguous(logits) ||
         (bias && (bias->type!=GGML_TYPE_F32 || !ggml_is_contiguous(bias)))) return 0;
-    int next=start+int(ops.size());
-    while (next<graph->n_nodes && (graph->nodes[next]->op==GGML_OP_VIEW || graph->nodes[next]->op==GGML_OP_RESHAPE)) {
-        ops.push_back(graph->nodes[next++]->op);
-    }
-    const int count=ggml_quactlize_execution_moe_nodes(graph,next);
-    if (!count) return 0;
-    for (int j=0;j<count;++j) ops.push_back(graph->nodes[next+j]->op);
-    const int outputs[3]={ids_index,weights_index,next+count-1};
-    if (!ggml_can_fuse_subgraph(graph,start,ops.size(),ops.data(),outputs,3) ||
-        !ggml_cuda_check_fusion_memory_ranges(graph,start,ops.size(),outputs,3)) return 0;
+    auto span=quactlize::llama::match_moe_router(graph,start,ops,ids_index,weights_index);
+    if (!span.count) return 0;
+    // Preserved input views are not writes. Check only the real outputs.
+    const int outputs[3]={ids_index,weights_index,start+span.count-1};
+    if (!ggml_cuda_check_fusion_memory_ranges(graph,start,span.count,outputs,3)) return 0;
     const qk_llama_router_v1 router{1,sizeof(router),int(args.sigmoid),int(clamp!=nullptr),
         int(args.delayed_softmax),0,clamp?ggml_get_op_params_f32(clamp,0):-INFINITY,
         scale?ggml_get_op_params_f32(scale,0):1.f,static_cast<float const*>(logits->data),
         bias?static_cast<float const*>(bias->data):nullptr,static_cast<float*>(weights->data)};
-    return ggml_quactlize_execution_moe_router_run(ctx,graph,next,router,ids) ? int(ops.size())-1 : 0;
+    return ggml_quactlize_execution_moe_router_run(ctx,graph,span.chain_start,router,ids) ? span.count-1 : 0;
 }
 #endif
 

@@ -13,6 +13,7 @@ import secrets
 import socket
 import statistics
 import subprocess
+import sys
 import time
 from urllib.error import URLError
 
@@ -175,10 +176,14 @@ class AsysSession:
         self.report = output / "proof.asysrep"
         self.log = output / "proof-control.log"
 
-    def command(self, application):
+    def command(self, application, environment=None):
+        from quactlize_profile_env import select
+        settings = select(os.environ if environment is None else environment)
+        entry = Path(__file__).with_name("quactlize_profile_env.py")
+        target = [sys.executable, "-I", str(entry), json.dumps(settings, sort_keys=True), *application]
         return [str(self.executable), "launch", "--trace", "hggc", "--hggc-trace-set", "kernel-activity",
                 "--sample", "none", "--wait", "primary", "--kill", "sigterm", "--show-output", "true",
-                "--session-new", self.session, *application]
+                "--session-new", self.session, *target]
 
     def control(self, action, *options, check=True):
         with self.log.open("a") as log:
@@ -236,7 +241,7 @@ def run_arm(args, index, arm, tokens, profile=None):
     ]
     if profile:
         require(len(args.prompts) == 1 and args.repeats == 1, "trace needs one warmup and one captured request")
-        command = profile.command(command)
+        command = profile.command(command, env)
     save(args.output / (label + ".command.json"), command[:-1] + ["<ephemeral-key>"])
     base = f"http://127.0.0.1:{port}"
     records = []
