@@ -16,8 +16,10 @@ struct llama_output_copies {
         entry.second.push_back(dst);
     }
 
-    void submit() {
-        for (auto & [backend, entry] : data) {
+    void submit(ggml_backend_t transfer = nullptr) {
+        for (auto & [source, entry] : data) {
+            auto * backend = transfer ? transfer : source;
+            GGML_ASSERT(!transfer || ggml_backend_get_device(transfer) == ggml_backend_get_device(source));
             auto * dev = ggml_backend_get_device(backend);
             auto * reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
             auto get_batch = reg ? (ggml_backend_get_tensors_async_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_get_tensors_async") : nullptr;

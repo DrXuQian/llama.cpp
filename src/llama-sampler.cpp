@@ -1284,6 +1284,14 @@ static void llama_sampler_dist_backend_apply(
 
     auto * sctx = (llama_sampler_dist *) smpl->ctx;
 
+    if (ggml_nelements(data->logits) == 1 && data->candidates && ggml_nelements(data->candidates) == 1) {
+        // Keep one RNG draw per output without uploading an unused random value.
+        sctx->inp_uniforms.push_back(nullptr);
+        data->sampled = data->candidates;
+        data->probs = ggml_fill(ctx, data->logits, 1.0f);
+        return;
+    }
+
     ggml_tensor * inp_uniform = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
     ggml_format_name(inp_uniform, "uniform_%zu", sctx->inp_uniforms.size());
     ggml_set_input(inp_uniform);
@@ -1354,10 +1362,10 @@ static void llama_sampler_dist_backend_set_input(struct llama_sampler * smpl) {
     auto & rng = sctx->backend_transactional ? sctx->rng_backend : sctx->rng;
 
     for (auto * inp_uniform : sctx->inp_uniforms) {
-        GGML_ASSERT(inp_uniform != nullptr);
-
         const float rnd = dist(rng);
-        ggml_backend_tensor_set(inp_uniform, &rnd, 0, sizeof(float));
+        if (inp_uniform) {
+            ggml_backend_tensor_set(inp_uniform, &rnd, 0, sizeof(float));
+        }
 
         if (sctx->backend_transactional) {
             ++sctx->n_backend_draws_generated;
@@ -3905,6 +3913,8 @@ struct llama_sampler_logit_bias : public llama_sampler_backend {
 
     struct ggml_tensor * inp_logit_bias;
     struct ggml_tensor * inp_logit_idxs;
+    ggml_context_ptr constants_ctx;
+    ggml_backend_buffer_ptr constants_buffer;
 };
 
 static const char * llama_sampler_logit_bias_name(const struct llama_sampler * smpl) {
@@ -3967,19 +3977,7 @@ static void llama_sampler_logit_bias_backend_apply(
         return;
     }
 
-    const size_t n = sctx->logit_bias.size();
-
-    if (sctx->inp_logit_bias == nullptr) {
-        GGML_ASSERT(sctx->inp_logit_idxs == nullptr);
-
-        sctx->inp_logit_bias = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, n);
-        ggml_set_name(sctx->inp_logit_bias, "logit_bias");
-        ggml_set_input(sctx->inp_logit_bias);
-
-        sctx->inp_logit_idxs = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n);
-        ggml_set_name(sctx->inp_logit_idxs, "logit_idxs");
-        ggml_set_input(sctx->inp_logit_idxs);
-    }
+    GGML_ASSERT(sctx->inp_logit_bias && sctx->inp_logit_idxs);
 
     ggml_tensor * cur = ggml_fill(ctx, data->logits, 0.0f);
 
@@ -4014,27 +4012,32 @@ static void llama_sampler_logit_bias_backend_set_input(struct llama_sampler * sm
     ggml_backend_tensor_set(sctx->inp_logit_idxs, data_logit_idxs.data(), 0, ggml_nbytes(sctx->inp_logit_idxs));
 }
 
-static void llama_sampler_logit_bias_backend_reset(struct llama_sampler * smpl) {
-    auto * sctx = (llama_sampler_logit_bias *) smpl->ctx;
-    sctx->inp_logit_bias = nullptr;
-    sctx->inp_logit_idxs = nullptr;
-}
-
 static bool llama_sampler_logit_bias_backend_init(
         struct llama_sampler       * smpl,
         ggml_backend_buffer_type_t   buft,
         uint32_t                     n_outputs_max_per_seq) {
-    GGML_UNUSED(buft);
     GGML_UNUSED(n_outputs_max_per_seq);
 
     auto * sctx = (llama_sampler_logit_bias *) smpl->ctx;
 
-    sctx->init(true);
-
     if (sctx->logit_bias.empty()) {
+        sctx->init(true);
         return true;
     }
 
+    // Bias values are immutable and can be shared by all graphs of this sampler.
+    const size_t n = sctx->logit_bias.size();
+    sctx->constants_ctx.reset(ggml_init({ 2*ggml_tensor_overhead(), nullptr, true }));
+    sctx->inp_logit_bias = ggml_new_tensor_2d(sctx->constants_ctx.get(), GGML_TYPE_F32, 1, n);
+    sctx->inp_logit_idxs = ggml_new_tensor_1d(sctx->constants_ctx.get(), GGML_TYPE_I32, n);
+    ggml_set_name(sctx->inp_logit_bias, "logit_bias");
+    ggml_set_name(sctx->inp_logit_idxs, "logit_idxs");
+    sctx->constants_buffer.reset(ggml_backend_alloc_ctx_tensors_from_buft(sctx->constants_ctx.get(), buft));
+    sctx->init(sctx->constants_buffer != nullptr);
+    if (!sctx->constants_buffer) {
+        return false;
+    }
+    llama_sampler_logit_bias_backend_set_input(smpl);
     return true;
 }
 
@@ -4048,8 +4051,8 @@ static struct llama_sampler_i llama_sampler_logit_bias_i = {
     /* .backend_init      = */ llama_sampler_logit_bias_backend_init,
     /* .backend_accept    = */ nullptr,
     /* .backend_apply     = */ llama_sampler_logit_bias_backend_apply,
-    /* .backend_set_input = */ llama_sampler_logit_bias_backend_set_input,
-    /* .backend_reset     = */ llama_sampler_logit_bias_backend_reset,
+    /* .backend_set_input = */ nullptr,
+    /* .backend_reset     = */ nullptr,
     /* .copy_state        = */ llama_sampler_backend_copy_state<llama_sampler_logit_bias>,
 };
 
@@ -4072,6 +4075,8 @@ struct llama_sampler * llama_sampler_init_logit_bias(
             /* .to_search      = */ {},
             /* .inp_logit_bias = */ nullptr,
             /* .inp_logit_idxs = */ nullptr,
+            /* .constants_ctx  = */ {},
+            /* .constants_buffer = */ {},
         }
     );
 }

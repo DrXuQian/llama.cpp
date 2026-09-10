@@ -110,6 +110,7 @@ struct llama_nextn_handoff {
     ggml_backend_buffer_ptr device;
     ggml_backend_buffer_ptr host;
     ggml_backend_event_ptr consumed;
+    ggml_backend_event_ptr snapshot_ready;
     std::vector<ggml_tensor *> rows;
 };
 
@@ -137,6 +138,7 @@ struct llama_nextn_catchup {
     llama_memory_context_ptr mctx;
     std::unique_ptr<llm_graph_params> controls;
     bool consumed = false;
+    bool handoff_deferred = false;
 };
 
 struct llama_nextn_draft_body {
@@ -159,6 +161,9 @@ struct llama_nextn_draft {
 struct llama_nextn_target {
     ggml_backend_sched_ptr sched;
     llm_graph_result_ptr res;
+    ggml_context_ptr constants_ctx;
+    ggml_backend_buffer_ptr constants_device;
+    ggml_tensor * out_ids = nullptr;
     ggml_context_ptr meta_ctx;
     ggml_backend_sched_ptr meta_sched;
     ggml_cgraph * meta_gf = nullptr;
@@ -190,7 +195,14 @@ struct llama_nextn_target {
 
 llama_spec_pipeline::llama_spec_pipeline(llama_context & context) : lctx(context) {}
 
-llama_spec_pipeline::~llama_spec_pipeline() = default;
+llama_spec_pipeline::~llama_spec_pipeline() {
+    if (handoff && handoff->snapshot_ready) {
+        ggml_backend_event_synchronize(handoff->snapshot_ready.get());
+    }
+    if (copy_backend) {
+        ggml_backend_synchronize(copy_backend.get());
+    }
+}
 
 bool llama_spec_pipeline::prepare_nextn_draft(llama_context & source, llama_nextn_target & target, int n, bool target_rebuilt,
         std::shared_ptr<llama_nextn_draft_body> & shared) {
@@ -469,6 +481,7 @@ bool llama_spec_pipeline::prepare_nextn_catchup(llama_context & source, llama_ne
         LLAMA_LOG_DEBUG("%s: prepared GPU catch-up (%d rows)\n", __func__, n);
     }
     state.consumed = false;
+    state.handoff_deferred = false;
     return true;
 }
 
@@ -542,6 +555,9 @@ bool llama_spec_pipeline::prefetch_nextn_target(llama_context & source) {
     const int bank = 1 - this->target_bank;
     const int n_begin = early ? 1 : n_max;
     auto * retired = this->targets[bank*10 + n_begin].get();
+    if (this->target_copied[bank]) {
+        ggml_backend_event_synchronize(this->target_copied[bank].get());
+    }
     if (retired && retired->done) {
         ggml_backend_event_synchronize(retired->done.get());
     }
@@ -590,6 +606,21 @@ bool llama_spec_pipeline::prefetch_nextn_target(llama_context & source) {
             state.sched.reset(ggml_backend_sched_new(lctx.backend_ptrs.data(), lctx.backend_buft.data(), lctx.backend_ptrs.size(),
                     max_nodes, false, lctx.cparams.op_offload));
         }
+        if (!state.out_ids) {
+            state.constants_ctx.reset(ggml_init({ ggml_tensor_overhead(), nullptr, true }));
+            state.out_ids = ggml_new_tensor_1d(state.constants_ctx.get(), GGML_TYPE_I32, n);
+            state.constants_device.reset(ggml_backend_alloc_ctx_tensors(state.constants_ctx.get(), backend));
+            if (!state.constants_device) {
+                state.out_ids = nullptr;
+                return false;
+            }
+            // Every row is an output in this width's verification graph.
+            std::vector<int32_t> ids(n);
+            for (int i = 0; i < n; ++i) {
+                ids[i] = i;
+            }
+            ggml_backend_tensor_set(state.out_ids, ids.data(), 0, n*sizeof(int32_t));
+        }
         if (!this->output_ready) {
             this->output_ready.reset(ggml_backend_event_new(dev));
             if (!this->output_ready) {
@@ -619,6 +650,7 @@ bool llama_spec_pipeline::prefetch_nextn_target(llama_context & source) {
         auto params = controls;
         params.sched = state.sched.get();
         params.nextn_target = &state.meta;
+        params.nextn_out_ids = state.out_ids;
         params.samplers = state.samplers;
         bool same_sampler = state.build_controls && llm_graph_params::samplers_equal(state.build_controls->samplers, controls.samplers);
         if (!same_sampler && state.samplers.size() == 1) {
@@ -810,29 +842,59 @@ bool llama_spec_pipeline::prefetch_nextn_target(llama_context & source) {
         tensors.push_back(chain.selected_hidden);
         destinations.push_back(first.catchup_seed->rows[0]->data);
     }
-    ggml_backend_event_record(input.consumed.get(), backend);
-    ggml_backend_event_wait(producer, input.consumed.get());
+    if (producer != backend) {
+        ggml_backend_event_record(input.consumed.get(), backend);
+        ggml_backend_event_wait(producer, input.consumed.get());
+    }
     if (!get_batch(producer, tensors.data(), destinations.data(), tensors.size())) {
         return false;
     }
-    ggml_backend_event_record(first.ready.get(), producer);
-    ggml_backend_tensor_get_async(producer, input.storage, ggml_backend_buffer_get_base(input.host.get()), 0, ggml_nbytes(input.storage));
-    ggml_backend_event_record(input.ready.get(), producer);
+    auto same_backend = [](const std::unique_ptr<llama_output_copies> & copies, ggml_backend_t current) {
+        return !copies || (copies->data.size() == 1 && copies->data.begin()->first == current);
+    };
+    // Only alternating graph banks keep their outputs alive during the next target.
+    const bool can_overlap = chain.composed && this->target_active >= 0 && producer == backend &&
+        same_backend(this->readback, backend) && same_backend(source.spec->readback, producer);
+    if (can_overlap && !this->copy_backend) {
+        this->copy_backend.reset(ggml_backend_dev_init(dev, nullptr));
+        if (this->copy_backend) {
+            LLAMA_LOG_DEBUG("%s: GPU result readback uses a separate stream\n", __func__);
+        }
+    }
+    auto * transfer = can_overlap && this->copy_backend ? this->copy_backend.get() : nullptr;
+    if (producer != backend || transfer) {
+        ggml_backend_event_record(first.ready.get(), producer);
+    }
+    if (transfer) {
+        ggml_backend_event_wait(transfer, first.ready.get());
+    }
+    ggml_backend_tensor_get_async(transfer ? transfer : producer, input.storage,
+            ggml_backend_buffer_get_base(input.host.get()), 0, ggml_nbytes(input.storage));
+    ggml_backend_event_record(input.ready.get(), transfer ? transfer : producer);
     input.snapshot_pending = true;
-    this->readback->submit();
+    this->readback->submit(transfer);
     this->readback.reset();
-    ggml_backend_event_record(this->output_ready.get(), backend);
+    ggml_backend_event_record(this->output_ready.get(), transfer ? transfer : backend);
     this->output_pending = true;
     if ((early || first.catchup) && source.spec->readback) {
-        source.spec->readback->submit();
+        source.spec->readback->submit(transfer);
         source.spec->readback.reset();
         if (!source.spec->output_ready) {
             source.spec->output_ready.reset(ggml_backend_event_new(dev));
         }
-        ggml_backend_event_record(source.spec->output_ready.get(), producer);
+        ggml_backend_event_record(source.spec->output_ready.get(), transfer ? transfer : producer);
         source.spec->output_pending = true;
     }
-    ggml_backend_event_wait(backend, first.ready.get());
+    if (transfer) {
+        auto & copied = this->target_copied[this->target_bank];
+        if (!copied) {
+            copied.reset(ggml_backend_event_new(dev));
+        }
+        ggml_backend_event_record(copied.get(), transfer);
+    }
+    if (producer != backend) {
+        ggml_backend_event_wait(backend, first.ready.get());
+    }
     if (!composed && eagle && ggml_backend_sched_graph_compute_async(first.meta_sched.get(), first.meta_gf) != GGML_STATUS_SUCCESS) {
         return false;
     }
@@ -1134,14 +1196,42 @@ bool llama_spec_pipeline::decode_nextn_catchup(llama_context & source, const lla
             if (decode_batch.n_tokens > 0) {
                 kv->apply_ubatch(slots, ubatch);
             }
-            ggml_backend_event_record(state.consumed.get(), dst_backend);
-            ggml_backend_event_wait(src_backend, state.consumed.get());
-            ggml_backend_tensor_copy_async(src_backend, dst_backend, prepared.hidden, input);
-            if (eagle) {
-                ggml_backend_tensor_get_async(dst_backend, input, ggml_backend_buffer_get_base(state.host.get()), 0, ggml_nbytes(input));
-                ggml_backend_event_record(this->features->consumed.get(), dst_backend);
+            if (active->draft) {
+                prepared.handoff_deferred = true;
+                if (!source.spec->copy_backend) {
+                    source.spec->copy_backend.reset(ggml_backend_dev_init(dev, nullptr));
+                }
+            }
+            auto * transfer = prepared.handoff_deferred ? source.spec->copy_backend.get() : nullptr;
+            if (transfer) {
+                // The composed draft already consumed these hidden rows on the target stream.
+                ggml_backend_event_record(state.consumed.get(), src_backend);
+                ggml_backend_event_wait(transfer, state.consumed.get());
+                auto * tensor = eagle ? prepared.hidden : hidden[0];
+                ggml_backend_tensor_get_async(transfer, tensor, ggml_backend_buffer_get_base(state.host.get()), 0, ggml_nbytes(tensor));
+                if (!state.snapshot_ready) {
+                    state.snapshot_ready.reset(ggml_backend_event_new(dev));
+                }
+                ggml_backend_event_record(state.snapshot_ready.get(), transfer);
+                if (eagle) {
+                    ggml_backend_event_record(this->features->consumed.get(), transfer);
+                }
+                auto & copied = source.spec->target_copied[source.spec->target_bank];
+                if (!copied) {
+                    copied.reset(ggml_backend_event_new(dev));
+                }
+                ggml_backend_event_record(copied.get(), transfer);
             } else {
-                ggml_backend_tensor_get_async(src_backend, hidden[0], ggml_backend_buffer_get_base(state.host.get()), 0, ggml_nbytes(hidden[0]));
+                prepared.handoff_deferred = false;
+                ggml_backend_event_record(state.consumed.get(), dst_backend);
+                ggml_backend_event_wait(src_backend, state.consumed.get());
+                ggml_backend_tensor_copy_async(src_backend, dst_backend, prepared.hidden, input);
+                if (eagle) {
+                    ggml_backend_tensor_get_async(dst_backend, input, ggml_backend_buffer_get_base(state.host.get()), 0, ggml_nbytes(input));
+                    ggml_backend_event_record(this->features->consumed.get(), dst_backend);
+                } else {
+                    ggml_backend_tensor_get_async(src_backend, hidden[0], ggml_backend_buffer_get_base(state.host.get()), 0, ggml_nbytes(hidden[0]));
+                }
             }
             prepared.consumed = true;
             *snapshot = (const float *) ggml_backend_buffer_get_base(state.host.get());
@@ -1298,9 +1388,21 @@ bool llama_spec_pipeline::decode_nextn_prefetch(llama_context & source, const ll
         state.seq = batch.seq_id[0][0];
         state.draft.assign(batch.token + 1, batch.token + n);
         state.draft.push_back(LLAMA_TOKEN_NULL);
-        ggml_backend_tensor_get_async(src_backend, next.body->sampled, ggml_backend_buffer_get_base(state.sampled.host.get()), 0, n*sizeof(llama_token));
-        ggml_backend_event_record(state.ready.get(), src_backend);
+        auto * transfer = source.spec->copy_backend.get();
         ggml_backend_event_record(state.sampled.consumed.get(), src_backend);
+        if (transfer) {
+            ggml_backend_event_wait(transfer, state.sampled.consumed.get());
+        }
+        ggml_backend_tensor_get_async(transfer ? transfer : src_backend, next.body->sampled,
+                ggml_backend_buffer_get_base(state.sampled.host.get()), 0, n*sizeof(llama_token));
+        ggml_backend_event_record(state.ready.get(), transfer ? transfer : src_backend);
+        if (transfer) {
+            auto & copied = source.spec->target_copied[source.spec->target_bank];
+            if (!copied) {
+                copied.reset(ggml_backend_event_new(dev));
+            }
+            ggml_backend_event_record(copied.get(), transfer);
+        }
         if (this->graph && !this->graph->composed) {
             this->graph_cache[this->graph_active] = std::move(this->graph);
         } else {
@@ -1319,6 +1421,12 @@ bool llama_spec_pipeline::decode_nextn_prefetch(llama_context & source, const ll
         LLAMA_LOG_DEBUG("%s: consuming GPU-composed acceptance and draft (%d verified rows)\n", __func__, n);
         source.prefetch_nextn_target(lctx);
         return true;
+    }
+    if (prepared && prepared->input == state.next && prepared->catchup && prepared->catchup->handoff_deferred) {
+        ggml_backend_event_record(this->handoff->consumed.get(), dst_backend);
+        ggml_backend_event_wait(src_backend, this->handoff->consumed.get());
+        ggml_backend_tensor_copy_async(src_backend, dst_backend, prepared->catchup->hidden, this->handoff->rows[n - 1]);
+        prepared->catchup->handoff_deferred = false;
     }
     if (state.pos >= 0) {
         ggml_backend_event_wait(src_backend, state.sampled.consumed.get());
@@ -1642,6 +1750,9 @@ bool llama_spec_pipeline::decode_nextn(const llama_batch & seed, int32_t n_draft
                 lctx.cparams.embeddings == chain.params[0].cparams.embeddings &&
                 lctx.cparams.nextn_layer_offset == chain.params[0].cparams.nextn_layer_offset) {
             ggml_backend_event_synchronize(state.ready.get());
+            if (this->handoff->snapshot_ready) {
+                ggml_backend_event_synchronize(this->handoff->snapshot_ready.get());
+            }
             if (this->features) {
                 synchronize_nextn_catchup();
             }
@@ -1857,8 +1968,11 @@ int32_t llama_spec_pipeline::nextn_draft_length() {
 
 void llama_spec_pipeline::wait_for_snapshots() {
     if (this->lookahead && this->lookahead->pos >= 0) {
-        // The acceptance snapshot is copied on the target context's stream.
+        // Wait for acceptance snapshots before their host buffers are released.
         ggml_backend_event_synchronize(this->lookahead->ready.get());
+    }
+    if (this->handoff && this->handoff->snapshot_ready) {
+        ggml_backend_event_synchronize(this->handoff->snapshot_ready.get());
     }
 }
 
@@ -1906,14 +2020,21 @@ void llama_spec_pipeline::synchronize(bool outputs_only) {
             this->output_pending = true;
         }
     }
-    if (outputs_only && this->output_pending) {
-        ggml_backend_event_synchronize(this->output_ready.get());
-    } else {
+    if (!outputs_only || !this->output_pending) {
         ggml_backend_sched_synchronize(lctx.sched.get());
         if (this->outputs && this->graph &&
                 ggml_backend_sched_get_tensor_backend(this->graph->sched.get(), this->graph->logits[0]) != lctx.backend_ptrs[0]) {
             ggml_backend_sched_synchronize(this->graph->sched.get());
         }
+    }
+    if (this->output_pending) {
+        ggml_backend_event_synchronize(this->output_ready.get());
+    }
+    if (!outputs_only && this->copy_backend) {
+        ggml_backend_synchronize(this->copy_backend.get());
+    }
+    if (this->handoff && this->handoff->snapshot_ready) {
+        ggml_backend_event_synchronize(this->handoff->snapshot_ready.get());
     }
 }
 
@@ -2135,6 +2256,9 @@ void llama_spec_pipeline::add_memory_usage(std::map<ggml_backend_buffer_type_t, 
     std::set<const llama_nextn_handoff *> seeds;
     std::set<const llama_nextn_draft_body *> drafts;
     for (const auto & entry : this->targets) {
+        if (entry) {
+            add_buffer(entry->constants_device);
+        }
         if (entry && entry->input && controls.insert(entry->input.get()).second) {
             add_buffer(entry->input->device);
             add_buffer(entry->input->host);

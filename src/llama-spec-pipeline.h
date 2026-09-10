@@ -80,6 +80,8 @@ private:
     llama_ubatch last_ubatch = {};
     std::unique_ptr<llama_output_copies> readback;
     std::unique_ptr<llama_nextn_lookahead> lookahead;
+    ggml_backend_ptr copy_backend;
+    std::array<ggml_backend_event_ptr, 2> target_copied;
     std::array<std::unique_ptr<llama_nextn_target>, 20> targets;
     llama_memory_context_ptr mctx;
     ggml_backend_event_ptr output_ready;

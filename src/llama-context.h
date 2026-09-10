@@ -41,6 +41,7 @@ struct llama_memory_buffer {
 using llama_memory_buffers = std::map<ggml_backend_buffer_type_t, llama_memory_buffer>;
 
 struct llama_spec_pipeline;
+struct llama_output_copies;
 
 struct llama_context {
     // init scheduler and compute buffers, reserve worst-case graphs
@@ -237,7 +238,7 @@ private:
 
     // async-copy enabled layer-input tensors (per cparams.output_layer_inp)
     // from backend into host-side embd_layer_inp buffers
-    void extract_layer_inputs(const llm_graph_result * res, size_t token_offset, size_t n_tokens);
+    void extract_layer_inputs(const llm_graph_result * res, size_t token_offset, size_t n_tokens, llama_output_copies & copies);
 
     //
     // graph

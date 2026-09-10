@@ -16,14 +16,16 @@ The context synchronizes its work and waits for cross-context snapshots before d
 | `invalidate_graphs()` | Drain pending work and invalidate target build controls before graph reservation. |
 | `begin_decode()` | Retire an unused prefetched target and clear per-batch output state. |
 | `stage_outputs()` | Retain deferred output copies and their memory context, or submit ordinary copies immediately. |
-| `synchronize()` | Submit deferred copies and wait for the selected output event or scheduler. |
+| `synchronize()` | Submit deferred copies and wait for output events; full synchronization also drains the copy backend. |
 | `wait_for_snapshots()` | Wait for copies produced by the other context before releasing host destinations. |
 
 `common_speculative_nextn_driver` in `common/speculative.cpp` owns the shared sampler installation, pipeline configuration and deferred draft collection. MTP and EAGLE3 keep their model-specific feature handling and catch-up alignment. EAGLE3 uses three target features and a shifted token/position relationship. The MTP implementation also supports shared memory and multiple trained heads; these modes must not inherit assumptions from the single-head Qwen path.
 
 ## Execution dependencies
 
-The existing fast path submits the next target evaluation before the CPU reconciles the previous acceptance result. Draft confidence and target-width selection remain GPU operations. This refactor preserves that behavior and its compatibility fallbacks.
+The fast path composes target verification, catch-up, acceptance and the following draft in one CUDA graph. It submits the next target evaluation before the CPU reconciles the previous acceptance result. Draft confidence and target-width selection remain GPU operations.
+
+Alternating graph banks keep outputs alive while a separate backend stream copies snapshots to pinned host buffers. A producer event orders the copies after computation, and a per-bank completion event protects storage reuse. Target layer features use the same output queue. A composed draft consumes its own hidden input; the ordinary handoff copy is deferred until that draft cannot be adopted. Snapshot validation and the compatibility fallbacks remain in place.
 
 There are still CPU batch, position and KV mirror checks between calls. The module is not yet a self-contained, repeatedly replayed GPU cycle, and output collection is not a nonblocking `try_collect` API. Moving code into this module does not remove those dependencies or prove zero GPU idle.
 
@@ -39,9 +41,9 @@ Snapshot completion has its own event, and control storage remains alive until p
 
 The CUDA graph cache skips leading input views when choosing its tensor anchor. Otherwise, width variants that share a control view and have the same node count can replace each other's captured graph and force repeated capture during decoding.
 
-This feedback does not yet include token quota, EOS, cancellation, output credits or autonomous catch-up scheduling. CPU KV metadata, the MTP draft rejection-mask mapping and graph preparation still run between submissions. Snapshot checks are blocking, and the control gather is still submitted separately from the draft graph. Composing those operations and defining bounded output collection remain necessary before a complete GPU cycle can be replayed.
+This feedback does not yet include token quota, EOS, cancellation, output credits or autonomous multi-round replay. CPU KV metadata, the MTP draft rejection-mask mapping and graph preparation still run between submissions. Snapshot checks are blocking, and the control gather is still submitted separately from the draft graph.
 
-The next execution change must give submit and collect independent responsibilities: submit consumes device seed/length/position state, while collect only publishes a completed output snapshot. A composed cycle must also retain recurrent rollback, EOS/token limits, context capacity and output-buffer lifetime. Adding asynchronous copies alone does not establish that contract.
+Any future multi-round replay must retain recurrent rollback, EOS/token limits, context capacity and output-buffer lifetime. Neither graph composition nor asynchronous copies alone prove zero GPU idle. Changes to this execution path need measured reductions in the remaining gaps and a separate plain-throughput comparison.
 
 ## Extension boundaries
 
