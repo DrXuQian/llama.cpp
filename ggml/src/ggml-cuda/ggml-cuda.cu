@@ -4778,30 +4778,31 @@ static __global__ void ggml_cuda_graph_select(const int32_t * selector, cudaGrap
     cudaGraphSetConditional(handle, selector[0]);
 }
 
-static bool ggml_backend_cuda_graph_select(ggml_backend_t backend, ggml_cgraph * const * prefixes,
-        ggml_cgraph * const * graphs, int n_graphs, ggml_tensor * selector) {
+static bool ggml_backend_cuda_graph_select(ggml_backend_t backend, ggml_cgraph * primary,
+        ggml_cgraph * const * stages, int n_graphs, int n_stages, ggml_tensor * selector) {
     auto * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
     ggml_cuda_set_device(cuda_ctx->device);
-    if (n_graphs < 1 || n_graphs > 9 || selector->type != GGML_TYPE_I32) {
+    if (n_graphs < 1 || n_graphs > 9 || n_stages < 1 || (!selector && n_graphs != 1) ||
+            (selector && (selector->type != GGML_TYPE_I32 || ggml_nelements(selector) != 1))) {
         return false;
     }
-    const auto key = ggml_cuda_graph_get_key(graphs[0]);
+    const auto key = ggml_cuda_graph_get_key(primary);
     if (!ggml_cuda_graph_set_enabled(cuda_ctx, key)) {
         return false;
     }
     auto * graph = cuda_ctx->cuda_graph(key);
-    std::vector<uint64_t> uids;
-    for (int i = 0; i < n_graphs; ++i) {
-        uids.push_back(prefixes[i] ? prefixes[i]->uid : 0);
-        uids.push_back(graphs[i]->uid);
+    std::vector<uint64_t> uids = { (uint64_t) n_graphs, (uint64_t) n_stages };
+    for (int i = 0; i < n_graphs*n_stages; ++i) {
+        uids.push_back(stages[i] ? stages[i]->uid : 0);
     }
-    if (graph->select_uids == uids && graph->select_data == selector->data) {
+    void * data = selector ? selector->data : nullptr;
+    if (graph->select_uids == uids && graph->select_data == data) {
         if (graph->instance && graph->warmup_complete) {
             return true;
         }
     }
-    for (int i = 0; i < n_graphs; ++i) {
-        if (!ggml_cuda_graph_check_compability(graphs[i]) || (prefixes[i] && !ggml_cuda_graph_check_compability(prefixes[i]))) {
+    for (int i = 0; i < n_graphs*n_stages; ++i) {
+        if (stages[i] && !ggml_cuda_graph_check_compability(stages[i])) {
             return false;
         }
     }
@@ -4809,33 +4810,35 @@ static bool ggml_backend_cuda_graph_select(ggml_backend_t backend, ggml_cgraph *
     const auto previous_graph = graph->graph;
     graph->instance = nullptr;
     CUDA_CHECK(cudaGraphCreate(&graph->graph, 0));
-    cudaGraphConditionalHandle handle;
-    CUDA_CHECK(cudaGraphConditionalHandleCreate(&handle, graph->graph, 0, cudaGraphCondAssignDefault));
-    void * data = selector->data;
-    void * args[] = { &data, &handle };
-    cudaKernelNodeParams kernel = {};
-    kernel.func = (void *) ggml_cuda_graph_select;
-    kernel.gridDim = kernel.blockDim = dim3(1);
-    kernel.kernelParams = args;
-    cudaGraphNode_t first, branch;
-    CUDA_CHECK(cudaGraphAddKernelNode(&first, graph->graph, nullptr, 0, &kernel));
     cudaGraphNodeParams params = {};
-    params.type = cudaGraphNodeTypeConditional;
-    params.conditional.handle = handle;
-    params.conditional.type = cudaGraphCondTypeSwitch;
-    params.conditional.size = n_graphs;
-    CUDA_CHECK(cudaGraphAddNode(&branch, graph->graph, &first, 1, &params));
+    if (selector) {
+        cudaGraphConditionalHandle handle;
+        CUDA_CHECK(cudaGraphConditionalHandleCreate(&handle, graph->graph, 0, cudaGraphCondAssignDefault));
+        void * args[] = { &data, &handle };
+        cudaKernelNodeParams kernel = {};
+        kernel.func = (void *) ggml_cuda_graph_select;
+        kernel.gridDim = kernel.blockDim = dim3(1);
+        kernel.kernelParams = args;
+        cudaGraphNode_t first, branch;
+        CUDA_CHECK(cudaGraphAddKernelNode(&first, graph->graph, nullptr, 0, &kernel));
+        params.type = cudaGraphNodeTypeConditional;
+        params.conditional.handle = handle;
+        params.conditional.type = cudaGraphCondTypeSwitch;
+        params.conditional.size = n_graphs;
+        CUDA_CHECK(cudaGraphAddNode(&branch, graph->graph, &first, 1, &params));
+    }
     for (int i = 0; i < n_graphs; ++i) {
-        auto body = params.conditional.phGraph_out[i];
+        auto body = selector ? params.conditional.phGraph_out[i] : graph->graph;
         {
             std::lock_guard<std::mutex> lock(ggml_cuda_lock);
             ggml_cuda_lock_counter.fetch_add(1, std::memory_order_relaxed);
         }
         CUDA_CHECK(cudaStreamBeginCaptureToGraph(cuda_ctx->stream(), body, nullptr, nullptr, 0, cudaStreamCaptureModeRelaxed));
-        if (prefixes[i]) {
-            ggml_cuda_graph_evaluate_and_capture(cuda_ctx, prefixes[i], false, false, key);
+        for (int j = 0; j < n_stages; ++j) {
+            if (auto * stage = stages[i*n_stages + j]) {
+                ggml_cuda_graph_evaluate_and_capture(cuda_ctx, stage, false, false, key);
+            }
         }
-        ggml_cuda_graph_evaluate_and_capture(cuda_ctx, graphs[i], false, false, key);
         CUDA_CHECK(cudaStreamEndCapture(cuda_ctx->stream(), &body));
         {
             std::lock_guard<std::mutex> lock(ggml_cuda_lock);
@@ -4844,9 +4847,9 @@ static bool ggml_backend_cuda_graph_select(ggml_backend_t backend, ggml_cgraph *
             }
         }
     }
-    ggml_cuda_graph_update_required(cuda_ctx, graphs[0]);
+    ggml_cuda_graph_update_required(cuda_ctx, primary);
     graph->select_uids = std::move(uids);
-    graph->select_data = selector->data;
+    graph->select_data = data;
     graph->instance = previous_instance;
     if (graph->instance) {
         cudaGraphExecUpdateResultInfo info;

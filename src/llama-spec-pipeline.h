@@ -39,6 +39,7 @@ private:
     void set_nextn_prefetch(bool enabled, bool fixed_kv);
     void set_nextn_graph_cache(int32_t n_max);
     void release_target();
+    bool prepare_nextn_catchup(llama_context & source, llama_nextn_target & target, int n, bool target_rebuilt);
     llm_graph_result * consume_target(const llama_ubatch & ubatch, llama_memory_context_i * mctx);
     uint32_t graph_cache_limit() const { return graph_cache_max; }
     int recurrent_bank() const { return target_bank; }

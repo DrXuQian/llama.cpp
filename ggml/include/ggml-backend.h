@@ -219,7 +219,7 @@ extern "C" {
     // Prepare an allocated graph for replay without executing it.
     typedef bool                         (*ggml_backend_graph_prepare_t)(ggml_backend_t backend, struct ggml_cgraph * graph);
     typedef bool                         (*ggml_backend_graph_early_exit_t)(ggml_backend_t backend, struct ggml_cgraph * graph, struct ggml_tensor * const * scores, int n_steps, float p_min, struct ggml_tensor * counts);
-    typedef bool                         (*ggml_backend_graph_select_t)(ggml_backend_t backend, struct ggml_cgraph * const * prefixes, struct ggml_cgraph * const * graphs, int n_graphs, struct ggml_tensor * selector);
+    typedef bool                         (*ggml_backend_graph_select_t)(ggml_backend_t backend, struct ggml_cgraph * primary, struct ggml_cgraph * const * stages, int n_graphs, int n_stages, struct ggml_tensor * selector);
     // Get additional buffer types provided by the device (returns a NULL-terminated array)
     typedef ggml_backend_buffer_type_t * (*ggml_backend_dev_get_extra_bufts_t)(ggml_backend_dev_t device);
     // Set the abort callback for the backend
@@ -352,7 +352,8 @@ extern "C" {
     GGML_API bool                 ggml_backend_sched_alloc_graph_after(ggml_backend_sched_t sched, struct ggml_cgraph * graph, ggml_backend_event_t last_use);
     GGML_API bool                 ggml_backend_sched_graph_prepare(ggml_backend_sched_t sched);
     GGML_API bool                 ggml_backend_sched_graph_early_exit(ggml_backend_sched_t sched, struct ggml_tensor * const * scores, int n_steps, float p_min, struct ggml_tensor * counts);
-    GGML_API bool                 ggml_backend_sched_graph_select(ggml_backend_sched_t const * prefixes, ggml_backend_sched_t const * scheds, int n_graphs, struct ggml_tensor * selector);
+    // Each branch contains n_stages consecutive schedulers; null stages are skipped. Replay through primary.
+    GGML_API bool                 ggml_backend_sched_graph_select(ggml_backend_sched_t primary, ggml_backend_sched_t const * stages, int n_graphs, int n_stages, struct ggml_tensor * selector);
     GGML_API enum ggml_status     ggml_backend_sched_graph_compute(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
     GGML_API enum ggml_status     ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
     GGML_API void                 ggml_backend_sched_synchronize(ggml_backend_sched_t sched);

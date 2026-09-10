@@ -2127,31 +2127,34 @@ bool ggml_backend_sched_graph_early_exit(ggml_backend_sched_t sched, struct ggml
     return prepare && prepare(backend, &split.graph, scores, n_steps, p_min, counts);
 }
 
-bool ggml_backend_sched_graph_select(ggml_backend_sched_t const * prefixes, ggml_backend_sched_t const * scheds, int n_graphs, struct ggml_tensor * selector) {
-    if (n_graphs < 1) {
+bool ggml_backend_sched_graph_select(ggml_backend_sched_t primary, ggml_backend_sched_t const * stages, int n_graphs, int n_stages, struct ggml_tensor * selector) {
+    if (!primary || !primary->is_alloc || primary->n_splits != 1 || n_graphs < 1 || n_stages < 1) {
         return false;
     }
-    ggml_backend_t backend = nullptr;
-    std::vector<ggml_cgraph *> pre(n_graphs), graphs(n_graphs);
+    auto * backend = primary->backends[primary->splits[0].backend_id];
+    std::vector<ggml_cgraph *> graphs(n_graphs*n_stages);
     std::vector<ggml_tensor *> inputs, copies;
     ggml_backend_set_inputs_t set_inputs = nullptr;
     for (int i = 0; i < n_graphs; ++i) {
-        for (int j = 0; j < 2; ++j) {
-            auto * sched = j ? scheds[i] : prefixes[i];
-            if (!sched && !j) {
+        for (int j = 0; j < n_stages; ++j) {
+            auto * sched = stages[i*n_stages + j];
+            if (!sched) {
                 continue;
             }
-            if (!sched || !sched->is_alloc || sched->n_splits != 1 || sched->n_copies != 1 || sched->callback_eval) {
+            if (!sched->is_alloc || sched->n_splits != 1 || sched->n_copies != 1 || sched->callback_eval) {
                 return false;
             }
             auto & split = sched->splits[0];
             auto * current = sched->backends[split.backend_id];
-            if (backend && current != backend) {
+            if (current != backend) {
                 return false;
             }
-            backend = current;
             set_inputs = sched->set_inputs[split.backend_id];
-            (j ? graphs : pre)[i] = &split.graph;
+            graphs[i*n_stages + j] = &split.graph;
+            // Computing primary uploads its own inputs before the combined graph launch.
+            if (sched == primary) {
+                continue;
+            }
             for (int k = 0; k < split.n_inputs; ++k) {
                 auto * input = split.inputs[k];
                 auto * copy = tensor_copy(input, split.backend_id, sched->cur_copy);
@@ -2166,7 +2169,7 @@ bool ggml_backend_sched_graph_select(ggml_backend_sched_t const * prefixes, ggml
     auto device = ggml_backend_get_device(backend);
     auto reg = device ? ggml_backend_dev_backend_reg(device) : nullptr;
     auto prepare = reg ? (ggml_backend_graph_select_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_graph_select") : nullptr;
-    if ((!inputs.empty() && !set_inputs) || !prepare || !prepare(backend, pre.data(), graphs.data(), n_graphs, selector)) {
+    if ((!inputs.empty() && !set_inputs) || !prepare || !prepare(backend, &primary->splits[0].graph, graphs.data(), n_graphs, n_stages, selector)) {
         return false;
     }
     return inputs.empty() || set_inputs(backend, copies.data(), inputs.data(), inputs.size());
