@@ -226,19 +226,6 @@ llama_model_eagle3::graph<false>::graph(const llama_model & model, const llm_gra
     ggml_tensor * inp_pos = build_inp_pos();
 
     auto * inp_attn = build_attn_inp_kv();
-    if (params.nextn_gpu_kv) {
-        // Use the accepted prefix directly to preserve ordinary attention reduction order.
-        const auto * kv = static_cast<const llama_kv_cache_context *>(mctx);
-        auto * position = ggml_cast(ctx0, inp_pos, GGML_TYPE_F32);
-        inp_attn->from_graph = true;
-        inp_attn->self_k_idxs = ggml_cast(ctx0, position, GGML_TYPE_I64);
-        inp_attn->self_v_idxs = inp_attn->self_k_idxs;
-        auto * distance = ggml_sub(ctx0, ggml_arange(ctx0, 0, kv->get_n_kv(), 1), position);
-        inp_attn->self_kq_mask = ggml_cast(ctx0, ggml_scale(ctx0, ggml_step(ctx0, distance), -1e30f), GGML_TYPE_F16);
-        inp_attn->self_kq_mask_cnv = inp_attn->self_kq_mask;
-        ggml_build_forward_expand(gf, inp_attn->self_k_idxs);
-        ggml_build_forward_expand(gf, inp_attn->self_kq_mask);
-    }
 
     const float kq_scale = 1.0f/sqrtf(float(n_embd_head));
 

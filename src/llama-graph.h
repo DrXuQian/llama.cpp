@@ -828,6 +828,9 @@ struct llm_graph_params {
     ggml_tensor * nextn_tokens = nullptr;
     ggml_tensor * nextn_hidden = nullptr;
     ggml_tensor * nextn_positions = nullptr;
+    ggml_tensor * nextn_kv_positions = nullptr;
+    ggml_tensor * nextn_kq_mask = nullptr;
+    ggml_tensor * nextn_out_ids = nullptr;
     ggml_tensor * nextn_reject_mask = nullptr;
     ggml_tensor * nextn_verify_tokens = nullptr;
     std::array<ggml_tensor *, 3> nextn_features = {};
@@ -838,7 +841,8 @@ struct llm_graph_params {
     //   having the same topology allows us to reuse the graph in some cases
     bool allow_reuse(const llm_graph_params & other) const {
         if (nextn_tokens != other.nextn_tokens || nextn_hidden != other.nextn_hidden || nextn_verify_tokens != other.nextn_verify_tokens ||
-                nextn_positions != other.nextn_positions || nextn_reject_mask != other.nextn_reject_mask ||
+                nextn_positions != other.nextn_positions || nextn_kv_positions != other.nextn_kv_positions ||
+                nextn_kq_mask != other.nextn_kq_mask || nextn_out_ids != other.nextn_out_ids || nextn_reject_mask != other.nextn_reject_mask ||
                 nextn_features != other.nextn_features || nextn_gpu_kv != other.nextn_gpu_kv || nextn_target != other.nextn_target) {
             return false;
         }
@@ -1062,7 +1066,11 @@ struct llm_graph_context {
 
     ggml_tensor * nextn_verify_tokens;
     ggml_tensor * nextn_positions;
+    ggml_tensor * nextn_kv_positions;
+    ggml_tensor * nextn_kq_mask;
+    ggml_tensor * nextn_out_ids;
     ggml_tensor * nextn_reject_mask;
+    bool nextn_gpu_kv;
     const llm_graph_nextn_target * nextn_target;
 
     llm_graph_result * res;

@@ -1505,7 +1505,11 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     cb_func          (params.cb),
     nextn_verify_tokens(params.nextn_verify_tokens),
     nextn_positions(params.nextn_positions),
+    nextn_kv_positions(params.nextn_kv_positions),
+    nextn_kq_mask(params.nextn_kq_mask),
+    nextn_out_ids(params.nextn_out_ids),
     nextn_reject_mask(params.nextn_reject_mask),
+    nextn_gpu_kv(params.nextn_gpu_kv),
     nextn_target(params.nextn_target),
     res              (params.res),
     ctx0             (res->get_ctx()),
@@ -2504,6 +2508,11 @@ ggml_tensor * llm_graph_context::build_inp_attn_scale() const {
 }
 
 ggml_tensor * llm_graph_context::build_inp_out_ids() const {
+    if (nextn_out_ids) {
+        GGML_ASSERT(ggml_nelements(nextn_out_ids) == n_outputs);
+        return nextn_out_ids;
+    }
+
     // note: when all tokens are output, we could skip this optimization to spare the ggml_get_rows() calls,
     //       but this would make the graph topology depend on the number of output tokens, which can interfere with
     //       features that require constant topology such as pipeline parallelism
@@ -2871,6 +2880,23 @@ llm_graph_input_attn_kv * llm_graph_context::build_attn_inp_kv() const {
     const auto * mctx_cur = static_cast<const llama_kv_cache_context *>(mctx);
 
     auto inp = build_attn_inp_kv_impl(ctx0, ubatch, hparams, cparams, mctx_cur);
+
+    if (nextn_gpu_kv) {
+        GGML_ASSERT(n_tokens == 1 && cparams.flash_attn);
+        auto * position = nextn_kv_positions ? nextn_kv_positions : ggml_cast(ctx0, nextn_positions, GGML_TYPE_F32);
+        GGML_ASSERT(ggml_nelements(position) == 1 && position->type == GGML_TYPE_F32);
+        inp->from_graph = true;
+        inp->self_k_idxs = ggml_cast(ctx0, position, GGML_TYPE_I64);
+        inp->self_v_idxs = inp->self_k_idxs;
+        inp->self_kq_mask = nextn_kq_mask;
+        if (!inp->self_kq_mask) {
+            auto * distance = ggml_sub(ctx0, ggml_arange(ctx0, 0, mctx_cur->get_n_kv(), 1), position);
+            inp->self_kq_mask = ggml_cast(ctx0, ggml_scale(ctx0, ggml_step(ctx0, distance), -1e30f), GGML_TYPE_F16);
+        }
+        inp->self_kq_mask_cnv = inp->self_kq_mask;
+        ggml_build_forward_expand(gf, inp->self_k_idxs);
+        ggml_build_forward_expand(gf, inp->self_kq_mask);
+    }
 
     if (nextn_reject_mask) {
         auto * mask = inp->self_kq_mask_cnv;
