@@ -255,6 +255,14 @@ endif()
 # so the guards that decide whether a tensor's GGUF bytes get thrown away have negative controls that run anywhere,
 # including on a machine with no PPU and no real .so.
 if (GGML_NCP_QUACTLIZE)
+    if (UNIX)
+        add_executable(test-kpack-model-loader test-kpack-model-loader.cpp)
+        target_include_directories(test-kpack-model-loader PRIVATE
+            ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/ggml/src)
+        target_link_libraries(test-kpack-model-loader PRIVATE llama)
+        add_test(NAME test-kpack-model-loader COMMAND $<TARGET_FILE:test-kpack-model-loader>)
+    endif()
+
     # One stub per format, from one source, each fixed to its qtype at COMPILE time. All five are loaded into the
     # same process and export the same symbol names, so this is the shape the real bundle has -- and a stub that took
     # its identity from the environment would have all five answering as the same format, hiding the very mix-up the

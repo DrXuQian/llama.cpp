@@ -1080,7 +1080,19 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         return it->second.get();
     };
 
-    auto buft_for_tensor = [&](ggml_tensor * t_meta) -> ggml_backend_buffer_type_t {
+    auto buft_override_for = [&](const std::string & name) -> const llama_model_tensor_buft_override * {
+        if (tensor_buft_overrides) {
+            for (auto rule = tensor_buft_overrides; rule->pattern; ++rule) {
+                if (std::regex_search(name, std::regex(rule->pattern))) {
+                    return rule;
+                }
+            }
+        }
+        return nullptr;
+    };
+
+    auto buft_for_tensor = [&](ggml_tensor * t_meta,
+                               ggml_backend_buffer_type_t inherited_buft = nullptr) -> ggml_backend_buffer_type_t {
         if (!t_meta) {
             if (flags & TENSOR_NOT_REQUIRED) {
                 return nullptr;
@@ -1155,34 +1167,27 @@ struct ggml_tensor * llama_model_loader::create_tensor(
                 GGML_ABORT("invalid layer %d for tensor %s", info.layer, tn.str().c_str());
         }
 
-        ggml_backend_buffer_type_t buft = nullptr;
+        ggml_backend_buffer_type_t buft = inherited_buft;
 
         // check overrides
-        if (tensor_buft_overrides) {
-            std::string tensor_name = tn.str();
-            for (const auto * overrides = tensor_buft_overrides; overrides->pattern != nullptr; ++overrides) {
-                std::regex pattern(overrides->pattern);
-                if (std::regex_search(tensor_name, pattern)) {
-                    if (overrides->buft == ggml_backend_cpu_buffer_type()) {
-                        // when overriding to a CPU buffer, consider the extra buffer types
-                        buft = select_weight_buft(hparams, t_meta, op, buft_list_cpu);
-                        if (use_mmap) {
-                            static std::once_flag once;
-                            std::call_once(once, [] {
-                                LLAMA_LOG_WARN("llama_model_loader: tensor overrides to CPU are used with mmap enabled - consider using --no-mmap for better performance\n");
-                            });
-                        }
-                    } else {
-                        buft = overrides->buft;
-                    }
-
-                    LLAMA_LOG_DEBUG("tensor %s (%zu MiB %s) buffer type overridden to %s\n",
-                            tensor_name.c_str(),
-                            ggml_nbytes(t_meta) / 1024 / 1024, ggml_type_name(t_meta->type),
-                            ggml_backend_buft_name(buft));
-                    break;
+        if (const auto * overrides = buft_override_for(tn.str())) {
+            if (overrides->buft == ggml_backend_cpu_buffer_type()) {
+                // when overriding to a CPU buffer, consider the extra buffer types
+                buft = select_weight_buft(hparams, t_meta, op, buft_list_cpu);
+                if (use_mmap) {
+                    static std::once_flag once;
+                    std::call_once(once, [] {
+                        LLAMA_LOG_WARN("llama_model_loader: tensor overrides to CPU are used with mmap enabled - consider using --no-mmap for better performance\n");
+                    });
                 }
+            } else {
+                buft = overrides->buft;
             }
+
+            LLAMA_LOG_DEBUG("tensor %s (%zu MiB %s) buffer type overridden to %s\n",
+                    tn.str().c_str(),
+                    ggml_nbytes(t_meta) / 1024 / 1024, ggml_type_name(t_meta->type),
+                    ggml_backend_buft_name(buft));
         }
 
         if (!buft) {
@@ -1274,12 +1279,14 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             ggml_tensor meta=*gate->tensor;
             meta.ne[1]*=2; meta.nb[2]*=2; meta.nb[3]*=2; ggml_set_name(&meta,tn.str().c_str());
             for (size_t j=0;j<3;++j) plain &= meta.ne[j]==ne.begin()[j];
-            auto buft=plain ? buft_for_tensor(&meta) : nullptr;
-            if (buft && tensor_buft_overrides) {
-                for (const auto & name:{gate_name,up_name}) for (auto rule=tensor_buft_overrides;rule->pattern;++rule) {
-                    if (std::regex_search(name,std::regex(rule->pattern))) { plain &= rule->buft==buft; break; }
-                }
-            }
+            const auto * gate_rule = buft_override_for(gate_name);
+            const auto * up_rule = buft_override_for(up_name);
+            // Exact source-name overrides do not match the synthetic name.
+            // Inherit only a shared assignment; an explicit merged rule still wins.
+            auto inherited_buft = gate_rule && up_rule && gate_rule->buft == up_rule->buft
+                ? gate_rule->buft : nullptr;
+            auto buft = plain ? buft_for_tensor(&meta, inherited_buft) : nullptr;
+            plain &= (!gate_rule || gate_rule->buft == buft) && (!up_rule || up_rule->buft == buft);
             auto dev=buft ? ggml_backend_buft_get_device(buft) : nullptr;
             auto reg=dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
             auto accepts=reg ? reinterpret_cast<decltype(&ggml_quactlize_pair_supported)>(
