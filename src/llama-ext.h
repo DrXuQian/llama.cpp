@@ -98,7 +98,7 @@ LLAMA_API void llama_set_embeddings_nextn(struct llama_context * ctx, bool value
 // Configure NextN prefetch before decoding. Supported single-GPU contexts use fixed KV graph sizes.
 LLAMA_API void llama_set_nextn_prefetch(struct llama_context * ctx, bool enabled, bool fixed_kv = true);
 
-// Experimental four-row EAGLE3 tree verification in the GPU prefetch pipeline.
+// Experimental fixed-budget EAGLE3 tree verification in the GPU prefetch pipeline.
 LLAMA_API void llama_set_nextn_tree(struct llama_context * ctx, bool enabled);
 
 // Resolve tree proposals after verification. Unused path rows force rejection at the bonus row.

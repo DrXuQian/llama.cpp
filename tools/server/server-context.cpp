@@ -496,7 +496,7 @@ struct server_slot {
         const auto & draft = task->params.speculative.draft;
         const auto & types = task->params.speculative.types;
         const bool keep_tree_budget = stats.n_gen > 1 && draft.eagle3_tree && draft.gpu_pipeline &&
-            draft.n_max == 3 && draft.p_min == 0.0f && llama_n_seq_max(ctx_tgt) == 1 &&
+            (draft.n_max == 3 || draft.n_max == 7) && draft.p_min == 0.0f && llama_n_seq_max(ctx_tgt) == 1 &&
             std::find(types.begin(), types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3) != types.end() &&
             std::all_of(types.begin(), types.end(), [](auto type) { return type == COMMON_SPECULATIVE_TYPE_NONE || type == COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3; }) &&
             !llama_model_is_recurrent(llama_get_model(ctx_tgt)) && !llama_model_is_hybrid(llama_get_model(ctx_tgt)) &&

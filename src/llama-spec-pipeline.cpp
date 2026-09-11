@@ -556,7 +556,7 @@ bool llama_spec_pipeline::prefetch_nextn_target(llama_context & source) {
         return false;
     }
     const bool can_compose = ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(dev), "ggml_backend_graph_select") != nullptr;
-    const bool tree = tree_enabled && eagle && !early && n_max == 4 && chain.tree_scores.size() == 3 &&
+    const bool tree = tree_enabled && eagle && !early && (n_max == 4 || n_max == 8) && chain.tree_scores.size() == (size_t) n_max - 1 &&
         kv->is_fixed_size() && (uint32_t) n_kv == kv->get_size() && can_compose;
     const int bank = 1 - this->target_bank;
     const int n_begin = early ? 1 : n_max;
@@ -581,7 +581,7 @@ bool llama_spec_pipeline::prefetch_nextn_target(llama_context & source) {
             state.tree.reset();
             if (tree) {
                 state.tree = std::make_unique<llama_spec_tree>();
-                if (!state.tree->init(backend)) {
+                if (!state.tree->init(backend, n)) {
                     state.tree.reset();
                     return false;
                 }
@@ -755,7 +755,7 @@ bool llama_spec_pipeline::prefetch_nextn_target(llama_context & source) {
                         ggml_flash_attn_ext_set_kv_indices(node, state.meta.kv_idxs);
                     }
                 }
-                if (!state.tree->build_outputs(*res, *kv, input.tokens[3], lctx.model.vocab.n_tokens())) {
+                if (!state.tree->build_outputs(*res, *kv, input.tokens[n - 1], lctx.model.vocab.n_tokens())) {
                     return false;
                 }
             } else if (eagle) {
@@ -874,31 +874,34 @@ bool llama_spec_pipeline::prefetch_nextn_target(llama_context & source) {
         destinations.push_back((int32_t *) input.storage->data + i);
     }
     const size_t n_control = tensors.size();
-    std::array<ggml_tensor, 4> tree_candidates;
-    std::array<ggml_tensor, 4> tree_probabilities;
+    std::array<ggml_tensor, 8> tree_candidates;
+    std::array<ggml_tensor, 8> tree_probabilities;
     if (tree) {
         tensors.push_back(chain.selected_token);
         destinations.push_back(first.tree->tokens->data);
-        for (int i = 0; i < 3; ++i) {
+        const int branches = first.tree->n_branches;
+        for (int i = 0; i < n_max - 1; ++i) {
             tree_candidates[i] = *chain.candidates[i];
-            tree_candidates[i].ne[0] = 2;
+            tree_candidates[i].ne[0] = branches;
             tensors.push_back(&tree_candidates[i]);
-            destinations.push_back((int32_t *) first.tree->tokens->data + 1 + 2*i);
+            destinations.push_back((int32_t *) first.tree->tokens->data + 1 + branches*i);
             tree_probabilities[i] = *chain.tree_scores[i];
-            tree_probabilities[i].ne[0] = 2;
+            tree_probabilities[i].ne[0] = branches;
             tensors.push_back(&tree_probabilities[i]);
-            destinations.push_back((float *) first.tree->scores->data + 1 + 2*i);
+            destinations.push_back((float *) first.tree->scores->data + 1 + branches*i);
         }
-        tree_candidates[3] = tree_candidates[0];
-        tree_candidates[3].ne[0] = 1;
-        tree_candidates[3].data = (int32_t *) tree_candidates[3].data + 2;
-        tree_probabilities[3] = tree_probabilities[0];
-        tree_probabilities[3].ne[0] = 1;
-        tree_probabilities[3].data = (float *) tree_probabilities[3].data + 2;
-        tensors.push_back(&tree_candidates[3]);
-        destinations.push_back((int32_t *) first.tree->tokens->data + 7);
-        tensors.push_back(&tree_probabilities[3]);
-        destinations.push_back((float *) first.tree->scores->data + 7);
+        if (n_max == 4) {
+            tree_candidates[3] = tree_candidates[0];
+            tree_candidates[3].ne[0] = 1;
+            tree_candidates[3].data = (int32_t *) tree_candidates[3].data + 2;
+            tree_probabilities[3] = tree_probabilities[0];
+            tree_probabilities[3].ne[0] = 1;
+            tree_probabilities[3].data = (float *) tree_probabilities[3].data + 2;
+            tensors.push_back(&tree_candidates[3]);
+            destinations.push_back((int32_t *) first.tree->tokens->data + 7);
+            tensors.push_back(&tree_probabilities[3]);
+            destinations.push_back((float *) first.tree->scores->data + 7);
+        }
     }
     if (first.catchup_seed) {
         tensors.push_back(chain.selected_hidden);
@@ -909,10 +912,12 @@ bool llama_spec_pipeline::prefetch_nextn_target(llama_context & source) {
         ggml_backend_event_wait(producer, input.consumed.get());
     }
     // Keep scalar control packing and tree input copies on the small device-copy paths.
-    const size_t n_first = tree ? n_control : tensors.size();
-    if (!get_batch(producer, tensors.data(), destinations.data(), n_first) ||
-            (tree && !get_batch(producer, tensors.data() + n_first, destinations.data() + n_first, tensors.size() - n_first))) {
-        return false;
+    for (size_t begin = 0; begin < tensors.size();) {
+        const size_t end = tree ? (begin < n_control ? n_control : std::min(begin + 12, tensors.size())) : tensors.size();
+        if (!get_batch(producer, tensors.data() + begin, destinations.data() + begin, end - begin)) {
+            return false;
+        }
+        begin = end;
     }
     auto same_backend = [](const std::unique_ptr<llama_output_copies> & copies, ggml_backend_t current) {
         return !copies || (copies->data.size() == 1 && copies->data.begin()->first == current);
@@ -978,7 +983,7 @@ bool llama_spec_pipeline::prefetch_nextn_target(llama_context & source) {
     if (!this->prefetch_reported) {
         LLAMA_LOG_INFO("%s: GPU NextN pipeline active; target submitted before CPU acceptance\n", __func__);
         if (tree) {
-            LLAMA_LOG_INFO("%s: experimental EAGLE3 tree active (4 target rows, GPU path selection and KV commit)\n", __func__);
+            LLAMA_LOG_INFO("%s: experimental EAGLE3 tree active (%d target rows, GPU path selection and KV commit)\n", __func__, n_max);
         }
         this->prefetch_reported = true;
     }
@@ -1563,7 +1568,7 @@ bool llama_spec_pipeline::prepare_draft_graph(llama_nextn_graph & chain,
         ggml_tensor * sampled, ggml_tensor * input_hidden, llama_pos verify_pos) {
     const bool eagle = lctx.model.arch == LLM_ARCH_EAGLE3;
     const auto seq_id = contexts[0]->get_ubatch().seq_id[0][0];
-    const bool tree = tree_enabled && eagle && prefetch && n_draft == 3 && p_min == 0.0f && lctx.model.vocab.n_tokens() >= 10;
+    const bool tree = tree_enabled && eagle && prefetch && (n_draft == 3 || n_draft == 7) && p_min == 0.0f && lctx.model.vocab.n_tokens() >= 10;
     auto * res = chain.res.get();
     auto params_for = [&](int i) {
         auto params = lctx.graph_params(res, contexts[i]->get_ubatch(), contexts[i].get(), lctx.ctx_type_to_graph_type(lctx.cparams.ctx_type));
@@ -1718,7 +1723,7 @@ bool llama_spec_pipeline::prepare_draft_graph(llama_nextn_graph & chain,
             ggml_build_forward_expand(res->get_gf(), chain.tokens.back());
             chain.hidden.push_back(res->get_h_nextn());
             if (tree) {
-                auto * candidates = ggml_view_1d(ctx, ids, i ? 2 : 3, 0);
+                auto * candidates = ggml_view_1d(ctx, ids, n_draft == 3 ? (i ? 2 : 3) : n_draft, 0);
                 auto * probabilities = llama_spec_tree::probabilities(ctx, logits, candidates, llama_spec_tree::row(ctx, values, 0));
                 if (i) {
                     probabilities = ggml_mul(ctx, probabilities, llama_spec_tree::row(ctx, chain.tree_scores.back(), 0));
@@ -2239,7 +2244,7 @@ bool llama_spec_pipeline::should_defer_outputs(const llama_ubatch & ubatch, uint
 void llama_spec_pipeline::stage_outputs(llama_output_copies copies, llama_memory_context_ptr & mctx, bool defer) {
     if (target_active >= 0 && targets[target_active]->tree) {
         auto & state = *targets[target_active];
-        copies.add(lctx.backend_ptrs[0], state.input->tokens[3], ggml_backend_buffer_get_base(state.tree->host.get()));
+        copies.add(lctx.backend_ptrs[0], state.input->tokens[state.tree->n_rows - 1], ggml_backend_buffer_get_base(state.tree->host.get()));
     }
     if (defer) {
         readback = std::make_unique<llama_output_copies>(std::move(copies));
@@ -2250,7 +2255,7 @@ void llama_spec_pipeline::stage_outputs(llama_output_copies copies, llama_memory
 }
 
 bool llama_spec_pipeline::verified_draft(llama_token * tokens, int32_t n) {
-    if (!tokens || n != 3 || target_active < 0 || !targets[target_active]->tree) {
+    if (!tokens || target_active < 0 || !targets[target_active]->tree || n != targets[target_active]->tree->n_rows - 1) {
         return false;
     }
     lctx.synchronize(true);

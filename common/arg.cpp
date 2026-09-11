@@ -4156,7 +4156,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
 
     add_opt(common_arg(
         {"--spec-eagle3-tree"},
-        "experimental GPU EAGLE3 tree verification (requires draft-n-max 3, draft-p-min 0, single-slot greedy GPU pipeline)",
+        "experimental GPU EAGLE3 tree verification (requires draft-n-max 3 or 7, draft-p-min 0, single-slot greedy GPU pipeline)",
         [](common_params & params) {
             params.speculative.draft.eagle3_tree = true;
         }

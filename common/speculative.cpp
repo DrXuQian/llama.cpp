@@ -123,7 +123,7 @@ struct common_speculative_nextn_driver {
     void configure_pipeline() {
         llama_set_nextn_prefetch(params.ctx_tgt, allow_prefetch);
         llama_set_nextn_prefetch(params.ctx_dft, allow_prefetch);
-        const bool tree = params.eagle3_tree && allow_prefetch && params.n_max == 3 && params.p_min == 0.0f;
+        const bool tree = params.eagle3_tree && allow_prefetch && (params.n_max == 3 || params.n_max == 7) && params.p_min == 0.0f;
         llama_set_nextn_tree(params.ctx_tgt, tree);
         llama_set_nextn_tree(params.ctx_dft, tree);
         const int n_cache = params.gpu_pipeline && n_seq == 1 && !synthetic &&
