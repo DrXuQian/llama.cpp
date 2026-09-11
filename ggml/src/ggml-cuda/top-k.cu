@@ -46,6 +46,55 @@ static int next_power_of_2(int x) {
     return n;
 }
 
+#if !defined(GGML_USE_HIP)
+template<int ITEMS, bool MERGE>
+static __global__ void top_k_small(const float * src, const int * ids, float * keys_out, int * ids_out, int ncols, int k) {
+    constexpr int BLOCK_SIZE = 256;
+    using block_sort = cub::BlockRadixSort<float, BLOCK_SIZE, ITEMS, int>;
+    __shared__ typename block_sort::TempStorage scratch;
+    float keys[ITEMS];
+    int values[ITEMS];
+
+#pragma unroll
+    for (int i = 0; i < ITEMS; ++i) {
+        const int col = blockIdx.x * BLOCK_SIZE * ITEMS + threadIdx.x * ITEMS + i;
+        // Minimum radix key; stable sorting keeps valid items before padding.
+        keys[i] = col < ncols ? src[col] : __uint_as_float(0xffffffffU);
+        values[i] = col < ncols ? (MERGE ? ids[col] : col) : INT_MAX;
+    }
+    block_sort(scratch).SortDescendingBlockedToStriped(keys, values);
+
+    if (threadIdx.x < k) {
+        const int col = blockIdx.x * k + threadIdx.x;
+        if (!MERGE) {
+            keys_out[col] = keys[0];
+        }
+        ids_out[col] = values[0];
+    }
+}
+
+static void top_k_small_cuda(ggml_cuda_pool & pool, const float * src, int * dst, int ncols, int k, cudaStream_t stream) {
+    constexpr int BLOCK_SIZE = 256;
+    constexpr int ITEMS = 8;
+    const int blocks = (ncols + BLOCK_SIZE * ITEMS - 1) / (BLOCK_SIZE * ITEMS);
+    const int count = blocks * k;
+    GGML_ASSERT(k <= 16 && count <= BLOCK_SIZE * ITEMS);
+
+    ggml_cuda_pool_alloc<float> keys(pool, count);
+    ggml_cuda_pool_alloc<int> ids(pool, count);
+    top_k_small<ITEMS, false><<<blocks, BLOCK_SIZE, 0, stream>>>(src, nullptr, keys.get(), ids.get(), ncols, k);
+
+    // Tile order and stable radix sorting preserve the full sort's tie order.
+    if (count <= BLOCK_SIZE) {
+        top_k_small<1, true><<<1, BLOCK_SIZE, 0, stream>>>(keys.get(), ids.get(), nullptr, dst, count, k);
+    } else if (count <= BLOCK_SIZE * 4) {
+        top_k_small<4, true><<<1, BLOCK_SIZE, 0, stream>>>(keys.get(), ids.get(), nullptr, dst, count, k);
+    } else {
+        top_k_small<ITEMS, true><<<1, BLOCK_SIZE, 0, stream>>>(keys.get(), ids.get(), nullptr, dst, count, k);
+    }
+}
+#endif // !defined(GGML_USE_HIP)
+
 #endif                            // CUB_TOP_K_AVAILABLE
 
 #if !defined(GGML_CUDA_USE_CUB) && defined(GGML_USE_HIP)
@@ -233,6 +282,12 @@ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
         top_k_cub(pool, src0_d + i * ncols, dst_d + i * k, ncols, k, stream);
     }
 #elif defined(GGML_CUDA_USE_CUB)  // CUB_TOP_K_AVAILABLE
+#if !defined(GGML_USE_HIP)
+    if (nrows == 1 && ncols > 1024 && ncols <= 262144 && k <= 16) {
+        top_k_small_cuda(pool, src0_d, dst_d, ncols, k, stream);
+        return;
+    }
+#endif // !defined(GGML_USE_HIP)
     // Fall back to argsort + copy
     const int    ncols_pad      = next_power_of_2(ncols);
     const size_t shared_mem     = ncols_pad * sizeof(int);
