@@ -51,6 +51,7 @@ struct Plan {
     qks_choice_v1 choice{};
     qkg_call_v1 gemv{};
     qkg_config_v1 gemv_config{};
+    qkg_q4_decode_config_v1 q4_config{};
     void * handle = nullptr;
     half * a = nullptr;
     half * out = nullptr;
@@ -62,6 +63,7 @@ struct Plan {
     int32_t * bounds = nullptr;
     bool direct = false, legacy = false, sf = false, scale_resident = false;
     bool indexed = false;
+    bool q4_decode = false, q4_tc = false;
     int rows = 0, tokens = 0, topk = 0;
     ~Plan() { if (handle) api->destroy(handle); }
 };
@@ -185,17 +187,32 @@ Plan & prepare(ggml_backend_cuda_context & ctx, const ggml_tensor * weight,
         c.ids_stride = ids ? ids->nb[1] / sizeof(int32_t) : 0; c.out_row_stride = art.n;
         c.a = input->data; c.low = art.low; c.high = art.high; c.units = art.units;
         c.ids = ids ? (const int32_t *) ids->data : nullptr; c.output = (float *) output->data; c.stream = stream;
-        p->direct = ggml_quactlize_gemv_config(c, &p->gemv_config);
+        if (mode == RouteMode::Auto && art.qtype == GGML_TYPE_Q4_K && owner.api->q4_select) {
+            qkg_sizes_v1 sizes{};
+            int rc = owner.api->q4_select(&c, &art.arrangement, &p->q4_config, &sizes);
+            if (rc != QKG_OK && rc != QKG_SHAPE)
+                GGML_ABORT("[quactlize] %s: Q4 decode selection failed rc=%d", weight->name, rc);
+            p->direct = p->q4_decode = rc == QKG_OK;
+        } else {
+            p->direct = ggml_quactlize_gemv_config(c, &p->gemv_config);
+        }
         if (!p->direct && mode == RouteMode::Gemv)
             GGML_ABORT("[quactlize] %s: forced GEMV has no measured recipe for this request", weight->name);
     }
     if (p->direct) {
         auto & c = p->gemv;
         qkg_sizes_v1 sizes{};
-        int rc = owner.api->gemv_query(&c, &p->gemv_config, &art.arrangement, &sizes);
+        int rc = p->q4_decode ? owner.api->q4_select(&c, &art.arrangement, &p->q4_config, &sizes) :
+            owner.api->gemv_query(&c, &p->gemv_config, &art.arrangement, &sizes);
         if (rc != QKG_OK) GGML_ABORT("[quactlize] %s: GEMV query failed rc=%d", weight->name, rc);
         c.workspace = owner.storage(stream, sizes.workspace_bytes); c.workspace_bytes = sizes.workspace_bytes;
-        GGML_LOG_INFO("[quactlize-plan] tensor=%s op=%s route=gemv q=%d rows=%d n=%" PRId64 " k=%" PRId64
+        if (p->q4_decode) {
+            auto f = p->q4_config;
+            GGML_LOG_INFO("[quactlize-plan] tensor=%s op=%s route=gemv-q4-s1 q=%d rows=%d n=%" PRId64 " k=%" PRId64
+                " reader=%d variant=%d warps=%d values=%d columns=%d split=1 selection=MEASURED_DECODE\n",
+                weight->name, ids ? "grouped" : "dense", art.qtype, p->rows, art.n, art.k,
+                f.reader, f.variant, f.warps, f.values, f.columns);
+        } else GGML_LOG_INFO("[quactlize-plan] tensor=%s op=%s route=gemv q=%d rows=%d n=%" PRId64 " k=%" PRId64
             " columns=%d warps=%d split=%d selection=MEASURED_GEMV_POOL activation=FP16 scale_resident=%d\n", weight->name, ids ? "grouped" : "dense",
             art.qtype, p->rows, art.n, art.k, p->gemv_config.columns, p->gemv_config.warps, p->gemv_config.split,
             int(art.qtype == GGML_TYPE_Q8_0));
@@ -203,7 +220,13 @@ Plan & prepare(ggml_backend_cuda_context & ctx, const ggml_tensor * weight,
         qks_request_v1 r{1, sizeof(r), art.qtype, ids ? QK_GROUPED_FQ : QK_DENSE_FQ,
             p->rows, int(art.n), int(art.k), int(art.experts), int(tokens), art.arrangement.mapping_id};
         int status = QKS_MISS;
-        const int prefill_choice = mode == RouteMode::Auto && tokens > 1 ? ggml_quactlize_prefill_route(r) : -1;
+        if (mode == RouteMode::Auto && art.qtype == GGML_TYPE_Q4_K && owner.api->query_decode) {
+            status = owner.api->query_decode(owner.runtime, &r, &p->choice);
+            if (status != QKS_OK && status != QKS_MISS)
+                GGML_ABORT("[quactlize] %s: decode TC selection: %s", weight->name, owner.api->error());
+            p->q4_tc = status == QKS_OK;
+        }
+        const int prefill_choice = !p->q4_tc && mode == RouteMode::Auto && tokens > 1 ? ggml_quactlize_prefill_route(r) : -1;
         if (art.qtype == GGML_TYPE_Q8_0) {
             r.route = ids ? QK_GROUPED_SF : QK_DENSE_SF;
             status = owner.api->query(owner.runtime, &r, &p->choice);
@@ -234,7 +257,7 @@ Plan & prepare(ggml_backend_cuda_context & ctx, const ggml_tensor * weight,
                 GGML_ABORT("[quactlize] %s: SF selection failed: %s", weight->name, owner.api->error());
             }
         }
-        if (!p->sf) {
+        if (!p->sf && !p->q4_tc) {
             if (mode == RouteMode::Sf) GGML_ABORT("[quactlize] %s: forced SF has no admitted resources/module", weight->name);
             r.route = ids ? QK_GROUPED_FQ : QK_DENSE_FQ;
             status = owner.api->query(owner.runtime, &r, &p->choice);
@@ -404,7 +427,9 @@ bool ggml_quactlize_execution_run(ggml_backend_cuda_context & ctx, const ggml_te
             p.units_bytes, p.scale, p.zero, p.sf_plane_bytes, &p.art.arrangement, stream) != QKG_OK)
         GGML_ABORT("[quactlize] %s: per-call SF prepass failed", weight->name);
     if (p.direct) {
-        if (p.api->gemv_run(&p.gemv, &p.gemv_config, &p.art.arrangement) != QKG_OK)
+        int rc = p.q4_decode ? p.api->q4_run(&p.gemv, &p.q4_config, &p.art.arrangement) :
+            p.api->gemv_run(&p.gemv, &p.gemv_config, &p.art.arrangement);
+        if (rc != QKG_OK)
             GGML_ABORT("[quactlize] %s: GEMV launch failed", weight->name);
         ggml_ncp_route_log(output, "so-quactlize-kpack-gemv", nullptr);
         return true;
@@ -413,6 +438,19 @@ bool ggml_quactlize_execution_run(ggml_backend_cuda_context & ctx, const ggml_te
         if (p.api->run(p.handle,stream)!=QKS_OK)
             GGML_ABORT("[quactlize] %s: fused indexed GEMM launch failed",weight->name);
         ggml_ncp_route_log(output,p.sf ? "so-quactlize-kpack-sf" : "so-quactlize-kpack-fq-selected",nullptr);
+        return true;
+    }
+    if (p.q4_tc) {
+        p.gemv.stream = stream;
+        int rc = ids ? p.api->q4_prepare(&p.gemv, p.a, p.bounds, p.ids_dst) :
+            p.api->q4_cast(1, input->data, p.a, p.rows, p.art.k, p.gemv.a_row_stride, stream);
+        if (rc != QKG_OK) GGML_ABORT("[quactlize] %s: decode TC preparation failed rc=%d", weight->name, rc);
+        if (p.api->run(p.handle, stream) != QKS_OK)
+            GGML_ABORT("[quactlize] %s: selected decode TC failed", weight->name);
+        rc = ids ? p.api->q4_finish(&p.gemv, p.out, p.ids_dst) :
+            p.api->q4_cast(0, p.out, output->data, p.rows, p.art.n, p.gemv.out_row_stride, stream);
+        if (rc != QKG_OK) GGML_ABORT("[quactlize] %s: decode TC finish failed rc=%d", weight->name, rc);
+        ggml_ncp_route_log(output, "so-quactlize-kpack-fq-selected", nullptr);
         return true;
     }
     if (ids) {

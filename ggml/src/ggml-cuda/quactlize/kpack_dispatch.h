@@ -9,7 +9,8 @@ extern "C" {
 enum { QKS_OK = 0, QKS_MISS = 1, QKS_INVALID = 2, QKS_BINDING = 3,
        QKS_RUNTIME = 4 };
 enum { QKS_RECENT = 1, QKS_HISTORICAL = 2, QKS_PREDICTED = 3,
-       QKS_DEVICE_BOUNDS = 4, QKS_MEASURED_GROUPED = 5, QKS_Q8_INITIAL = 6 };
+       QKS_DEVICE_BOUNDS = 4, QKS_MEASURED_GROUPED = 5, QKS_Q8_INITIAL = 6,
+       QKS_DECODE_MEASURED = 7 };
 
 // Additive Q8_0/W8A16 intake capability, without a device/context or JIT.
 // Returns 1 for supported weight geometry and SF route (1=dense,3=grouped).
@@ -52,6 +53,12 @@ typedef struct {
 // The cache and helper must be trusted local files, like the packaged DSOs.
 int quactlize_kpack_dispatch_enable_jit_v1(void* runtime, qks_jit_options_v1 const*);
 int quactlize_kpack_dispatch_query_v1(void* runtime, qks_request_v1 const*, qks_choice_v1*);
+// Additive TC selection for the measured Q4 F32-endpoint decode path. Call
+// only after the Q4 SIMT selector declines. Dense M<=8; grouped E256/top8,
+// shared or slot-specific A, max_rows=tokens=m/8 (an upper bound, not observed
+// routing). No device-ID readback. Unlisted requests return QKS_MISS; retain
+// the ordinary selector. Forced FQ/SF and the v1 query are unchanged.
+int quactlize_kpack_dispatch_query_decode_v1(void* runtime, qks_request_v1 const*, qks_choice_v1*);
 int quactlize_kpack_dispatch_prepare_v1(void* runtime, qks_choice_v1 const*,
                                      qk_call_v1 const*, void** handle);
 int quactlize_kpack_dispatch_run_v1(void* handle, void* stream);
