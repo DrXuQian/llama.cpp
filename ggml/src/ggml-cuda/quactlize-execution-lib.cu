@@ -38,6 +38,18 @@ const ggml_quactlize_execution_api * ggml_quactlize_execution_library() {
         QZ_BIND(gemv_query, device, "quactlize_kpack_gemv_query_v1");
         QZ_BIND(gemv_run, device, "quactlize_kpack_gemv_run_v1");
         QZ_BIND(sf_prepare, device, "quactlize_kpack_sf_prepare_v1");
+        result.q4_select = reinterpret_cast<decltype(result.q4_select)>(
+            dlsym(device, "quactlize_kpack_q4_decode_select_v1"));
+        result.query_decode = reinterpret_cast<decltype(result.query_decode)>(
+            dlsym(host, "quactlize_kpack_dispatch_query_decode_v1"));
+        if (bool(result.q4_select) != bool(result.query_decode))
+            GGML_ABORT("[quactlize] mixed Q4 decode host/device package");
+        if (result.q4_select) {
+            QZ_BIND(q4_run, device, "quactlize_kpack_q4_decode_run_v1");
+            QZ_BIND(q4_cast, device, "quactlize_kpack_q4_decode_cast_v1");
+            QZ_BIND(q4_prepare, device, "quactlize_kpack_q4_decode_indexed_prepare_v1");
+            QZ_BIND(q4_finish, device, "quactlize_kpack_q4_decode_indexed_finish_v1");
+        }
         result.bind_indexed = reinterpret_cast<decltype(result.bind_indexed)>(
             dlsym(host,"quactlize_kpack_dispatch_bind_llama_indexed_v1"));
         result.moe_create = reinterpret_cast<decltype(result.moe_create)>(
