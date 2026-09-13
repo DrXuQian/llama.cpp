@@ -1,6 +1,7 @@
 #pragma once
 #include "quactlize/kpack_dispatch.h"
 #include "quactlize/kpack_execution.h"
+#include "quactlize/kpack_q4_decode.h"
 
 struct ggml_quactlize_execution_api {
     const char * root;
@@ -20,6 +21,12 @@ struct ggml_quactlize_execution_api {
     decltype(&quactlize_kpack_dispatch_moe_run_v1) moe_run;
     decltype(&quactlize_kpack_dispatch_moe_run_router_v1) moe_run_router;
     decltype(&quactlize_kpack_dispatch_moe_destroy_v1) moe_destroy;
+    decltype(&quactlize_kpack_q4_decode_select_v1) q4_select;
+    decltype(&quactlize_kpack_q4_decode_run_v1) q4_run;
+    decltype(&quactlize_kpack_dispatch_query_decode_v1) query_decode;
+    decltype(&quactlize_kpack_q4_decode_cast_v1) q4_cast;
+    decltype(&quactlize_kpack_q4_decode_indexed_prepare_v1) q4_prepare;
+    decltype(&quactlize_kpack_q4_decode_indexed_finish_v1) q4_finish;
 };
 
 // QUACTLIZE_KPACK_EXECUTION names the complete native package. An explicit
