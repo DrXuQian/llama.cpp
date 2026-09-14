@@ -52,6 +52,12 @@ const ggml_quactlize_execution_api * ggml_quactlize_execution_library() {
         }
         result.bind_indexed = reinterpret_cast<decltype(result.bind_indexed)>(
             dlsym(host,"quactlize_kpack_dispatch_bind_llama_indexed_v1"));
+        result.query_dense_io = reinterpret_cast<decltype(result.query_dense_io)>(
+            dlsym(host,"quactlize_kpack_dispatch_query_dense_io_v1"));
+        result.prepare_dense_io = reinterpret_cast<decltype(result.prepare_dense_io)>(
+            dlsym(host,"quactlize_kpack_dispatch_prepare_dense_io_v1"));
+        if (bool(result.query_dense_io) != bool(result.prepare_dense_io))
+            GGML_ABORT("[quactlize] incomplete typed decode package");
         result.moe_create = reinterpret_cast<decltype(result.moe_create)>(
             dlsym(host,"quactlize_kpack_dispatch_moe_create_v1"));
         result.moe_run = reinterpret_cast<decltype(result.moe_run)>(

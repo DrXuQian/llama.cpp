@@ -41,7 +41,8 @@ inline MoeGraph match_moe(ggml_cgraph const * graph, int start) {
         match.down->op != GGML_OP_MUL_MAT_ID || match.down->src[1] != glu ||
         match.down->src[2] != match.gate->src[2] || !ggml_is_contiguous(glu)) return {};
     auto * ids = match.gate->src[2]; auto * input = match.gate->src[1];
-    if (!ids || !input || ids->ne[0] <= 0 || ids->ne[1] <= 0 || ids->ne[0] > 32/ids->ne[1] ||
+    if (!ids || !input || ids->ne[0] <= 0 || ids->ne[1] <= 0 ||
+        ids->ne[0] > (ids->ne[1]<=8 ? 64 : 32)/ids->ne[1] ||
         input->ne[2] != ids->ne[1] || input->ne[3] != 1) return {};
     for (auto * node : {match.gate,match.up,match.down}) {
         if (!node) continue;

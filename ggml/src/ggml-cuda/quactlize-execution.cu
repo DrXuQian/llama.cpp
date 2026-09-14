@@ -64,6 +64,7 @@ struct Plan {
     bool direct = false, legacy = false, sf = false, scale_resident = false;
     bool indexed = false;
     bool q4_decode = false, q4_tc = false;
+    bool dense_io = false;
     int rows = 0, tokens = 0, topk = 0;
     ~Plan() { if (handle) api->destroy(handle); }
 };
@@ -219,9 +220,16 @@ Plan & prepare(ggml_backend_cuda_context & ctx, const ggml_tensor * weight,
     } else {
         qks_request_v1 r{1, sizeof(r), art.qtype, ids ? QK_GROUPED_FQ : QK_DENSE_FQ,
             p->rows, int(art.n), int(art.k), int(art.experts), int(tokens), art.arrangement.mapping_id};
+        p->dense_io = !ids && tokens <= 8 && owner.api->query_dense_io && owner.api->prepare_dense_io;
+        auto query_tc = [&](bool decode = false) {
+            if (p->dense_io)
+                return owner.api->query_dense_io(owner.runtime, &r, QKD_F32, int(decode), &p->choice);
+            return decode ? owner.api->query_decode(owner.runtime, &r, &p->choice) :
+                            owner.api->query(owner.runtime, &r, &p->choice);
+        };
         int status = QKS_MISS;
         if (mode == RouteMode::Auto && art.qtype == GGML_TYPE_Q4_K && owner.api->query_decode) {
-            status = owner.api->query_decode(owner.runtime, &r, &p->choice);
+            status = query_tc(true);
             if (status != QKS_OK && status != QKS_MISS)
                 GGML_ABORT("[quactlize] %s: decode TC selection: %s", weight->name, owner.api->error());
             p->q4_tc = status == QKS_OK;
@@ -229,13 +237,13 @@ Plan & prepare(ggml_backend_cuda_context & ctx, const ggml_tensor * weight,
         const int prefill_choice = !p->q4_tc && mode == RouteMode::Auto && tokens > 1 ? ggml_quactlize_prefill_route(r) : -1;
         if (art.qtype == GGML_TYPE_Q8_0) {
             r.route = ids ? QK_GROUPED_SF : QK_DENSE_SF;
-            status = owner.api->query(owner.runtime, &r, &p->choice);
+            status = query_tc();
             if (status != QKS_OK)
                 GGML_ABORT("[quactlize] %s: Q8 W8A16 selection: %s", weight->name, owner.api->error());
             p->sf = p->scale_resident = true;
         } else if (mode == RouteMode::Sf || prefill_choice == 1) {
             r.route = ids ? QK_GROUPED_SF : QK_DENSE_SF;
-            status = owner.api->query(owner.runtime, &r, &p->choice);
+            status = query_tc();
             if (status == QKS_OK) {
                 // Size query only. Values are expanded on the compute stream
                 // before every GEMM; no per-weight scale allocation or event.
@@ -260,15 +268,15 @@ Plan & prepare(ggml_backend_cuda_context & ctx, const ggml_tensor * weight,
         if (!p->sf && !p->q4_tc) {
             if (mode == RouteMode::Sf) GGML_ABORT("[quactlize] %s: forced SF has no admitted resources/module", weight->name);
             r.route = ids ? QK_GROUPED_FQ : QK_DENSE_FQ;
-            status = owner.api->query(owner.runtime, &r, &p->choice);
+            status = query_tc();
         }
         if (status == QKS_MISS) {
             p->legacy = true;
             GGML_LOG_INFO("[quactlize] %s: native policy miss, retain legacy K-pack FQ (%s)\n", weight->name, owner.api->error());
         } else {
             if (status != QKS_OK) GGML_ABORT("[quactlize] %s: native selection: %s", weight->name, owner.api->error());
-            size_t a_bytes = align256(size_t(p->rows) * art.k * sizeof(half));
-            size_t out_bytes = align256(size_t(p->rows) * art.n * sizeof(half));
+            size_t a_bytes = p->dense_io ? 0 : align256(size_t(p->rows) * art.k * sizeof(half));
+            size_t out_bytes = p->dense_io ? 0 : align256(size_t(p->rows) * art.n * sizeof(half));
             size_t index_bytes = ids ? align256(size_t(p->rows) * sizeof(int32_t)) : 0;
             size_t bound_bytes = ids ? align256(size_t(art.experts + 1) * sizeof(int32_t)) : 0;
             size_t head = a_bytes + out_bytes + 2 * index_bytes + bound_bytes;
@@ -279,7 +287,9 @@ Plan & prepare(ggml_backend_cuda_context & ctx, const ggml_tensor * weight,
             GGML_ASSERT(p->choice.workspace_bytes <= SIZE_MAX - head);
             uint8_t * storage = slot ? owner.private_storage(head + p->choice.workspace_bytes) :
                 owner.storage(stream, head + p->choice.workspace_bytes);
-            p->a = (half *) storage; p->out = (half *) (storage + a_bytes);
+            if (!p->dense_io) {
+                p->a = (half *) storage; p->out = (half *) (storage + a_bytes);
+            }
             if (p->sf && !p->scale_resident) {
                 p->scale = (uint16_t *) (storage + scale_offset);
                 p->zero = (uint16_t *) (storage + scale_offset + plane_bytes);
@@ -293,11 +303,16 @@ Plan & prepare(ggml_backend_cuda_context & ctx, const ggml_tensor * weight,
             c.version = 1; c.size = sizeof(c); c.m = p->rows; c.n = art.n; c.k = art.k; c.experts = art.experts;
             c.group_size = art.arrangement.group_size; c.device = p->choice.device; c.compute_units = p->choice.compute_units;
             GGML_ASSERT(c.device == ctx.device);
-            c.mapping_id = art.arrangement.mapping_id; c.a = p->a; c.low = art.low; c.high = art.high;
+            c.mapping_id = art.arrangement.mapping_id; c.a = p->dense_io ? input->data : p->a;
+            c.low = art.low; c.high = art.high;
             c.metadata = p->sf && !p->scale_resident ? (const void *) p->scale : (const void *) art.units;
-            c.zero = p->zero; c.output = p->out; c.offsets_device = p->bounds;
-            c.workspace = storage + head; c.workspace_bytes = p->choice.workspace_bytes; c.stream = stream;
-            if (owner.api->prepare(owner.runtime, &p->choice, &c, &p->handle) != QKS_OK)
+            c.zero = p->zero; c.output = p->dense_io ? output->data : p->out; c.offsets_device = p->bounds;
+            c.workspace = p->choice.workspace_bytes ? storage + head : nullptr;
+            c.workspace_bytes = p->choice.workspace_bytes; c.stream = stream;
+            qkd_dense_call_v1 typed{1,sizeof(typed),c,QKD_F32,QKD_F32};
+            int prepare_rc = p->dense_io ? owner.api->prepare_dense_io(owner.runtime, &p->choice, &typed, &p->handle) :
+                owner.api->prepare(owner.runtime, &p->choice, &c, &p->handle);
+            if (prepare_rc != QKS_OK)
                 GGML_ABORT("[quactlize] %s: native prepare: %s", weight->name, owner.api->error());
             if (ids && owner.api->bind_indexed) {
                 qk_llama_indexed_v1 io{1,sizeof(io),p->tokens,p->topk,int(input->ne[1]),0,
@@ -316,6 +331,8 @@ Plan & prepare(ggml_backend_cuda_context & ctx, const ggml_tensor * weight,
                 " parent=%s build=%s algorithm=%d split=%d grid=%d policy=%d prefill_choice=%d activation=FP16 scale_resident=%d\n", weight->name, ids ? "grouped" : "dense",
                 p->sf ? "sf" : "fq", art.qtype, p->rows, art.n, art.k, p->choice.parent, p->choice.build_key,
                 p->choice.algorithm, p->choice.split, p->choice.grid, p->choice.policy, prefill_choice, int(p->scale_resident));
+            if (p->dense_io)
+                GGML_LOG_INFO("[quactlize-adapter] tensor=%s dense_io=FP32 standalone_adapters=0\n", weight->name);
         }
     }
     auto * result = p.get();
@@ -434,7 +451,7 @@ bool ggml_quactlize_execution_run(ggml_backend_cuda_context & ctx, const ggml_te
         ggml_ncp_route_log(output, "so-quactlize-kpack-gemv", nullptr);
         return true;
     }
-    if (p.indexed) {
+    if (p.indexed || p.dense_io) {
         if (p.api->run(p.handle,stream)!=QKS_OK)
             GGML_ABORT("[quactlize] %s: fused indexed GEMM launch failed",weight->name);
         ggml_ncp_route_log(output,p.sf ? "so-quactlize-kpack-sf" : "so-quactlize-kpack-fq-selected",nullptr);

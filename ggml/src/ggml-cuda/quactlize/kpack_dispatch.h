@@ -1,6 +1,7 @@
 #pragma once
 #include "kpack_module.h"
 #include "kpack_indexed.h"
+#include "kpack_decode_io.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -59,6 +60,15 @@ int quactlize_kpack_dispatch_query_v1(void* runtime, qks_request_v1 const*, qks_
 // routing). No device-ID readback. Unlisted requests return QKS_MISS; retain
 // the ordinary selector. Forced FQ/SF and the v1 query are unchanged.
 int quactlize_kpack_dispatch_query_decode_v1(void* runtime, qks_request_v1 const*, qks_choice_v1*);
+// Dense M1..8 with explicit F32 or BF16 endpoints. Uses the SAME selector as
+// query_v1 (decode_policy=0) or query_decode_v1 (decode_policy=1, after SIMT
+// declines). Compiles only the selected typed parent, not an unused FP16 one.
+// Uses packaged typed parents or selected-parent JIT/cache. Tickets and resources are distinct;
+// old query/prepare retain FP16 semantics. No tuning or new fallback policy.
+int quactlize_kpack_dispatch_query_dense_io_v1(void* runtime,qks_request_v1 const*,
+                                            int32_t endpoint_type,int32_t decode_policy,qks_choice_v1*);
+int quactlize_kpack_dispatch_prepare_dense_io_v1(void* runtime,qks_choice_v1 const*,
+                                               qkd_dense_call_v1 const*,void** handle);
 int quactlize_kpack_dispatch_prepare_v1(void* runtime, qks_choice_v1 const*,
                                      qk_call_v1 const*, void** handle);
 int quactlize_kpack_dispatch_run_v1(void* handle, void* stream);

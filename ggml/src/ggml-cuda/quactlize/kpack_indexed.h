@@ -7,8 +7,9 @@
 // F32 [tokens,topk,N]. row_ids[m] is caller-owned scratch (m=tokens*topk).
 // Binding occurs once, outside capture. All pointers/lifetimes remain fixed;
 // IDs and A values may change on every replay. run performs no host data read.
-// The first fused implementation accepts m<=32 and experts<=1024. Larger
-// requests explicitly decline and use the existing unfused preparation.
+// Accepts m<=32, plus decode tokens1..8 up to m<=64; experts<=1024. The
+// extension uses the same prepare/SwiGLU/finish conversion boundaries.
+// Larger requests explicitly decline; no unbounded/prefill promise is made.
 typedef struct {
   uint32_t version, size;
   int32_t tokens, topk, channels, reserved;

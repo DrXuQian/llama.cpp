@@ -27,6 +27,8 @@ struct ggml_quactlize_execution_api {
     decltype(&quactlize_kpack_q4_decode_cast_v1) q4_cast;
     decltype(&quactlize_kpack_q4_decode_indexed_prepare_v1) q4_prepare;
     decltype(&quactlize_kpack_q4_decode_indexed_finish_v1) q4_finish;
+    decltype(&quactlize_kpack_dispatch_query_dense_io_v1) query_dense_io;
+    decltype(&quactlize_kpack_dispatch_prepare_dense_io_v1) prepare_dense_io;
 };
 
 // QUACTLIZE_KPACK_EXECUTION names the complete native package. An explicit
