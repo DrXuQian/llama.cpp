@@ -93,10 +93,18 @@ def selection(text, manifest):
         r = dict(re.findall(r"([a-z_]+)=([^\s]+)", line))
         require(
             r.get("op") in ("dense", "grouped")
-            and r.get("route") in ("fq", "sf", "gemv"),
+            and r.get("route") in ("fq", "sf", "gemv", "gemv-q4-s1", "full-bf16"),
             "invalid plan receipt",
         )
-        if r["route"] != "gemv":
+        if r["route"] == "full-bf16":
+            require(manifest.get("prefill") and int(r.get("q",0)) in range(10,15)
+                    and int(r.get("n",0))>0 and int(r.get("k",0))>0
+                    and (int(r.get("rows",0))>=128 if r["op"]=="dense" else int(r.get("rows",0))>=1024)
+                    and r.get("cost_scope")=="ISOLATED_COMPONENT_SUM",
+                    "unbound full-BF16 prefill receipt")
+        elif r["route"] == "gemv-q4-s1":
+            require(r.get("q")=="12" and r.get("split")=="1", "invalid measured Q4 S1 plan")
+        elif r["route"] in ("fq", "sf"):
             m = modules.get(r.get("build"))
             require(
                 m and m["parent"]["symbol"] == r.get("parent"),
@@ -163,9 +171,49 @@ def model_selection(args, text):
         with Path(m["path"]).open("rb") as stream:
             require(hashlib.file_digest(stream, "sha256").hexdigest() == m["sha256"],
                     "selected module payload changed")
-    evidence = selection(text, dict(modules=modules))
+    evidence = selection(text, args.manifest | dict(modules=modules))
     evidence["modules"] = modules
+    evidence["providers"] = provider_images(args, text, evidence["plans"])
     return evidence
+
+
+def provider_images(args, text, plans):
+    selected = [p for p in plans if p["route"]=="full-bf16"]
+    if not selected:
+        return []
+    receipt = args.manifest.get("prefill", {})
+    image = args.bundle/receipt.get("library", "")
+    require(image.is_file() and hashlib.sha256(image.read_bytes()).hexdigest()==receipt.get("library_sha256"),
+            "full-BF16 composition payload differs")
+    records = {}
+    for line in text.splitlines():
+        if "[quactlize-prefill-image]" not in line:
+            continue
+        match = re.search(r'tensor=(\S+) rows=(\d+) provider=(cublas|deepgemm) image="([^"\n]+)"', line)
+        require(match is not None, "invalid provider image receipt")
+        tensor, rows, kind, path = match.groups()
+        records[tensor, rows] = (kind, Path(path).resolve(strict=True))
+    output = []
+    for p in selected:
+        require((p["tensor"],p["rows"]) in records, "full-BF16 plan has no provider image")
+        kind, image = records[p["tensor"],p["rows"]]
+        require(kind == ("cublas" if p["op"]=="dense" else "deepgemm"), "provider/operator differs")
+        with image.open('rb') as stream:
+            image_hash = hashlib.file_digest(stream, "sha256").hexdigest()
+        record = dict(tensor=p["tensor"], rows=p["rows"], op=p["op"], provider=kind,
+                      library=str(image), sha256=image_hash, kernel_execution="NOT_YET_TRACED")
+        if kind == "deepgemm":
+            receipt = json.loads((image.parent/f'quactlize-launch-m{p["rows"]}.json').read_text())
+            require(receipt.get("schema")=="quactlize.deepgemm-launch.v1" and
+                    receipt.get("shape")==list(map(int,(p["rows"],p["n"],p["k"],p["experts"]))) and
+                    receipt.get("files",{}).get("kernel.so")==image_hash,
+                    "DeepGEMM shape/image receipt differs")
+            for name in ("kernel.cu", "kernel.args"):
+                require(hashlib.sha256((image.parent/name).read_bytes()).hexdigest()==receipt["files"].get(name),
+                        "DeepGEMM source/ABI changed")
+            record["receipt"] = receipt
+        output.append(record)
+    return output
 
 
 class AsysSession:
@@ -520,6 +568,14 @@ def proof(args):
     libraries = [(Path(m["path"]), m["origin"] + "/" + m["key"], m["key"])
                  for m in plans["modules"]]
     libraries.append((args.bundle / "libquactlize_ppu_execution.so", "execution", None))
+    provider_ops = {}
+    for record in plans.get("providers", []):
+        if record["provider"]=="deepgemm":
+            key = "provider/"+record["sha256"]
+            provider_ops.setdefault(key,set()).add(record["op"])
+            item = (Path(record["library"]),key,key)
+            if item not in libraries:
+                libraries.append(item)
     symbols = {}
     for library, label, build in libraries:
         listing = subprocess.check_output(
@@ -532,14 +588,18 @@ def proof(args):
         ).splitlines()
         require(len(decoded) == len(names), "demangled symbol count differs")
         for name, demangled in zip(names, decoded):
-            if "cutlass::device_kernel<" in demangled or re.search(
+            is_q4 = "quactlize::execution::q4_decode::kernel<" in demangled
+            is_provider = build in provider_ops and re.search(r"(?i)(?:bf16|bfloat16)",demangled) and re.search(r"(?i)gemm",demangled)
+            if "cutlass::device_kernel<" in demangled or is_q4 or is_provider or re.search(
                 r"kpack_q(?:8|10|11|12|13|14)::", demangled
             ):
                 item = symbols.setdefault(
                     name, dict(name=demangled, libraries=[], ops=[])
                 )
                 item["libraries"].append(label)
-                if build:
+                if build in provider_ops:
+                    ops = provider_ops[build] if is_provider else set()
+                elif build:
                     ops = {
                         r["op"]
                         for r in plans["plans"]
@@ -550,20 +610,24 @@ def proof(args):
                     ops = {
                         r["op"]
                         for r in plans["plans"]
-                        if r["route"] == "gemv" and q and r["q"] == q[1]
+                        if (r["route"] == "gemv" and q and r["q"] == q[1]) or
+                           (is_q4 and r["route"]=="gemv-q4-s1")
                     }
                 item["ops"] = sorted(set(item["ops"]) | ops)
     total, matched = activity(db, symbols)
     require(matched, "no selected native compute kernel in PPU device trace")
     ops = {op for m in matched for op in symbols[m["mangled"]]["ops"]}
+    observed_providers = {label for m in matched for label in symbols[m["mangled"]]["libraries"] if label.startswith("provider/")}
+    missing_providers = [r for r in plans.get("providers",[]) if "provider/"+r["sha256"] not in observed_providers]
     # A proof covers its own short request. It is not counted as an untraced
     # performance sample or as device evidence for every ABBA parent.
     result = dict(
-        kernel_execution="PASS_SHORT_REQUEST" if ops == {"dense", "grouped"} else "PARTIAL_SHORT_REQUEST",
+        kernel_execution="PASS_SHORT_REQUEST" if ops == {"dense", "grouped"} and not missing_providers else "PARTIAL_SHORT_REQUEST",
         gpu_kernel_calls=total,
         matched=matched,
         observed_ops=sorted(ops),
         missing_ops=sorted({"dense", "grouped"} - ops),
+        untraced_prefill_providers=missing_providers,
         selection=plans,
         timing_scope="PROFILER_ONLY_NOT_PERFORMANCE",
         capture_scope="SECOND_REQUEST_SAME_PROCESS_FIRST_USE_EXCLUDED",

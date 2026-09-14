@@ -390,6 +390,20 @@ int main(int argc, char ** argv) {
         self.assertFalse(selection(line, manifest)["fully_selected"])
         self.assertIn("output", PATTERN)
 
+    def test_full_prefill_and_q4_s1_are_not_treated_as_tc_modules(self):
+        full = "[quactlize-plan] tensor=w op=dense route=full-bf16 q=12 rows=128 n=1024 k=5120 experts=1 cost_scope=ISOLATED_COMPONENT_SUM"
+        with self.assertRaises(ValueError):
+            selection(full, dict(modules=[]))
+        manifest = dict(modules=[], prefill=dict(library="libquactlize_ppu_prefill.so"))
+        result = selection(full, manifest)
+        self.assertEqual(result["plans"][0]["route"], "full-bf16")
+        with self.assertRaises(ValueError):
+            selection(full.replace("rows=128", "rows=8"), manifest)
+        line = "[quactlize-plan] tensor=w op=dense route=gemv-q4-s1 q=12 rows=1 split=1"
+        self.assertEqual(selection(line,dict(modules=[]))["plans"][0]["route"], "gemv-q4-s1")
+        with self.assertRaises(ValueError):
+            selection(line.replace("split=1", "split=4"), dict(modules=[]))
+
     def test_abba(self):
         arms = []
         for arm in ("reference", "native", "native", "reference"):

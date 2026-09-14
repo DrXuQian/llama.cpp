@@ -9,6 +9,7 @@
 #include <sstream>
 #include <string>
 #include <tuple>
+#include <unistd.h>
 
 template<typename T> static T qz_entry(void * library, const char * name) {
     auto entry = reinterpret_cast<T>(dlsym(library, name));
@@ -68,6 +69,21 @@ const ggml_quactlize_execution_api * ggml_quactlize_execution_library() {
             dlsym(host,"quactlize_kpack_dispatch_moe_destroy_v1"));
         if (getenv("QUACTLIZE_KPACK_JIT_HELPER")) {
             QZ_BIND(enable_jit, host, "quactlize_kpack_dispatch_enable_jit_v1");
+        }
+        result.prefill_choice = reinterpret_cast<decltype(result.prefill_choice)>(
+            dlsym(host,"quactlize_kpack_dispatch_prefill_v1"));
+        const std::string prefill_path = directory + "/libquactlize_ppu_prefill.so";
+        if (access(prefill_path.c_str(), F_OK) == 0) {
+            void * prefill = dlopen(prefill_path.c_str(), RTLD_NOW | RTLD_LOCAL);
+            if (!prefill) GGML_ABORT("[quactlize] prefill runtime load: %s", dlerror());
+            if (!result.prefill_choice) GGML_ABORT("[quactlize] prefill runtime lacks the matching host selector");
+            QZ_BIND(dequant, prefill, "quactlize_kpack_dequant_v1");
+            QZ_BIND(full_query, prefill, "quactlize_kpack_prefill_query_v1");
+            QZ_BIND(full_prepare, prefill, "quactlize_kpack_prefill_prepare_v1");
+            QZ_BIND(full_run, prefill, "quactlize_kpack_prefill_run_v1");
+            QZ_BIND(full_destroy, prefill, "quactlize_kpack_prefill_destroy_v1");
+            QZ_BIND(full_error, prefill, "quactlize_kpack_prefill_error_v1");
+            QZ_BIND(full_image, prefill, "quactlize_kpack_prefill_provider_image_v1");
         }
 #undef QZ_BIND
         GGML_LOG_INFO("[quactlize] native execution package: %s\n", root);
