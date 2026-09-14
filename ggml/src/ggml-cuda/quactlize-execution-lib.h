@@ -22,6 +22,8 @@ struct ggml_quactlize_execution_api {
     decltype(&quactlize_kpack_dispatch_moe_run_v1) moe_run;
     decltype(&quactlize_kpack_dispatch_moe_run_router_v1) moe_run_router;
     decltype(&quactlize_kpack_dispatch_moe_destroy_v1) moe_destroy;
+    decltype(&quactlize_kpack_dispatch_moe_create_v2) moe_create_mixed;
+    decltype(&quactlize_kpack_dispatch_moe_simt_scratch_v1) moe_simt_scratch;
     decltype(&quactlize_kpack_q4_decode_select_v1) q4_select;
     decltype(&quactlize_kpack_q4_decode_run_v1) q4_run;
     decltype(&quactlize_kpack_dispatch_query_decode_v1) query_decode;

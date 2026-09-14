@@ -80,6 +80,7 @@ struct MoePlan {
     const ggml_quactlize_execution_api * api;
     Plan * gate, * up, * down;
     void * handle = nullptr;
+    uint32_t simt_mask = 0;
     ~MoePlan() { if (handle) api->moe_destroy(handle); }
 };
 
@@ -438,7 +439,8 @@ MoePlan * prepare_moe(ggml_backend_cuda_context & ctx, const ggml_cgraph * graph
         auto found=owner->plans.find(key);
         if (found==owner->plans.end() && !create) return nullptr;
         plans[j]=found==owner->plans.end() ? &prepare(ctx,node->src[0],node->src[1],node->src[2],node,j+1) : found->second.get();
-        if (!plans[j]->indexed || plans[j]->legacy || plans[j]->direct) return nullptr;
+        if (plans[j]->legacy || (!plans[j]->indexed && !plans[j]->direct)) return nullptr;
+        if (plans[j]->direct && !owner->api->moe_create_mixed) return nullptr;
     }
     std::array<Plan *,3> key{plans[0],plans[1],plans[2]};
     auto found=owner->moe_plans.find(key);
@@ -446,11 +448,27 @@ MoePlan * prepare_moe(ggml_backend_cuda_context & ctx, const ggml_cgraph * graph
     if (!create) return nullptr;
     auto result=std::make_unique<MoePlan>();
     result->api=owner->api; result->gate=plans[0]; result->up=plans[1]; result->down=plans[2];
-    int rc=owner->api->moe_create(plans[0]->handle,plans[1]?plans[1]->handle:nullptr,plans[2]->handle,&result->handle);
+    qks_moe_endpoint_v2 endpoints[3]{};
+    for (int j=0;j<3;++j) {
+        auto * p=plans[j];if (!p) continue;
+        auto & e=endpoints[j];e.version=2;e.size=sizeof(e);
+        if (!p->direct) { e.tc_handle=p->handle;continue; }
+        result->simt_mask|=1u<<j;
+        int status=owner->api->moe_simt_scratch(owner->runtime,&p->gemv,&e.scratch_bytes);
+        if (status==QKS_MISS) return nullptr;
+        if (status!=QKS_OK) GGML_ABORT("[quactlize] mixed MoE scratch: %s",owner->api->error());
+        e.scratch=owner->private_storage(e.scratch_bytes);e.simt_call=&p->gemv;e.arrangement=&p->art.arrangement;
+        if (p->q4_decode) e.q4_config=&p->q4_config;
+        else e.simt_config=&p->gemv_config;
+    }
+    int rc=result->simt_mask ? owner->api->moe_create_mixed(owner->runtime,&endpoints[0],
+        plans[1]?&endpoints[1]:nullptr,&endpoints[2],&result->handle) :
+        owner->api->moe_create(plans[0]->handle,plans[1]?plans[1]->handle:nullptr,plans[2]->handle,&result->handle);
     if (rc==QKS_MISS) return nullptr;
     if (rc!=QKS_OK) GGML_ABORT("[quactlize] MoE chain preparation: %s",owner->api->error());
-    GGML_LOG_INFO("[quactlize-moe] gate=%s down=%s merged=%d rows=%d shared_prepare=1 swiglu_to_down=1 reduce_scatter=1\n",
-        match.gate->src[0]->name,match.down->src[0]->name,int(!match.up),plans[0]->rows);
+    GGML_LOG_INFO("[quactlize-moe] gate=%s down=%s merged=%d rows=%d simt_mask=%u shared_prepare=1 swiglu_to_down=1 reduce_scatter=%d\n",
+        match.gate->src[0]->name,match.down->src[0]->name,int(!match.up),plans[0]->rows,result->simt_mask,
+        int(!(result->simt_mask&4)));
     auto * pointer=result.get(); owner->moe_plans.emplace(key,std::move(result)); return pointer;
 }
 } // namespace

@@ -67,6 +67,17 @@ const ggml_quactlize_execution_api * ggml_quactlize_execution_library() {
             dlsym(host,"quactlize_kpack_dispatch_moe_run_router_v1"));
         result.moe_destroy = reinterpret_cast<decltype(result.moe_destroy)>(
             dlsym(host,"quactlize_kpack_dispatch_moe_destroy_v1"));
+        result.moe_create_mixed = reinterpret_cast<decltype(result.moe_create_mixed)>(
+            dlsym(host,"quactlize_kpack_dispatch_moe_create_v2"));
+        result.moe_simt_scratch = reinterpret_cast<decltype(result.moe_simt_scratch)>(
+            dlsym(host,"quactlize_kpack_dispatch_moe_simt_scratch_v1"));
+        if (bool(result.moe_create_mixed) != bool(result.moe_simt_scratch))
+            GGML_ABORT("[quactlize] incomplete mixed MoE interface");
+        if (result.moe_create_mixed && (!result.moe_run || !result.moe_run_router || !result.moe_destroy ||
+            !dlsym(device,"quactlize_kpack_moe_simt_query_v1") ||
+            !dlsym(device,"quactlize_kpack_moe_simt_bind_v1") ||
+            !dlsym(device,"quactlize_kpack_moe_mixed_stage_v1")))
+            GGML_ABORT("[quactlize] mixed MoE host/device package differs");
         if (getenv("QUACTLIZE_KPACK_JIT_HELPER")) {
             QZ_BIND(enable_jit, host, "quactlize_kpack_dispatch_enable_jit_v1");
         }

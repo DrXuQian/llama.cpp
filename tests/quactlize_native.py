@@ -80,7 +80,7 @@ def timings(response, payload):
     )
 
 
-def selection(text, manifest):
+def selection(text, manifest, expected_ops=None):
     require(
         not re.search(r"CUDA error:|PPU error:|GGML_ASSERT|GGML_ABORT", text),
         "runtime failure in model log",
@@ -131,7 +131,7 @@ def selection(text, manifest):
         fallbacks=fallbacks,
         prepass=prepass,
         fully_selected=not fallbacks
-        and {r["op"] for r in plans} == {"dense", "grouped"},
+        and {r["op"] for r in plans} == set(expected_ops or ("dense", "grouped")),
     )
 
 
@@ -171,7 +171,7 @@ def model_selection(args, text):
         with Path(m["path"]).open("rb") as stream:
             require(hashlib.file_digest(stream, "sha256").hexdigest() == m["sha256"],
                     "selected module payload changed")
-    evidence = selection(text, args.manifest | dict(modules=modules))
+    evidence = selection(text, args.manifest | dict(modules=modules), getattr(args, "expected_ops", None))
     evidence["modules"] = modules
     evidence["providers"] = provider_images(args, text, evidence["plans"])
     return evidence
@@ -621,12 +621,14 @@ def proof(args):
     missing_providers = [r for r in plans.get("providers",[]) if "provider/"+r["sha256"] not in observed_providers]
     # A proof covers its own short request. It is not counted as an untraced
     # performance sample or as device evidence for every ABBA parent.
+    expected_ops = set(getattr(args, "expected_ops", ("dense", "grouped")))
     result = dict(
-        kernel_execution="PASS_SHORT_REQUEST" if ops == {"dense", "grouped"} and not missing_providers else "PARTIAL_SHORT_REQUEST",
+        kernel_execution="PASS_SHORT_REQUEST" if ops == expected_ops and not missing_providers else "PARTIAL_SHORT_REQUEST",
         gpu_kernel_calls=total,
         matched=matched,
         observed_ops=sorted(ops),
-        missing_ops=sorted({"dense", "grouped"} - ops),
+        missing_ops=sorted(expected_ops - ops),
+        expected_ops=sorted(expected_ops),
         untraced_prefill_providers=missing_providers,
         selection=plans,
         timing_scope="PROFILER_ONLY_NOT_PERFORMANCE",
@@ -673,6 +675,11 @@ def main():
             "proof arm/token overrides require --proof-only")
     a.tensor_override_pattern = (inventory_pattern(json.loads(a.tensor_inventory.read_text()))
                                  if a.tensor_inventory else PATTERN)
+    a.expected_ops = (json.loads(a.tensor_inventory.read_text()).get("operators", ["dense", "grouped"])
+                      if a.tensor_inventory else ["dense", "grouped"])
+    require(isinstance(a.expected_ops, list) and a.expected_ops
+            and len(a.expected_ops) == len(set(a.expected_ops))
+            and set(a.expected_ops) <= {"dense", "grouped"}, "invalid expected operator inventory")
     capture_parameters = proof_parameters(a)
     require(
         a.proof_only or (a.repeats >= 2
