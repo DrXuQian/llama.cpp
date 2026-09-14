@@ -87,7 +87,7 @@ static void run(const char * label, std::vector<llama_model_tensor_buft_override
     std::unique_ptr<FILE, decltype(&fclose)> file(fixture(opt), fclose);
     std::vector<std::string> splits;
     llama_model_loader loader(nullptr, nullptr, nullptr, "", splits, file.get(),
-                              false, false, false, true, nullptr, rules.data());
+                              LLAMA_LOAD_MODE_NONE, false, true, false, nullptr, rules.data());
     llama_hparams hp{};
     hp.n_layer_all = 1;
     hp.n_expert = 2;

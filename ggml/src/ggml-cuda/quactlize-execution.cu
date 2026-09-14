@@ -475,7 +475,7 @@ bool ggml_quactlize_execution_run(ggml_backend_cuda_context & ctx, const ggml_te
         GGML_ASSERT(size_t(p.tokens) * sizeof(int32_t) <= smem && p.tokens < (1 << 22) && p.topk < (1 << 10));
         GGML_ASSERT(ids->nb[1] / sizeof(int32_t) <= INT32_MAX && input->nb[2] / input->nb[1] <= INT32_MAX);
         ggml_cuda_launch_mm_ids_helper((const int32_t *) ids->data, p.ids_src, p.ids_dst, p.bounds,
-            p.art.experts, p.tokens, p.topk, input->ne[1], ids->nb[1] / sizeof(int32_t), input->nb[2] / input->nb[1], stream);
+            p.art.experts, p.tokens, p.topk, input->ne[1], ids->nb[1] / sizeof(int32_t), input->nb[2] / input->nb[1], false, stream);
         CUDA_CHECK(cudaGetLastError());
     }
     gather<<<p.rows, 256, 0, stream>>>((const float *) input->data, p.a, p.ids_src, p.art.k, input->nb[1] / sizeof(float));
