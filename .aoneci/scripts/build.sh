@@ -25,6 +25,7 @@
 #   PPU_NVCC     PPU nvcc 路径   (default: /usr/local/PPU_SDK/CUDA_SDK/bin/nvcc)
 #   JOBS         并行编译数     (default: $(nproc))
 #   NCP_LIB_REV  ncp_flash_lib 完整 40 位 commit sha (default: .aoneci/NCP_LIB_VERSION 里记录的值)
+#   LLAMA_BUILD_DIR  New build output directory (default: LLAMA_CI_DIR/build-ci)
 # ============================================================
 
 set -euo pipefail
@@ -33,10 +34,17 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/config.sh"
 
+LLAMA_BUILD_DIR=$(realpath -m -- "${LLAMA_BUILD_DIR:-${LLAMA_CI_DIR}/build-ci}")
+if [ -e "$LLAMA_BUILD_DIR" ] || [ -L "$LLAMA_BUILD_DIR" ]; then
+    echo "ERROR: build output exists: $LLAMA_BUILD_DIR; set LLAMA_BUILD_DIR to a new path" >&2
+    exit 1
+fi
+
 echo "=========================================="
 echo "Build: ncp_flash_lib + llama.cpp"
 echo "=========================================="
 echo "llama.cpp   : $LLAMA_CI_DIR"
+echo "build output: $LLAMA_BUILD_DIR"
 echo "ncp_flash   : $NCP_LIB_DIR"
 echo "PPU nvcc    : $PPU_NVCC"
 echo "jobs        : $JOBS"
@@ -148,11 +156,7 @@ echo "==> [4/5] libncp_fa.so + libncp_moe.so built -> llama.cpp gets -DGGML_NCP_
 # --- 5. Build llama.cpp, then drop the .so next to the test binaries ---
 echo "==> [5/5] Building llama.cpp..."
 cd "${LLAMA_CI_DIR}"
-if [ -d "build-ci" ]; then
-    echo "    cleaning build-ci..."
-    rm -rf build-ci
-fi
-cmake -S . -B build-ci \
+cmake -S . -B "${LLAMA_BUILD_DIR}" \
     -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_CUDA_COMPILER="${PPU_NVCC}" \
     -DGGML_CUDA=ON \
@@ -167,21 +171,20 @@ cmake -S . -B build-ci \
     -DLLAMA_BUILD_SERVER=ON \
     -DGGML_NATIVE=OFF \
     -DGGML_AVX512_BF16=OFF -DGGML_AVX_VNNI=OFF
-cmake --build build-ci -j"${JOBS}"
+cmake --build "${LLAMA_BUILD_DIR}" -j"${JOBS}"
 
 # build-ci/bin holds libggml-cuda.so and the test binaries, and is where the $ORIGIN runpath looks. Moved, not
 # copied: one copy of the .so, so there is never a question of which one is being loaded. A re-run relinks it.
-mv -f "${NCP_LIB_DIR}/build/libncp_moe.so" "${LLAMA_CI_DIR}/build-ci/bin/"
-mv -f "${NCP_LIB_DIR}/build/libncp_fa.so" "${LLAMA_CI_DIR}/build-ci/bin/"
-echo "    installed libncp_moe.so, libncp_fa.so  -> build-ci/bin/"
+mv -f "${NCP_LIB_DIR}/build/libncp_moe.so" "${LLAMA_BUILD_DIR}/bin/"
+mv -f "${NCP_LIB_DIR}/build/libncp_fa.so" "${LLAMA_BUILD_DIR}/bin/"
+echo "    installed libncp_moe.so, libncp_fa.so  -> ${LLAMA_BUILD_DIR}/bin/"
 
 
 # The .so finds its own JIT include tree at bin/deep_gemm/include through dladdr, the way deep_gemm/__init__.py uses
 # dirname(__file__) -- so nothing has to export DG_LIBRARY_ROOT, here or on a target box. Warm cubins are not shipped; the .so picks up
 # bin/deep_gemm/cache if someone puts them there, otherwise it JITs into DG_JIT_CACHE_DIR.
 DG_INC_SRC="${NCP_LIB_DIR}/third_party/DeepGemm/deep_gemm/include"
-DG_INC_DST="${LLAMA_CI_DIR}/build-ci/bin/deep_gemm/include"
-rm -rf "${LLAMA_CI_DIR}/build-ci/bin/deep_gemm"
+DG_INC_DST="${LLAMA_BUILD_DIR}/bin/deep_gemm/include"
 mkdir -p "${DG_INC_DST}"
 
 # deep_gemm/ is the one that must be there: DeepGemm hashes every .cuh under it into the cubin cache key, on every start
@@ -208,12 +211,12 @@ echo ""
 echo "========================================"
 echo "BUILD COMPLETE"
 echo "========================================"
-echo "  NCP hooks     : FA + MoE (libncp_fa.so, libncp_moe.so + deep_gemm/ in build-ci/bin)"
+echo "  NCP hooks     : FA + MoE (libncp_fa.so, libncp_moe.so + deep_gemm/ in the output bin directory)"
 echo "  K-pack hook   : ON (load the separately published Quactlize runtime at execution)"
-echo "  test binaries : ${LLAMA_CI_DIR}/build-ci/bin/"
+echo "  test binaries : ${LLAMA_BUILD_DIR}/bin/"
 echo "========================================"
 echo ""
-echo "No GGML_NCP_*_LIB to export -- the \$ORIGIN runpath finds the .so in build-ci/bin."
+echo "No GGML_NCP_*_LIB to export -- the \$ORIGIN runpath finds the .so beside the binaries."
 echo "Replacing it? Put the new .so there; the loader warns and falls back to the inline kernels when it is missing."
 echo ""
 echo "Before running tests manually (not via run_tests.sh), source the runtime env first:"

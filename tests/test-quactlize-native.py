@@ -20,11 +20,31 @@ class NativeEvidence(unittest.TestCase):
         script = root / '.aoneci/scripts/build.sh'
         subprocess.run(['bash', '-n', str(script)], check=True)
         subprocess.run(['bash', '-n', str(script.with_name('config.sh'))], check=True)
-        text = script.read_text().split('cmake -S . -B build-ci', 1)[1].split('cmake --build', 1)[0]
+        text = script.read_text().split('cmake -S . -B "${LLAMA_BUILD_DIR}"', 1)[1].split('cmake --build', 1)[0]
         for flag in ('GGML_USE_PPU=ON', 'GGML_NCP_QUACTLIZE=ON', 'GGML_NCP_FA=ON',
                      'GGML_NCP_MOE=ON', 'GGML_NCP_GDN=OFF'):
             self.assertIn('-D' + flag, text)
         self.assertIn('-DCMAKE_CUDA_COMPILER="${PPU_NVCC}"', text)
+
+    def test_aoneci_does_not_remove_existing_external_build(self):
+        import shutil
+        root = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory() as temp:
+            work = Path(temp)
+            scripts = work / 'scripts'
+            scripts.mkdir()
+            for name in ('build.sh', 'config.sh'):
+                shutil.copy2(root / '.aoneci/scripts' / name, scripts / name)
+            old = work / 'existing-build'
+            old.mkdir()
+            marker = old / 'keep'
+            marker.write_text('existing output')
+            env = dict(os.environ, LLAMA_CI_DIR=str(work), NCP_LIB_DIR=str(work / 'ncp'),
+                       LLAMA_BUILD_DIR=str(old), DG_JIT_CACHE_DIR=str(work / 'jit'))
+            result = subprocess.run(['bash', str(scripts / 'build.sh')], env=env, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 1)
+            self.assertIn('build output exists', result.stderr)
+            self.assertEqual(marker.read_text(), 'existing output')
 
     def test_dense_only_inventory_does_not_require_a_grouped_kernel(self):
         text = "[quactlize-plan] tensor=w op=dense route=gemv-q4-s1 q=12 split=1"
