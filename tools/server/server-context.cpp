@@ -3792,7 +3792,15 @@ private:
 
             // verify and try to accept the draft
             {
-                common_sampler_ptr smpl_save(common_sampler_clone(slot.smpl.get()));
+                // smpl_save is read below only when use_ckpt_tgt, and n_rollback <= n_draft is its exact upper bound
+                const bool may_need_ckpt =
+                    ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
+                    (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && n_draft > llama_n_rs_seq(ctx_tgt));
+
+                common_sampler_ptr smpl_save;
+                if (may_need_ckpt) {
+                    smpl_save.reset(common_sampler_clone(slot.smpl.get()));
+                }
 
                 GGML_ASSERT(slot.spec_i_batch.size() == n_draft + 1);
                 auto accepted = common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft);

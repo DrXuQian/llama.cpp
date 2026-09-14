@@ -172,6 +172,11 @@ public:
 
     uint32_t get_n_kv(const slot_info & sinfo) const;
 
+    // true if every stream in sinfo holds its live cells in [0, used_max_p1()) with no holes and in position order,
+    // which is the only shape in which a single live length describes the history. See
+    // llama_kv_cells::is_prefix_ordered.
+    bool is_kv_prefix_ordered(const slot_info & sinfo) const;
+
     // get views of the current state of the cache
     ggml_tensor * get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
     ggml_tensor * get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
@@ -214,6 +219,9 @@ public:
     void set_input_k_shift(ggml_tensor * dst) const;
 
     void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
+    // clang-format off
+    void set_input_kv_used   (ggml_tensor * dst, const slot_info & sinfo) const;
+    // clang-format on
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
     void set_input_k_rot(ggml_tensor * dst) const;
@@ -366,6 +374,8 @@ public:
 
     uint32_t get_n_kv() const;
 
+    bool is_kv_prefix_ordered() const;
+
     ggml_type type_k() const;
     ggml_type type_v() const;
 
@@ -396,6 +406,9 @@ public:
 
     void set_input_k_shift   (ggml_tensor * dst) const;
     void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
+    // clang-format off
+    void set_input_kv_used   (ggml_tensor * dst) const;
+    // clang-format on
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
     void set_input_k_rot(ggml_tensor * dst) const;

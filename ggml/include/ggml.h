@@ -2446,9 +2446,27 @@ extern "C" {
     GGML_API enum ggml_prec ggml_flash_attn_ext_get_prec(
             const struct ggml_tensor * a);
 
+    // hint that the mask is a pure bottom-right causal mask (no interior masking / sliding window): lets a backend
+    // compute the mask from positions instead of reading the mask tensor. Default off; safe to ignore.
+    GGML_API void ggml_flash_attn_ext_set_causal(
+            struct ggml_tensor * a,
+            bool                 causal);
+
+    GGML_API bool ggml_flash_attn_ext_get_causal(
+            const struct ggml_tensor * a);
+
     GGML_API void ggml_flash_attn_ext_add_sinks(
             struct ggml_tensor * a,
             struct ggml_tensor * sinks);
+
+    // Optional I32 [n_stream] input holding, per stream, how many leading K/V entries actually hold tokens. K/V are
+    // views over a KV cache whose length is rounded up so the graph shape stays reusable, so their ne[1] is an upper
+    // bound rather than the live count. A backend that derives the causal offset from the K/V length instead of
+    // reading the mask needs the live count, and it has to come from a tensor rather than op_params because it
+    // changes every ubatch while a captured graph is replayed.
+    GGML_API void ggml_flash_attn_ext_set_kv_used(struct ggml_tensor * a, struct ggml_tensor * kv_used);
+
+    GGML_API struct ggml_tensor * ggml_flash_attn_ext_get_kv_used(const struct ggml_tensor * a);
 
     // TODO: needs to be adapted to ggml_flash_attn_ext
     GGML_API struct ggml_tensor * ggml_flash_attn_back(

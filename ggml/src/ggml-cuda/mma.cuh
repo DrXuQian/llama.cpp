@@ -23,7 +23,7 @@
 // However, the i indices in this file are by default permuted to simplify the index calculations.
 // #define GGML_CUDA_MMA_NO_VOLTA_PERM
 
-#if CUDART_VERSION >= 11080
+#if CUDART_VERSION >= 11080 && !defined(GGML_USE_PPU)
 
 static __device__ __forceinline__ int ggml_cuda_movmatrix(const int x) {
     int ret = 0;

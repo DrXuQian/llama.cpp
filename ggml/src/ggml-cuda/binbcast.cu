@@ -1,5 +1,6 @@
 #include "binbcast.cuh"
 #include <cstdint>
+#include <type_traits>
 #include <utility>
 
 template<typename T, size_t>
@@ -24,6 +25,46 @@ static __device__ __forceinline__ float op_mul(const float a, const float b) {
 
 static __device__ __forceinline__ float op_div(const float a, const float b) {
     return a / b;
+}
+
+// vector width in elements for the contiguous no-broadcast fast path:
+// 16 bytes per vectorized load/store
+static __device__ __forceinline__ void bin_bcast_vec_load(float * out, const float * ptr) {
+    const float4 v = *reinterpret_cast<const float4 *>(ptr);
+    out[0] = v.x; out[1] = v.y; out[2] = v.z; out[3] = v.w;
+}
+
+static __device__ __forceinline__ void bin_bcast_vec_store(float * ptr, const float * in) {
+    *reinterpret_cast<float4 *>(ptr) = make_float4(in[0], in[1], in[2], in[3]);
+}
+
+// flat contiguous element-wise kernel for the no-broadcast case (e.g. transformer residual adds)
+template <float (*bin_op)(const float, const float)>
+static __global__ void k_bin_elemwise(const float * __restrict__ src0,
+                                      const float * __restrict__ src1,
+                                      float *       __restrict__ dst,
+                                      const size_t n) {
+    constexpr int nv = 4; // float4
+
+    const size_t i0v   = blockIdx.x*blockDim.x + threadIdx.x;
+    const size_t nvec  = n / nv;
+    const size_t stride = gridDim.x*blockDim.x;
+
+    ggml_cuda_pdl_sync();
+
+    for (size_t iv = i0v; iv < nvec; iv += stride) {
+        float a[nv];
+        float b[nv];
+        bin_bcast_vec_load(a, src0 + iv*nv);
+        bin_bcast_vec_load(b, src1 + iv*nv);
+
+        float r[nv];
+#pragma unroll
+        for (int j = 0; j < nv; ++j) {
+            r[j] = bin_op(a[j], b[j]);
+        }
+        bin_bcast_vec_store(dst + iv*nv, r);
+    }
 }
 
 template <float (*bin_op)(const float, const float),
@@ -164,6 +205,14 @@ static __global__ void k_bin_bcast_unravel(const src0_t *         src0,
     dst_row[i0] = (dst_t) result;
 }
 
+// true if the byte strides describe a fully contiguous buffer for the shape ne
+static bool strides_are_contiguous(const size_t nb[], const int64_t ne[], const size_t elem_size) {
+    return nb[0] == elem_size &&
+           nb[1] == nb[0]*ne[0] &&
+           nb[2] == nb[1]*ne[1] &&
+           nb[3] == nb[2]*ne[2];
+}
+
 template <float (*bin_op)(const float, const float), typename src0_t, typename src1_t, typename dst_t, size_t... I>
 static void launch_bin_bcast_pack(const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst,
                                   const src0_t * src0_dd, const src1_t * src1_dd, dst_t * dst_dd,
@@ -296,6 +345,48 @@ static void launch_bin_bcast_pack(const ggml_tensor * src0, const ggml_tensor * 
         GGML_ASSERT(nb13 % sizeof(src1_t) == 0);
 
         GGML_ASSERT(ne2 * ne3 <= std::numeric_limits<unsigned int>::max());
+
+        // compile-time guard: the fast path body must only be instantiated when the
+        // three pointer types match, otherwise mixed-type dispatches (e.g. F16+F32->F16)
+        // fail to compile even though the runtime condition is never true
+        if constexpr (sizeof...(I) <= 1 &&
+                      std::is_same_v<src0_t, src1_t> && std::is_same_v<src1_t, dst_t> &&
+                      std::is_same_v<src0_t, float>) {
+            const size_t  nb_dst[] = { nb0,  nb1,  nb2,  nb3 };
+            const size_t  nb_s0[]  = { nb00, nb01, nb02, nb03 };
+            const size_t  nb_s1[]  = { nb10, nb11, nb12, nb13 };
+            const int64_t ne_c[]   = { ne0,  ne1,  ne2 };
+
+            const bool is_vec_fast_path =
+                src0_dd != nullptr &&
+                nr0 == 1 && nr1 == 1 && nr2 == 1 && nr3 == 1 &&
+                !ggml_is_permuted(src0) && !ggml_is_permuted(src1) && !ggml_is_permuted(dst) &&
+                strides_are_contiguous(nb_dst, ne_c, sizeof(dst_t)) &&
+                strides_are_contiguous(nb_s0,  ne_c, sizeof(src0_t)) &&
+                strides_are_contiguous(nb_s1,  ne_c, sizeof(src1_t));
+
+            if (is_vec_fast_path) {
+                const size_t n = ne0*ne1*ne2*ne3;
+                constexpr int nv = 4; // float4
+                const size_t align = nv * sizeof(src0_t);
+
+                const bool aligned = n % nv == 0 &&
+                    reinterpret_cast<uintptr_t>(src0_dd) % align == 0 &&
+                    reinterpret_cast<uintptr_t>(src1_dd) % align == 0 &&
+                    reinterpret_cast<uintptr_t>(dst_dd)  % align == 0;
+
+                if (aligned) {
+                    constexpr int block_size = 256;
+                    const int64_t nvec = n / nv;
+                    const int64_t num_blocks = std::min<int64_t>((nvec + block_size - 1) / block_size, 8192);
+
+                    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(num_blocks, block_size, 0, stream);
+                    ggml_cuda_kernel_launch(k_bin_elemwise<bin_op>, launch_params,
+                        src0_dd, src1_dd, dst_dd, n);
+                    return;
+                }
+            }
+        }
 
         const int block_size = 128;
 

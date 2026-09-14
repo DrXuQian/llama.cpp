@@ -268,6 +268,19 @@ llama_model_eagle3::graph<false>::graph(const llama_model & model, const llm_gra
                 model.layers[il].wo, NULL, nullptr,
                 Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
 
+        // kv for all n_tokens is already written above, so only the output rows go further
+        // masked only: the non-masked path reads back h_nextn per token index
+        if (cparams.embeddings_nextn_masked) {
+            // n_tokens  - input tokens of the current ubatch
+            // n_outputs - tokens that need output
+            if (n_outputs < n_tokens) {
+                ggml_tensor * inp_out_ids = build_inp_out_ids();
+
+                cur   = ggml_get_rows(ctx0, cur, inp_out_ids);
+                inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
+            }
+        }
+
         // Add residual and update it
         ggml_tensor * ffn_inp = ggml_add(ctx0, cur, inpSA);
         cb(ffn_inp, "ffn_inp", il);

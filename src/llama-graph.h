@@ -338,11 +338,18 @@ public:
 
     ggml_tensor * get_kq_mask() const { return self_kq_mask_cnv; }
 
+    ggml_tensor * get_kv_used() const { return self_kv_used; }
+
     ggml_tensor * self_k_idxs = nullptr; // I64 [n_batch]
     ggml_tensor * self_v_idxs = nullptr; // I64 [n_batch] or [n_batch*n_embd_v_gqa]
 
     ggml_tensor * self_kq_mask     = nullptr; // F32/F16 [n_kv, n_batch/n_stream, 1, n_stream]
     ggml_tensor * self_kq_mask_cnv = nullptr; //         [n_kv, n_batch/n_stream, 1, n_stream]
+
+    // clang-format off
+    // live K/V length per stream, i.e. how much of the padded n_kv actually holds tokens
+    ggml_tensor * self_kv_used = nullptr; // I32 [n_stream]
+    // clang-format on
 
     // note: assumes v_rot^2 == I
     ggml_tensor * self_k_rot = nullptr;
@@ -504,6 +511,12 @@ public:
     ggml_tensor * get_kq_mask()     const { return self_kq_mask_cnv; }
     ggml_tensor * get_kq_mask_swa() const { return self_kq_mask_swa_cnv; }
 
+    // clang-format off
+    ggml_tensor * get_kv_used()     const { return self_kv_used; }
+    ggml_tensor * get_kv_used_swa() const { return self_kv_used_swa; }
+
+    // clang-format on
+
     ggml_tensor * self_k_idxs     = nullptr; // I64 [n_batch]
     ggml_tensor * self_v_idxs     = nullptr; // I64 [n_batch] or [n_batch*n_embd_v_gqa]
     ggml_tensor * self_k_idxs_swa = nullptr; // I64 [n_batch]
@@ -513,6 +526,12 @@ public:
     ggml_tensor * self_kq_mask_cnv     = nullptr; //         [n_kv, n_batch/n_stream, 1, n_stream]
     ggml_tensor * self_kq_mask_swa     = nullptr; // F32/F16 [n_kv, n_batch/n_stream, 1, n_stream]
     ggml_tensor * self_kq_mask_swa_cnv = nullptr; //         [n_kv, n_batch/n_stream, 1, n_stream]
+
+    // clang-format off
+    // live K/V length per stream, separately for the two caches: they hold different layers and evict differently
+    ggml_tensor * self_kv_used     = nullptr; // I32 [n_stream]
+    ggml_tensor * self_kv_used_swa = nullptr; // I32 [n_stream]
+    // clang-format on
 
     ggml_tensor * self_k_rot = nullptr;
     ggml_tensor * self_v_rot = nullptr;
@@ -1163,16 +1182,19 @@ struct llm_graph_context {
     // attention
     //
 
+    // clang-format off
     ggml_tensor * build_attn_mha(
             ggml_tensor * q,       // [n_embd_head_q, n_head_q, n_tokens]
             ggml_tensor * k,       // [n_embd_head_k, n_head_k, n_tokens]
             ggml_tensor * v,       // [n_embd_head_v, n_head_v, n_tokens] (v_trans = false)
             ggml_tensor * kq_b,
             ggml_tensor * kq_mask,
+            ggml_tensor * kv_used, // I32 [n_stream], live K/V length per stream; null if not known
             ggml_tensor * sinks,   // [n_head_q]
             ggml_tensor * v_mla,   // [n_embd_head_v_mla, n_embd_head_v, n_head_v]
                   float   kq_scale,
                     int   il) const;
+    // clang-format on
 
     llm_graph_input_attn_no_cache * build_attn_inp_no_cache() const;
 

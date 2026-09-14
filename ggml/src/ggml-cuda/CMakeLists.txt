@@ -139,6 +139,11 @@ if (CUDAToolkit_FOUND)
         add_compile_definitions(GGML_CUDA_FORCE_MMQ)
     endif()
 
+    if (GGML_USE_PPU)
+        target_compile_definitions(ggml-cuda PUBLIC GGML_USE_PPU)
+        target_link_libraries      (ggml-cuda PUBLIC CUDA::nvtx3)
+    endif()
+
     if (GGML_CUDA_FORCE_CUBLAS)
         add_compile_definitions(GGML_CUDA_FORCE_CUBLAS)
     endif()
@@ -153,6 +158,48 @@ if (CUDAToolkit_FOUND)
 
     if (GGML_CUDA_NO_PEER_COPY)
         add_compile_definitions(GGML_CUDA_NO_PEER_COPY)
+    endif()
+
+    # NCP external kernel library support: dlopen libncp_fa.so / libncp_moe.so / libncp_gdn.so at runtime (built
+    # separately from the private ncp_flash_lib repo). llama.cpp itself pulls in NO cutlass/FA/torch/Triton headers --
+    # only the thin C ABI (ncp-fa-lib.h, ncp-moe-lib.h, ncp-gdn-lib.h) + the dlopen loader (ncp-lib.cu).
+    #
+    # One flag per library, because they are three independent kernel sets with three independent .so:
+    #   -DGGML_NCP_FA=ON   fattn-ncp.cu           -> libncp_fa.so
+    #   -DGGML_NCP_MOE=ON  mmid-ncp.cu            -> libncp_moe.so
+    #   -DGGML_NCP_GDN=ON  gated_delta_net-ncp.cu -> libncp_gdn.so
+    # All three are PPU-only (see the GGML_USE_PPU check below). Each hook and its call sites are guarded by its own
+    # #ifdef, so a flag left off compiles to nothing. All OFF (the default) -> a plain CUDA build, not even linked
+    # against libdl.
+    #
+    # The .so are expected NEXT TO THE BINARIES (build/bin, beside libggml-*.so) and are found through the $ORIGIN
+    # runpath set below, so ncp-lib.cu only dlopen's the bare soname. $ORIGIN is resolved by the loader to "the
+    # directory of this .so" -- unlike CMake's automatic build-tree rpath, which is an absolute path into the build
+    # dir and gets stripped on install. No path option and no env var to lose.
+    #
+    # All three require GGML_USE_PPU: the .so hold PPU kernels, so on a stock CUDA GPU they would load and then fail
+    # every call. Forcing them off here (loudly) beats shipping a build whose hooks can only ever decline.
+    if (NOT GGML_USE_PPU AND (GGML_NCP_FA OR GGML_NCP_MOE OR GGML_NCP_GDN))
+        message(WARNING "ggml-cuda: GGML_NCP_FA/MOE/GDN need GGML_USE_PPU=ON -- forcing all three OFF")
+        set(GGML_NCP_FA  OFF)
+        set(GGML_NCP_MOE OFF)
+        set(GGML_NCP_GDN OFF)
+    endif()
+
+    if (GGML_NCP_FA OR GGML_NCP_MOE OR GGML_NCP_GDN)
+        message(STATUS "ggml-cuda: NCP libs -> FA=${GGML_NCP_FA} MOE=${GGML_NCP_MOE} GDN=${GGML_NCP_GDN}")
+        if (GGML_NCP_FA)
+            add_compile_definitions(GGML_NCP_FA)
+        endif()
+        if (GGML_NCP_MOE)
+            add_compile_definitions(GGML_NCP_MOE)
+        endif()
+        if (GGML_NCP_GDN)
+            add_compile_definitions(GGML_NCP_GDN)
+        endif()
+        target_link_libraries(ggml-cuda PRIVATE ${CMAKE_DL_LIBS})
+        set_property(TARGET ggml-cuda APPEND PROPERTY BUILD_RPATH   "$ORIGIN")
+        set_property(TARGET ggml-cuda APPEND PROPERTY INSTALL_RPATH "$ORIGIN")
     endif()
 
     if (GGML_STATIC)

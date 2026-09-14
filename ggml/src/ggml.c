@@ -5495,6 +5495,23 @@ enum ggml_prec ggml_flash_attn_ext_get_prec(
     return (enum ggml_prec) prec_i32;
 }
 
+// Optional hint: the mask is a pure bottom-right causal mask (no interior masking, no sliding window). Lets a
+// backend compute the mask from positions instead of reading the mask tensor (op_params[4]; default 0 = off).
+void ggml_flash_attn_ext_set_causal(
+        struct ggml_tensor * a,
+        bool                 causal) {
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
+
+    ggml_set_op_params_i32(a, 4, causal ? 1 : 0); // [0]=scale [1]=max_bias [2]=softcap [3]=prec [4]=causal-hint
+}
+
+bool ggml_flash_attn_ext_get_causal(
+        const struct ggml_tensor * a) {
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
+
+    return ggml_get_op_params_i32(a, 4) != 0;
+}
+
 void ggml_flash_attn_ext_add_sinks(
         struct ggml_tensor * a,
         struct ggml_tensor * sinks) {
@@ -5509,6 +5526,26 @@ void ggml_flash_attn_ext_add_sinks(
     GGML_ASSERT(sinks->type == GGML_TYPE_F32);
 
     a->src[4] = sinks;
+}
+
+void ggml_flash_attn_ext_set_kv_used(struct ggml_tensor * a, struct ggml_tensor * kv_used) {
+    if (!kv_used) {
+        a->src[5] = NULL;
+        return;
+    }
+
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
+    GGML_ASSERT(kv_used->type == GGML_TYPE_I32);
+    // one entry per stream of K, which is also how the mask is laid out
+    GGML_ASSERT(kv_used->ne[0] >= a->src[1]->ne[3]);
+
+    a->src[5] = kv_used;
+}
+
+struct ggml_tensor * ggml_flash_attn_ext_get_kv_used(const struct ggml_tensor * a) {
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
+
+    return a->src[5];
 }
 
 // ggml_flash_attn_back
