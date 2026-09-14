@@ -9,6 +9,20 @@ built against, so a drifted ABI is a one-line `sha256sum -c` away rather than a 
 
     sha256sum -c ABI_SHA256
 
+The additive selected-runtime API is separate from the legacy six-library
+ABI. `kpack_dispatch.h`, `kpack_module.h` and `kpack_decode_io.h` mirror the
+Quactlize dispatcher, module and decode APIs (local include paths adjusted).
+The optional typed decode query/prepare pair supports direct F32 caller
+input/output for dense M1..8; `kpack_decode_io.h` also describes BF16 storage.
+The TC compute boundary remains FP16, with FP32 accumulation. The original
+FP16 module ABI and the measured SIMT/TC selector are unchanged.
+
+With the matching dispatcher, typed dense calls allocate no A/output adapter
+buffers and launch no standalone casts. Indexed MoE conversions stay inside
+prepare, activation and finish, including top8 tokens5..8 (up to 64 routed
+rows). Older libraries retain the old adapter path. PPU numerical, graph and
+model-performance admission of these additive endpoints is still pending.
+
 `quactlize_ppu_pack.h` is an additional verbatim copy of
 `quactlize/packing/api.h` at `7fbe892e2d774049437e9aa771f421cf633474ab`.
 It describes the separate, five-format GPU producer `libquactlize_ppu_pack.so`;

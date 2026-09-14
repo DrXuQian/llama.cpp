@@ -19,6 +19,9 @@ static ggml_quactlize_artifact test_art;
 static int prepares, queries, scale_prepares;
 static int gemv_lookups, prefill_lookups, expected_route;
 static bool measured_gemv;
+static const void * expected_a;
+static void * expected_output;
+struct TestHandle { qk_call_v1 call; bool f32; };
 
 static void require(bool value) {
     if (!value) GGML_ABORT("KPACK_ADAPTER_DEVICE invariant failed");
@@ -51,13 +54,14 @@ static int fake_query(void *, const qks_request_v1 * r, qks_choice_v1 * c) {
 }
 static int fake_prepare(void *, const qks_choice_v1 *, const qk_call_v1 * c, void ** out) {
     require(!c->rows_host && !c->rows_device && c->a && c->output);
-    require(bool(c->zero) == (expected_route == QK_DENSE_SF || expected_route == QK_GROUPED_SF));
+    require(bool(c->zero) == ((expected_route == QK_DENSE_SF || expected_route == QK_GROUPED_SF) && test_art.qtype != 8));
     ++prepares;
-    *out = new qk_call_v1(*c);
+    *out = new TestHandle{*c,false};
     return 0;
 }
-static void fake_destroy(void * p) { delete (qk_call_v1 *) p; }
+static void fake_destroy(void * p) { delete (TestHandle *) p; }
 
+template<typename Scalar>
 static __global__ void tag_gemm(qk_call_v1 c) {
     int r = blockIdx.x;
     int expert = 0;
@@ -65,15 +69,29 @@ static __global__ void tag_gemm(qk_call_v1 c) {
         while (expert+1 < c.experts && r >= c.offsets_device[expert+1]) ++expert;
     }
     for (int n=threadIdx.x; n<c.n; n+=blockDim.x) {
-        ((half *) c.output)[int64_t(r)*c.n+n] = __float2half(
-            __half2float(((const half *) c.a)[int64_t(r)*c.k]) + 8*(expert+1) + n%8 +
+        ((Scalar *) c.output)[int64_t(r)*c.n+n] = Scalar(
+            float(((const Scalar *) c.a)[int64_t(r)*c.k]) + 8*(expert+1) + n%8 +
             (c.zero ? __half2float(*(const half *) c.metadata) + __half2float(*(const half *) c.zero) : 0));
     }
 }
 static int fake_run(void * p, void * stream) {
-    auto c = *(qk_call_v1 *) p;
-    tag_gemm<<<c.m,128,0,(cudaStream_t) stream>>>(c);
+    auto h = *(TestHandle *) p;
+    auto c = h.call;
+    if (h.f32) tag_gemm<float><<<c.m,128,0,(cudaStream_t) stream>>>(c);
+    else tag_gemm<half><<<c.m,128,0,(cudaStream_t) stream>>>(c);
     return cudaGetLastError() == cudaSuccess ? 0 : 1;
+}
+static int fake_query_dense_io(void * r,const qks_request_v1 * request,int type,int decode,qks_choice_v1 * choice) {
+    require(type==QKD_F32 && decode==0 && request->experts==1 && request->m<=8);
+    return fake_query(r,request,choice);
+}
+static int fake_prepare_dense_io(void * r,const qks_choice_v1 * choice,const qkd_dense_call_v1 * d,void ** out) {
+    require(d->version==1 && d->size==sizeof(*d) && d->input_type==QKD_F32 && d->output_type==QKD_F32);
+    require(d->call.a==expected_a && d->call.output==expected_output && d->call.experts==1);
+    require(!d->call.offsets_device && !d->call.workspace && !d->call.workspace_bytes);
+    int rc=fake_prepare(r,choice,&d->call,out);
+    if (!rc) ((TestHandle *) *out)->f32=true;
+    return rc;
 }
 static int fake_gemv_query(const qkg_call_v1 * c, const qkg_config_v1 *,
                          const quactlize_ppu_placed_arrangement_v2 *, qkg_sizes_v1 * s) {
@@ -107,8 +125,13 @@ static int fake_sf_prepare(int, int, int, int, const uint8_t * units, uint64_t,
     return cudaGetLastError() == cudaSuccess ? 0 : 1;
 }
 const ggml_quactlize_execution_api * test_execution_library() {
-    static const ggml_quactlize_execution_api api = {"stub",fake_open,fake_close,fake_query,
-        fake_prepare,fake_run,fake_destroy,fake_error,fake_gemv_query,fake_gemv_run,fake_sf_prepare,nullptr};
+    static const ggml_quactlize_execution_api api = [] {
+        ggml_quactlize_execution_api result = {"stub",fake_open,fake_close,fake_query,
+            fake_prepare,fake_run,fake_destroy,fake_error,fake_gemv_query,fake_gemv_run,fake_sf_prepare,nullptr};
+        result.query_dense_io=fake_query_dense_io;
+        result.prepare_dense_io=fake_prepare_dense_io;
+        return result;
+    }();
     return &api;
 }
 
@@ -135,6 +158,7 @@ static void run_case(bool grouped, int tokens, int channels, bool recipe=false, 
     out->src[0]=test_weight; out->src[1]=a; out->src[2]=ids;
     CUDA_CHECK(cudaMalloc(&a->data,ggml_nbytes(a)));
     CUDA_CHECK(cudaMalloc(&out->data,ggml_nbytes(out)));
+    expected_a=a->data; expected_output=out->data;
     if (ids) CUDA_CHECK(cudaMalloc(&ids->data,ggml_nbytes(ids)));
     test_art={}; test_art.qtype=q8 ? 8 : 12; test_art.n=n; test_art.k=k; test_art.experts=grouped ? experts : 1;
     test_art.low=(const uint8_t *) a->data; test_art.units=test_art.low;
@@ -149,6 +173,10 @@ static void run_case(bool grouped, int tokens, int channels, bool recipe=false, 
         graph->n_nodes=1; graph->nodes[0]=out;
         test_prepare_graph(ctx,graph);
         test_prepare_graph(ctx,graph);
+        const bool dense_io=!grouped && !gemv && tokens<=8;
+        auto & prepared=prepare(ctx,test_weight,a,ids,out);
+        require(prepared.dense_io==dense_io);
+        if (dense_io) require(!prepared.a && !prepared.out);
         require(prepares==(gemv ? 0 : 1) && queries==prepares && scale_prepares==0);
         require(gemv_lookups==((automatic || forced_gemv) ? 1 : 0) && prefill_lookups==(auto_prefill ? 1 : 0));
         cudaGraph_t capture;
@@ -156,6 +184,11 @@ static void run_case(bool grouped, int tokens, int channels, bool recipe=false, 
         CUDA_CHECK(cudaStreamBeginCapture(ctx.stream(),cudaStreamCaptureModeRelaxed));
         require(test_execution_run(ctx,test_weight,a,ids,out));
         CUDA_CHECK(cudaStreamEndCapture(ctx.stream(),&capture));
+        if (dense_io) {
+            size_t nodes=0;
+            CUDA_CHECK(cudaGraphGetNodes(capture,nullptr,&nodes));
+            require(nodes==size_t(sf ? 2 : 1));
+        }
         CUDA_CHECK(cudaGraphInstantiate(&instance,capture,nullptr,nullptr,0));
         for (int replay=0; replay<4; ++replay) {
             std::vector<float> input(ggml_nelements(a)), output(size_t(rows)*n);
@@ -199,7 +232,7 @@ int main() {
     CUDA_CHECK(cudaGetDeviceCount(&devices));
     if (!devices) return 77;
     require(getenv("QUACTLIZE_KPACK_ROUTE"));
-    for (int tokens : {1,4,16}) {
+    for (int tokens : {1,2,3,4,5,6,7,8,16}) {
         run_case(false,tokens,1);
         run_case(true,tokens,1);
         run_case(true,tokens,2);
