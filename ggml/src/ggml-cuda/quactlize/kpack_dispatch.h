@@ -11,7 +11,7 @@ enum { QKS_OK = 0, QKS_MISS = 1, QKS_INVALID = 2, QKS_BINDING = 3,
        QKS_RUNTIME = 4 };
 enum { QKS_RECENT = 1, QKS_HISTORICAL = 2, QKS_PREDICTED = 3,
        QKS_DEVICE_BOUNDS = 4, QKS_MEASURED_GROUPED = 5, QKS_Q8_INITIAL = 6,
-       QKS_DECODE_MEASURED = 7 };
+       QKS_DECODE_MEASURED = 7, QKS_COMPONENT_MEASURED = 8 };
 
 // Additive Q8_0/W8A16 intake capability, without a device/context or JIT.
 // Returns 1 for supported weight geometry and SF route (1=dense,3=grouped).
@@ -34,6 +34,21 @@ typedef struct {
     int32_t policy, algorithm, split, grid, device, compute_units;
     char parent[192], build_key[65];
 } qks_choice_v1;
+
+typedef struct {
+    uint32_t version, size;
+    // route: 0=FQ, 1=per-call SF, 2=per-call full BF16 + external provider.
+    int32_t route, dequant_config, measured_tokens, predicted;
+    double gemm_us, dequant_us;
+} qks_prefill_choice_v1;
+// Pure host query: no JIT/device work. Mask 1=FQ,3=FQ+measured SF,7=all.
+// Only advertise SF/full when the measured expansion/provider is available.
+// Dense M128..4096; grouped top8 E256 with max_rows=tokens128..4096.
+// Costs are isolated component sums, excluding caller adapters and cache
+// interaction. TC cost already includes its reducer. No small-M full path.
+// Interior knot transfer sets predicted=1; no unmeasured 5% guarantee.
+int quactlize_kpack_dispatch_prefill_v1(qks_request_v1 const*, uint32_t mask,
+                                      qks_prefill_choice_v1*);
 
 // One runtime per device/context. root contains the exact modules packaged
 // with this host library. open/query/prepare belong outside graph capture.

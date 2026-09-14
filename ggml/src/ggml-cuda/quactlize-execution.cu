@@ -14,6 +14,7 @@
 #include <memory>
 #include <set>
 #include <vector>
+#include <unistd.h>
 
 namespace {
 enum class RouteMode { Auto, Fq, Sf, Gemv };
@@ -65,8 +66,14 @@ struct Plan {
     bool indexed = false;
     bool q4_decode = false, q4_tc = false;
     bool dense_io = false;
+    void * full_handle = nullptr;
+    int sf_config = -1;
+    qzd_call_v1 expansion{};
     int rows = 0, tokens = 0, topk = 0;
-    ~Plan() { if (handle) api->destroy(handle); }
+    ~Plan() {
+        if (handle) api->destroy(handle);
+        if (full_handle) api->full_destroy(full_handle);
+    }
 };
 struct Scratch { void * pointer = nullptr; size_t capacity = 0; };
 struct MoePlan {
@@ -129,6 +136,32 @@ Execution * execution(ggml_backend_cuda_context & ctx) {
     if (!api) return nullptr;
     if (!ctx.quactlize_execution) ctx.quactlize_execution = std::make_shared<Execution>(api, ctx.device);
     return static_cast<Execution *>(ctx.quactlize_execution.get());
+}
+
+qzd_call_v1 expansion_call(ggml_quactlize_artifact const & art, cudaStream_t stream) {
+    qzd_call_v1 c{};
+    c.version=1; c.size=sizeof(c); c.qtype=art.qtype; c.n=art.n; c.k=art.k; c.experts=art.experts;
+    c.low=art.low; c.high=art.high; c.units=art.units; c.stream=stream;
+    qkg_call_v1 shape{};
+    shape.version=1; shape.size=sizeof(shape); shape.qtype=art.qtype;
+    shape.n=art.n; shape.k=art.k; shape.experts=art.experts; shape.rows=1;
+    shape.mode=art.experts==1 ? QKG_DENSE:QKG_GROUPED;
+    shape.input_type=QKG_F16; shape.channels=1; shape.topk=1; shape.a_row_stride=art.k; shape.out_row_stride=art.n;
+    qkg_config_v1 recipe{1,sizeof(recipe),16,4,1}; qkg_sizes_v1 sizes{};
+    auto api=ggml_quactlize_execution_library();
+    if (api->gemv_query(&shape,&recipe,&art.arrangement,&sizes)!=QKG_OK)
+        GGML_ABORT("[quactlize] expansion size query failed");
+    c.low_bytes=sizes.low_bytes; c.high_bytes=sizes.high_bytes; c.unit_bytes=sizes.units_bytes;
+    return c;
+}
+
+unsigned prefill_mask(ggml_quactlize_execution_api const * api, bool grouped) {
+    if (!api->dequant) return 1;
+    const char * sdk=getenv("PPU_SDK");
+    if (!api->full_prepare || !sdk) return 3;
+    if (grouped) return getenv("QUACTLIZE_KPACK_DEEPGEMM_HELPER") && getenv("QUACTLIZE_KPACK_JIT_PYTHON") ? 7:3;
+    std::string path=std::string(sdk)+"/CUDA_SDK/targets/x86_64-linux/lib/libcublas.so";
+    return access(path.c_str(),R_OK)==0 ? 7:3;
 }
 
 Key make_key(const ggml_tensor * weight, const ggml_tensor * input, const ggml_tensor * ids,
@@ -234,7 +267,51 @@ Plan & prepare(ggml_backend_cuda_context & ctx, const ggml_tensor * weight,
                 GGML_ABORT("[quactlize] %s: decode TC selection: %s", weight->name, owner.api->error());
             p->q4_tc = status == QKS_OK;
         }
-        const int prefill_choice = !p->q4_tc && mode == RouteMode::Auto && tokens > 1 ? ggml_quactlize_prefill_route(r) : -1;
+        int prefill_choice=-1;
+        qks_prefill_choice_v1 prefill{};
+        if (!p->q4_tc && mode==RouteMode::Auto && tokens>1 && art.qtype!=GGML_TYPE_Q8_0) {
+            if (owner.api->prefill_choice) {
+                int rc=owner.api->prefill_choice(&r,prefill_mask(owner.api,ids!=nullptr),&prefill);
+                if (rc!=QKS_OK && rc!=QKS_MISS) GGML_ABORT("[quactlize] prefill policy query failed rc=%d",rc);
+                if (rc==QKS_OK) prefill_choice=prefill.route;
+            } else prefill_choice=ggml_quactlize_prefill_route(r);
+        }
+        if (prefill_choice==2) {
+            qkp_call_v1 call{};
+            call.version=1; call.size=sizeof(call); call.weight=expansion_call(art,stream);
+            call.weight.operation=1; call.weight.config=prefill.dequant_config; call.m=p->rows; call.device=ctx.device;
+            GGML_ASSERT(ggml_nelements(input)/art.k<=INT32_MAX);
+            call.a_rows=ggml_nelements(input)/art.k;
+            call.a=static_cast<float const*>(input->data); call.output=static_cast<float*>(output->data);
+            call.a_stride=input->nb[1]/sizeof(float); call.output_stride=output->nb[1]/sizeof(float);
+            uint64_t bytes=0;
+            if (owner.api->full_query(&call,&art.arrangement,&bytes)!=QKG_OK)
+                GGML_ABORT("[quactlize] %s: full-BF16 workspace query failed",weight->name);
+            size_t indices=ids ? align256(size_t(p->rows)*sizeof(int32_t)):0;
+            size_t bounds=ids ? align256(size_t(art.experts+1)*sizeof(int32_t)):0;
+            size_t head=2*indices+bounds;
+            GGML_ASSERT(bytes<=SIZE_MAX-head);
+            uint8_t * storage=owner.storage(stream,head+bytes);
+            if (ids) {
+                p->ids_src=reinterpret_cast<int32_t*>(storage);
+                p->ids_dst=reinterpret_cast<int32_t*>(storage+indices);
+                p->bounds=reinterpret_cast<int32_t*>(storage+2*indices);
+                call.src_rows=p->ids_src;call.dst_rows=p->ids_dst;call.offsets=p->bounds;
+            }
+            call.workspace=storage+head;call.workspace_bytes=bytes;
+            qkp_options_v1 options{1,sizeof(options),getenv("PPU_SDK"),getenv("QUACTLIZE_KPACK_JIT_PYTHON"),
+                getenv("QUACTLIZE_KPACK_DEEPGEMM_HELPER")};
+            if (owner.api->full_prepare(&call,&art.arrangement,&options,&p->full_handle)!=QKG_OK)
+                GGML_ABORT("[quactlize] %s: full-BF16 prepare: %s",weight->name,owner.api->full_error());
+            const char * image=owner.api->full_image(p->full_handle);
+            GGML_ASSERT(image && !strchr(image,'\n') && !strchr(image,'"'));
+            GGML_LOG_INFO("[quactlize-plan] tensor=%s op=%s route=full-bf16 q=%d rows=%d n=%" PRId64 " k=%" PRId64 " experts=%" PRId64 " dequant=%d knot_tokens=%d predicted=%d workspace=%" PRIu64 " cost_scope=ISOLATED_COMPONENT_SUM\n",
+                weight->name,ids ? "grouped":"dense",art.qtype,p->rows,art.n,art.k,art.experts,prefill.dequant_config,prefill.measured_tokens,prefill.predicted,bytes);
+            GGML_LOG_INFO("[quactlize-prefill-image] tensor=%s rows=%d provider=%s image=\"%s\"\n",
+                weight->name,p->rows,ids ? "deepgemm":"cublas",image);
+            auto * result=p.get();owner.plans.emplace(key,std::move(p));return *result;
+        }
+        if (prefill_choice==1 && owner.api->prefill_choice) p->sf_config=prefill.dequant_config;
         if (art.qtype == GGML_TYPE_Q8_0) {
             r.route = ids ? QK_GROUPED_SF : QK_DENSE_SF;
             status = query_tc();
@@ -293,6 +370,10 @@ Plan & prepare(ggml_backend_cuda_context & ctx, const ggml_tensor * weight,
             if (p->sf && !p->scale_resident) {
                 p->scale = (uint16_t *) (storage + scale_offset);
                 p->zero = (uint16_t *) (storage + scale_offset + plane_bytes);
+                if (p->sf_config>=0) {
+                    p->expansion=expansion_call(art,stream);p->expansion.operation=0;p->expansion.config=p->sf_config;
+                    p->expansion.output=p->scale;p->expansion.zero=p->zero;p->expansion.output_bytes=p->sf_plane_bytes;
+                }
             }
             if (ids) {
                 p->ids_src = (int32_t *) (storage + a_bytes + out_bytes);
@@ -350,6 +431,7 @@ MoePlan * prepare_moe(ggml_backend_cuda_context & ctx, const ggml_cgraph * graph
     for (int j=0;j<3;++j) {
         auto * node = nodes[j];
         if (!node) continue;
+        if (node->src[1]->ne[2]>8) return nullptr;
         ggml_quactlize_artifact art{};
         if (!ggml_quactlize_artifact_for(node->src[0],&art)) return nullptr;
         auto key=make_key(node->src[0],node->src[1],node->src[2],node,art,ctx.stream(),j+1);
@@ -440,7 +522,20 @@ bool ggml_quactlize_execution_run(ggml_backend_cuda_context & ctx, const ggml_te
     if (p.legacy) return false;
     cudaStream_t stream = ctx.stream();
     ggml_quactlize_wait_ready(p.art, stream);
-    if (p.sf && !p.scale_resident && p.api->sf_prepare(p.art.qtype, p.art.n, p.art.k, p.art.experts, p.art.units,
+    if (p.full_handle) {
+        if (ids) {
+            ggml_cuda_launch_mm_ids_helper(static_cast<int32_t const*>(ids->data),p.ids_src,p.ids_dst,p.bounds,
+                p.art.experts,p.tokens,p.topk,input->ne[1],ids->nb[1]/sizeof(int32_t),input->nb[2]/input->nb[1],false,stream);
+            CUDA_CHECK(cudaGetLastError());
+        }
+        if (p.api->full_run(p.full_handle,stream)!=QKG_OK)
+            GGML_ABORT("[quactlize] %s: full-BF16 run: %s",weight->name,p.api->full_error());
+        ggml_ncp_route_log(output,"so-quactlize-kpack-full-bf16",nullptr);
+        return true;
+    }
+    if (p.sf && p.sf_config>=0 && p.api->dequant(&p.expansion,&p.art.arrangement)!=QKG_OK)
+        GGML_ABORT("[quactlize] %s: measured SF expansion failed",weight->name);
+    if (p.sf && !p.scale_resident && p.sf_config<0 && p.api->sf_prepare(p.art.qtype, p.art.n, p.art.k, p.art.experts, p.art.units,
             p.units_bytes, p.scale, p.zero, p.sf_plane_bytes, &p.art.arrangement, stream) != QKG_OK)
         GGML_ABORT("[quactlize] %s: per-call SF prepass failed", weight->name);
     if (p.direct) {

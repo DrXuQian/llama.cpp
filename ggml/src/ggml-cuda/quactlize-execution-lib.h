@@ -2,6 +2,7 @@
 #include "quactlize/kpack_dispatch.h"
 #include "quactlize/kpack_execution.h"
 #include "quactlize/kpack_q4_decode.h"
+#include "quactlize/kpack_prefill.h"
 
 struct ggml_quactlize_execution_api {
     const char * root;
@@ -29,6 +30,14 @@ struct ggml_quactlize_execution_api {
     decltype(&quactlize_kpack_q4_decode_indexed_finish_v1) q4_finish;
     decltype(&quactlize_kpack_dispatch_query_dense_io_v1) query_dense_io;
     decltype(&quactlize_kpack_dispatch_prepare_dense_io_v1) prepare_dense_io;
+    decltype(&quactlize_kpack_dispatch_prefill_v1) prefill_choice;
+    decltype(&quactlize_kpack_dequant_v1) dequant;
+    decltype(&quactlize_kpack_prefill_query_v1) full_query;
+    decltype(&quactlize_kpack_prefill_prepare_v1) full_prepare;
+    decltype(&quactlize_kpack_prefill_run_v1) full_run;
+    decltype(&quactlize_kpack_prefill_destroy_v1) full_destroy;
+    decltype(&quactlize_kpack_prefill_error_v1) full_error;
+    decltype(&quactlize_kpack_prefill_provider_image_v1) full_image;
 };
 
 // QUACTLIZE_KPACK_EXECUTION names the complete native package. An explicit
