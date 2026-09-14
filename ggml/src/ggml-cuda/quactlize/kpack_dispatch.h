@@ -2,6 +2,7 @@
 #include "kpack_module.h"
 #include "kpack_indexed.h"
 #include "kpack_decode_io.h"
+#include "kpack_q4_decode.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -98,6 +99,25 @@ int quactlize_kpack_dispatch_bind_llama_indexed_v1(void*,qk_llama_indexed_v1 con
 // device completion. Run has no allocation, tuning, host read or device wait.
 // SF expansion, if needed, is caller-owned and precedes this chain each time.
 int quactlize_kpack_dispatch_moe_create_v1(void* gate,void* up,void* down,void** chain);
+// Additive mixed chain. Exactly one of tc_handle/simt_call is present.
+// SIMT config is either the automatic Q4 recipe or the caller's measured
+// generic recipe. Scratch is disjoint per projection and retained by caller.
+// Create copies descriptors, never GPU IDs. Existing handles remain usable.
+typedef struct {
+    uint32_t version,size;
+    void* tc_handle;
+    qkg_call_v1 const* simt_call;
+    qkg_q4_decode_config_v1 const* q4_config;
+    qkg_config_v1 const* simt_config;
+    quactlize_ppu_placed_arrangement_v2 const* arrangement;
+    void* scratch;
+    uint64_t scratch_bytes;
+} qks_moe_endpoint_v2;
+int quactlize_kpack_dispatch_moe_simt_scratch_v1(void* runtime,qkg_call_v1 const*,uint64_t*);
+int quactlize_kpack_dispatch_moe_create_v2(void* runtime,qks_moe_endpoint_v2 const* gate,
+    qks_moe_endpoint_v2 const* up,qks_moe_endpoint_v2 const* down,void** chain);
+// Both chain versions use the same run/router/destroy entries. Mixed chains
+// retain SIMT F32 results and TC FP16 completion semantics through SwiGLU.
 int quactlize_kpack_dispatch_moe_run_v1(void* chain,void* stream);
 // Same chain, but router+preparation are one kernel. The caller must match the
 // complete top-k graph, preserve weights/IDs as outputs and prove input ready.

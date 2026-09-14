@@ -99,7 +99,8 @@ void ggml_cuda_mul_mat_id_quactlize(ggml_backend_cuda_context & ctx,
 
     // nchannels_y MUST be the RAW src1->ne[1]: with ne11==1, ids_src1 = it*sis1 + iex%1 = it, the correct broadcast.
     ggml_cuda_launch_mm_ids_helper((const int32_t *) ids->data, ids_src1.ptr, ids_dst.ptr, bounds.ptr,
-        (int) n_experts, (int) n_tokens, (int) n_expert_used, (int) src1->ne[1], si1, sis1, stream);
+        (int) n_experts, (int) n_tokens, (int) n_expert_used, (int) src1->ne[1], si1, sis1,
+        /*write_inverse =*/ false, stream);
     CUDA_CHECK(cudaGetLastError());
 
     constexpr int block_dim = 256;   // every kernel here reads blockDim.x, so this is a launch choice only

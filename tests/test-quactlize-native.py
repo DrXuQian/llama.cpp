@@ -15,6 +15,11 @@ from quactlize_native import timings, selection, summarize, PATTERN
 
 
 class NativeEvidence(unittest.TestCase):
+    def test_dense_only_inventory_does_not_require_a_grouped_kernel(self):
+        text = "[quactlize-plan] tensor=w op=dense route=gemv-q4-s1 q=12 split=1"
+        self.assertTrue(selection(text, dict(modules=[]), ["dense"])["fully_selected"])
+        self.assertFalse(selection(text, dict(modules=[]), ["dense", "grouped"])["fully_selected"])
+
     def test_trace_tensor_inventory_uses_exact_names_including_dense_q8(self):
         names = ["blk.0.attn_q.weight", "blk.0.ffn_gate_exps.weight", "output.weight"]
         pattern = native.inventory_pattern(dict(eligible=names))
