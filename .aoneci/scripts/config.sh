@@ -9,14 +9,14 @@
 #   JOBS          - 并行数
 
 # --- 路径配置 (必填) ---
-if [ -z "$LLAMA_CI_DIR" ]; then
+if [ -z "${LLAMA_CI_DIR:-}" ]; then
     echo "ERROR: LLAMA_CI_DIR is not set." >&2
     echo "  export LLAMA_CI_DIR=/path/to/llama.cpp" >&2
     exit 1
 fi
 export LLAMA_CI_DIR
 
-if [ -z "$NCP_LIB_DIR" ]; then
+if [ -z "${NCP_LIB_DIR:-}" ]; then
     echo "ERROR: NCP_LIB_DIR is not set." >&2
     echo "  export NCP_LIB_DIR=/path/to/ncp_flash_lib" >&2
     exit 1

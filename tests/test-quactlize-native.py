@@ -15,6 +15,17 @@ from quactlize_native import timings, selection, summarize, PATTERN
 
 
 class NativeEvidence(unittest.TestCase):
+    def test_aoneci_build_enables_kpack_without_disabling_ci_hooks(self):
+        root = Path(__file__).resolve().parents[1]
+        script = root / '.aoneci/scripts/build.sh'
+        subprocess.run(['bash', '-n', str(script)], check=True)
+        subprocess.run(['bash', '-n', str(script.with_name('config.sh'))], check=True)
+        text = script.read_text().split('cmake -S . -B build-ci', 1)[1].split('cmake --build', 1)[0]
+        for flag in ('GGML_USE_PPU=ON', 'GGML_NCP_QUACTLIZE=ON', 'GGML_NCP_FA=ON',
+                     'GGML_NCP_MOE=ON', 'GGML_NCP_GDN=OFF'):
+            self.assertIn('-D' + flag, text)
+        self.assertIn('-DCMAKE_CUDA_COMPILER="${PPU_NVCC}"', text)
+
     def test_dense_only_inventory_does_not_require_a_grouped_kernel(self):
         text = "[quactlize-plan] tensor=w op=dense route=gemv-q4-s1 q=12 split=1"
         self.assertTrue(selection(text, dict(modules=[]), ["dense"])["fully_selected"])

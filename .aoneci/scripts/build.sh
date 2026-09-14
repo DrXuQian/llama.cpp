@@ -154,10 +154,13 @@ if [ -d "build-ci" ]; then
 fi
 cmake -S . -B build-ci \
     -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_CUDA_COMPILER="${PPU_NVCC}" \
     -DGGML_CUDA=ON \
     -DGGML_USE_PPU=ON \
     -DGGML_NCP_MOE=ON \
     -DGGML_NCP_FA=ON \
+    -DGGML_NCP_GDN=OFF \
+    -DGGML_NCP_QUACTLIZE=ON \
     -DCMAKE_CUDA_ARCHITECTURES=OFF \
     -DLLAMA_BUILD_TESTS=ON \
     -DLLAMA_BUILD_EXAMPLES=ON \
@@ -206,6 +209,7 @@ echo "========================================"
 echo "BUILD COMPLETE"
 echo "========================================"
 echo "  NCP hooks     : FA + MoE (libncp_fa.so, libncp_moe.so + deep_gemm/ in build-ci/bin)"
+echo "  K-pack hook   : ON (load the separately published Quactlize runtime at execution)"
 echo "  test binaries : ${LLAMA_CI_DIR}/build-ci/bin/"
 echo "========================================"
 echo ""
