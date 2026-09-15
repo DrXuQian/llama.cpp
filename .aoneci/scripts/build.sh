@@ -124,6 +124,7 @@ echo "    torch found: ${TORCH_DIR}"
 cmake -S . -B build \
     -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_CUDA_COMPILER="${PPU_NVCC}" \
+    -DCMAKE_PROJECT_INCLUDE="${LLAMA_CI_DIR}/.aoneci/cmake/ncp-ppu-runtime.cmake" \
     -DCMAKE_CUDA_ARCHITECTURES=OFF \
     -DNCP_BUILD_FA=ON \
     -DNCP_BUILD_MOE=ON \

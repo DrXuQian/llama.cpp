@@ -1,0 +1,31 @@
+# Applied after project(), before the NCP targets exist.
+if(NOT CMAKE_CURRENT_SOURCE_DIR STREQUAL CMAKE_SOURCE_DIR)
+    return()
+endif()
+include_guard(GLOBAL)
+
+if(CMAKE_VERSION VERSION_LESS 3.19)
+    message(FATAL_ERROR "The NCP runtime link hook requires CMake 3.19 or newer")
+endif()
+
+function(ncp_link_ppu_wrapper)
+    if(NOT NCP_BUILD_MOE)
+        return()
+    endif()
+    if(NOT TARGET ncp_moe)
+        message(FATAL_ERROR "NCP_BUILD_MOE is ON but the ncp_moe target is missing")
+    endif()
+    get_filename_component(compiler_dir "${CMAKE_CUDA_COMPILER}" DIRECTORY)
+    get_filename_component(sdk_root "${compiler_dir}/../.." ABSOLUTE)
+    foreach(lib_dir IN ITEMS "${sdk_root}/targets/x86_64-linux/lib" "${sdk_root}/lib")
+        if(EXISTS "${lib_dir}/libhggc_wrapper.so")
+            # The CUDA compatibility entry hggcGetDeviceProperties_v2 is in the wrapper, not libhggcrt.
+            set_property(TARGET ncp_moe APPEND PROPERTY LINK_LIBRARIES "${lib_dir}/libhggc_wrapper.so")
+            message(STATUS "ncp_moe PPU runtime: ${lib_dir}/libhggc_wrapper.so")
+            return()
+        endif()
+    endforeach()
+    message(FATAL_ERROR "PPU SDK at ${sdk_root} has no libhggc_wrapper.so")
+endfunction()
+
+cmake_language(DEFER CALL ncp_link_ppu_wrapper)

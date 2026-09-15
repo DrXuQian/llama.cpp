@@ -46,6 +46,58 @@ class NativeEvidence(unittest.TestCase):
             self.assertIn('build output exists', result.stderr)
             self.assertEqual(marker.read_text(), 'existing output')
 
+    def test_ncp_wrapper_link_is_target_local_and_incremental(self):
+        root = Path(__file__).resolve().parents[1]
+        hook = root / '.aoneci/cmake/ncp-ppu-runtime.cmake'
+        self.assertIn('-DCMAKE_PROJECT_INCLUDE="${LLAMA_CI_DIR}/.aoneci/cmake/ncp-ppu-runtime.cmake"',
+                      (root / '.aoneci/scripts/build.sh').read_text())
+        for location in ('targets/x86_64-linux/lib', 'lib'):
+            with self.subTest(location=location), tempfile.TemporaryDirectory() as temp:
+                work = Path(temp)
+                source, build, sdk = work / 'source', work / 'build', work / 'sdk'
+                source.mkdir()
+                lib = sdk / location
+                lib.mkdir(parents=True)
+                wrapper = lib / 'libhggc_wrapper.so'
+                (source / 'wrapper.c').write_text('int hggcGetDeviceProperties_v2(void) { return 42; }\n')
+                subprocess.run(['cc', '-shared', '-fPIC', '-Wl,-soname,libhggc_wrapper.so',
+                                str(source / 'wrapper.c'), '-o', str(wrapper)], check=True)
+                (source / 'moe.c').write_text('extern int hggcGetDeviceProperties_v2(void);\n'
+                                             'int moe(void) { return hggcGetDeviceProperties_v2(); }\n')
+                (source / 'main.c').write_text('extern int moe(void);\nint main(void) { return moe() != 42; }\n')
+                (source / 'fa.c').write_text('int fa(void) { return 0; }\n')
+                (source / 'CMakeLists.txt').write_text('''cmake_minimum_required(VERSION 3.19)
+project(ncp_link_fixture C)
+set(NCP_BUILD_MOE ON)
+add_library(ncp_moe SHARED moe.c)
+target_link_libraries(ncp_moe m)
+add_library(ncp_fa SHARED fa.c)
+add_executable(warm_cache main.c)
+target_link_libraries(warm_cache PRIVATE ncp_moe)
+add_executable(test_moe main.c)
+target_link_libraries(test_moe PRIVATE ncp_moe)
+''')
+                configure = ['cmake', '-S', str(source), '-B', str(build),
+                             '-DCMAKE_CUDA_COMPILER=' + str(sdk / 'CUDA_SDK/bin/nvcc')]
+                subprocess.run(configure, check=True, capture_output=True)
+                baseline = subprocess.run(['cmake', '--build', str(build), '-j2'], capture_output=True, text=True)
+                self.assertNotEqual(baseline.returncode, 0)
+                self.assertIn('hggcGetDeviceProperties_v2', baseline.stderr)
+                objects = {p: p.stat().st_mtime_ns for p in build.rglob('*.o')}
+                self.assertGreaterEqual(len(objects), 3)
+                subprocess.run(configure + ['-DCMAKE_PROJECT_INCLUDE=' + str(hook)], check=True, capture_output=True)
+                subprocess.run(['cmake', '--build', str(build), '-j2'], check=True, capture_output=True)
+                self.assertEqual(objects, {p: p.stat().st_mtime_ns for p in objects})
+                for target in ('warm_cache', 'test_moe'):
+                    subprocess.run([str(build / target)], check=True)
+                needed = lambda name: subprocess.check_output(['readelf', '-d', str(build / name)], text=True)
+                self.assertIn('libhggc_wrapper.so', needed('libncp_moe.so'))
+                self.assertNotIn('libhggc_wrapper.so', needed('libncp_fa.so'))
+                missing = subprocess.run(configure + ['-DCMAKE_CUDA_COMPILER=' + str(work / 'absent/CUDA_SDK/bin/nvcc')],
+                                         capture_output=True, text=True)
+                self.assertNotEqual(missing.returncode, 0)
+                self.assertIn('has no libhggc_wrapper.so', missing.stderr)
+
     def test_dense_only_inventory_does_not_require_a_grouped_kernel(self):
         text = "[quactlize-plan] tensor=w op=dense route=gemv-q4-s1 q=12 split=1"
         self.assertTrue(selection(text, dict(modules=[]), ["dense"])["fully_selected"])
