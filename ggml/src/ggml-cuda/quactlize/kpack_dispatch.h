@@ -15,7 +15,8 @@ enum { QKS_RECENT = 1, QKS_HISTORICAL = 2, QKS_PREDICTED = 3,
        QKS_DEVICE_BOUNDS = 4, QKS_MEASURED_GROUPED = 5, QKS_Q8_INITIAL = 6,
        QKS_DECODE_MEASURED = 7, QKS_COMPONENT_MEASURED = 8,
        QKS_SMALLM_EXACT = 9, QKS_SMALLM_BUCKET = 10,
-       QKS_COMPUTE_INITIAL = 11 };
+       QKS_COMPUTE_INITIAL = 11, QKS_MATCHED_EXACT = 12,
+       QKS_MATCHED_BUCKET = 13, QKS_MATCHED_ROUTER = 14 };
 
 // Additive Q8_0/W8A16 intake capability, without a device/context or JIT.
 // Returns 1 for supported weight geometry and SF route (1=dense,3=grouped).
@@ -39,7 +40,7 @@ typedef struct {
     char parent[192], build_key[65];
 } qks_choice_v1;
 
-enum { QKS_SMALLM_TC = 0, QKS_SMALLM_SIMT = 1 };
+enum { QKS_SMALLM_TC = 0, QKS_SMALLM_SIMT = 1, QKS_SMALLM_Q4 = 2 };
 typedef struct {
     uint32_t version,size;
     int32_t kind,policy,source_n,source_k,source_tokens;
@@ -60,6 +61,20 @@ int quactlize_kpack_dispatch_query_smallm_v1(void* runtime,qkg_call_v1 const*,
 // relabeled as BF16. F16 delegates to the existing policy unchanged.
 int quactlize_kpack_dispatch_query_smallm_v2(void* runtime,qkg_simt_call_v2 const*,
     quactlize_ppu_placed_arrangement_v2 const*,qks_smallm_choice_v1*);
+// Additive matched-pool override: explicit F16/BF16 measurements, complete
+// producer+real reducer+indexed endpoint costs. Grouped choices minimize worst
+// measured router-profile regret without reading IDs on the host. ROUTER
+// denotes a measured compromise exceeding 5%, not an optimality guarantee.
+// A bounded bucket is predicted; source_* name the donor. MISS means retain
+// the prior legal selector. This entry is decode-only and never runs a tuner.
+typedef struct {
+    uint32_t version,size;
+    qks_smallm_choice_v1 base;
+    qkg_q4_decode_config_v1 q4;
+    int32_t compute_type;
+} qks_smallm_choice_v2;
+int quactlize_kpack_dispatch_query_smallm_v3(void* runtime,qkg_simt_call_v2 const*,
+    quactlize_ppu_placed_arrangement_v2 const*,qks_smallm_choice_v2*);
 
 typedef struct {
     uint32_t version, size;

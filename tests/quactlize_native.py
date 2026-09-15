@@ -114,6 +114,11 @@ def selection(text, manifest, expected_ops=None):
             and r.get("route") in ("fq", "sf", "gemv", "gemv-q4-s1", "full-bf16"),
             "invalid plan receipt",
         )
+        matched_labels = {"12": "MATCHED_EXACT", "13": "MATCHED_BUCKET_PREDICTED", "14": "MATCHED_ROUTER_MINIMAX"}
+        matched = r.get("policy") in matched_labels
+        if matched:
+            require(manifest.get("smallm_matched_policy") and r.get("activation") in ("FP16", "BF16"),
+                    "unbound matched compute policy")
         if r["route"] == "full-bf16":
             require(manifest.get("prefill") and int(r.get("q",0)) in range(10,15)
                     and int(r.get("n",0))>0 and int(r.get("k",0))>0
@@ -123,13 +128,14 @@ def selection(text, manifest, expected_ops=None):
         elif r["route"] == "gemv-q4-s1":
             require(r.get("q")=="12" and r.get("split")=="1", "invalid measured Q4 S1 plan")
             require(r.get("activation", "FP16") in ("FP16", "BF16"), "invalid Q4 compute type")
-            if r.get("activation") == "BF16":
+            if r.get("activation") == "BF16" or matched:
                 receipt = manifest.get("execution_receipt", {})
                 compute = receipt.get("q4_decode_compute_v2", {})
                 configs = receipt.get("q4_decode_configs", {}).get(f'{r.get("n")}x{r.get("k")}', [])
                 config = [int(r.get(k, -1)) for k in ("reader", "variant", "warps", "values", "columns")]
-                require(manifest.get("compute_contract") and "bf16" in compute.get("compute", []) and
-                        r.get("selection") == "INITIAL_COMPUTE" and config in configs,
+                bf16 = r.get("activation") == "BF16"
+                require((not bf16 or (manifest.get("compute_contract") and "bf16" in compute.get("compute", []))) and
+                        r.get("selection") == (matched_labels[r["policy"]] if matched else "INITIAL_COMPUTE") and config in configs,
                         "unbound BF16 Q4 proposal or measured relabel")
         elif r["route"] == "gemv" and r.get("reader") == "simt-reuse":
             names = ("variant", "columns", "warps", "values", "split")
@@ -137,7 +143,8 @@ def selection(text, manifest, expected_ops=None):
             inventory = manifest.get("execution_receipt", {}).get("simt_configs", {}).get(r.get("q"), [])
             bf16 = r.get("activation") == "BF16"
             compute = manifest.get("execution_receipt", {}).get("simt_compute_v2", {})
-            require(manifest.get("smallm_policy") and r.get("policy") in (("11",) if bf16 else ("9", "10")) and
+            require((manifest.get("smallm_matched_policy") if matched else manifest.get("smallm_policy")) and
+                    (matched or r.get("policy") in (("11",) if bf16 else ("9", "10"))) and
                     r.get("activation") in ("FP16", "BF16") and
                     (not bf16 or (manifest.get("compute_contract") and "bf16" in compute.get("compute", []))) and
                     any(all(c.get(k)==v for k,v in config.items()) for c in inventory),
@@ -153,7 +160,7 @@ def selection(text, manifest, expected_ops=None):
             require(r.get("activation", "FP16") == ("BF16" if compute == "bf16" else "FP16"),
                     "selected module compute type differs from caller")
             if compute == "bf16":
-                require(manifest.get("compute_contract") and r.get("policy") == "11",
+                require(manifest.get("compute_contract") and (matched or r.get("policy") == "11"),
                         "BF16 proposal relabeled as FP16 measurement")
             require(
                 int(r["q"]) == p["qtype"] and p["route"] == r["route"] + "-" + r["op"],
