@@ -7,6 +7,7 @@
 #include "llama-model.h"
 #include "llama-sampler.h"
 #include "llama-spec-tree.h"
+#include "llama-spec-sampling.h"
 
 #include <algorithm>
 #include <cstring>
@@ -114,6 +115,43 @@ struct llama_nextn_graph {
     ggml_tensor * input_hidden = nullptr;
 };
 
+struct llama_nextn_random {
+    ggml_context_ptr ctx;
+    ggml_backend_buffer_ptr device;
+    ggml_tensor * uniforms = nullptr;
+    ggml_tensor * recovery = nullptr;
+    ggml_tensor * base = nullptr;
+    int32_t epoch = -1;
+    uint32_t seed = 0;
+    bool block = false;
+
+    bool init(ggml_backend_t backend, int size) {
+        ctx.reset(ggml_init({ 3*ggml_tensor_overhead(), nullptr, true }));
+        uniforms = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_F32, size);
+        recovery = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_F32, size);
+        base = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I32, 1);
+        device.reset(ggml_backend_alloc_ctx_tensors(ctx.get(), backend));
+        return device != nullptr;
+    }
+
+    bool rebase(const llama_sampler * sampler, int32_t next_epoch, llama_pos position, bool next_block) {
+        std::vector<float> values(ggml_nelements(uniforms));
+        if (!llama_sampler_backend_export_uniforms(sampler, values.data(), values.size(), next_block ? 1 : 0)) {
+            return false;
+        }
+        ggml_backend_tensor_set(uniforms, values.data(), 0, ggml_nbytes(uniforms));
+        if (!llama_sampler_backend_export_uniforms(sampler, values.data(), values.size(), 2)) {
+            return false;
+        }
+        ggml_backend_tensor_set(recovery, values.data(), 0, ggml_nbytes(recovery));
+        ggml_backend_tensor_set(base, &position, 0, sizeof(position));
+        epoch = next_epoch;
+        seed = llama_sampler_get_seed(sampler);
+        block = next_block;
+        return true;
+    }
+};
+
 struct llama_nextn_handoff {
     ggml_context_ptr ctx;
     ggml_backend_buffer_ptr device;
@@ -133,6 +171,7 @@ struct llama_nextn_lookahead {
     llama_seq_id seq = -1;
     int32_t epoch = 0;
     int32_t step = 0;
+    int32_t random_epoch = -1;
 };
 
 struct llama_nextn_catchup {
@@ -195,6 +234,8 @@ struct llama_nextn_target {
     int n_kv = 0;
     int n = 0;
     bool composed = false;
+    std::shared_ptr<llama_nextn_random> random;
+    bool magic = false;
 
     ~llama_nextn_target() {
         for (auto & entry : samplers) {
@@ -534,11 +575,13 @@ bool llama_spec_pipeline::prefetch_nextn_target(llama_context & source) {
             hctx->get_recr()->get_head() != 0 || hctx->get_recr()->get_rs_z() >= 0 || rs->n_rs_seq < (uint32_t) n_max - 1)) {
         return false;
     }
+    bool stochastic = false;
     for (int i = 0; i < previous_n; ++i) {
         auto * logits = lctx.gf_res_prev->t_sampled_logits[i];
-        if (!ubatch.output[i] || !logits || ggml_nelements(logits) != 1) {
+        if (!ubatch.output[i] || !logits || (eagle && ggml_nelements(logits) != 1)) {
             return false;
         }
+        stochastic |= ggml_nelements(logits) > 1;
     }
     const auto & cells = kv->get_cells(0);
     for (int i = 0; i < ubatch.pos[0] + previous_n; ++i) {
@@ -563,6 +606,27 @@ bool llama_spec_pipeline::prefetch_nextn_target(llama_context & source) {
         return false;
     }
     const bool can_compose = ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(dev), "ggml_backend_graph_select") != nullptr;
+    const bool magic = stochastic && magic_mtp && !early && n_max >= 4;
+    if (stochastic) {
+        if (!source.spec->lookahead || !can_compose) {
+            return false;
+        }
+        if (!this->random) {
+            this->random = std::make_shared<llama_nextn_random>();
+            if (!this->random->init(backend, 9*(kv->get_size() + 9))) {
+                this->random.reset();
+                return false;
+            }
+        }
+        if (source.spec->lookahead->random_epoch != source.spec->lookahead->epoch ||
+                this->random->epoch != source.spec->lookahead->epoch ||
+                this->random->seed != llama_sampler_get_seed(lctx.sampling.samplers.at(0)) || this->random->block != magic) {
+            if (!this->random->rebase(lctx.sampling.samplers.at(0), source.spec->lookahead->epoch, ubatch.pos[0], magic)) {
+                return false;
+            }
+            source.spec->lookahead->random_epoch = source.spec->lookahead->epoch;
+        }
+    }
     const bool tree = tree_enabled && eagle && !early && (n_max == 4 || n_max == 8) && chain.tree_scores.size() == (size_t) n_max - 1 &&
         kv->is_fixed_size() && (uint32_t) n_kv == kv->get_size() && can_compose;
     const int bank = 1 - this->target_bank;
@@ -583,6 +647,12 @@ bool llama_spec_pipeline::prefetch_nextn_target(llama_context & source) {
             this->targets[index] = std::make_unique<llama_nextn_target>();
         }
         auto & state = *this->targets[index];
+        auto random = stochastic ? this->random : nullptr;
+        if (state.random != random || state.magic != magic) {
+            state.build_controls.reset();
+            state.random = random;
+            state.magic = magic;
+        }
         if ((bool) state.tree != tree) {
             state.build_controls.reset();
             state.tree.reset();
@@ -724,6 +794,21 @@ bool llama_spec_pipeline::prefetch_nextn_target(llama_context & source) {
             }
             auto * accepted = ggml_cast(ctx, input.fields[llama_nextn_control::ACCEPTED], GGML_TYPE_F32);
             auto * positions = ggml_add(ctx, ggml_arange(ctx, 0, n, 1), base);
+            ggml_tensor * uniforms = nullptr;
+            ggml_tensor * recovery = nullptr;
+            if (random) {
+                auto * indices = ggml_cast(ctx, ggml_sub(ctx, positions, ggml_cast(ctx, random->base, GGML_TYPE_F32)), GGML_TYPE_I32);
+                if (magic) {
+                    // Block verification observes rejected suffix draws, so each round needs fresh uniforms.
+                    auto * offset = ggml_scale(ctx, ggml_cast(ctx, input.fields[llama_nextn_control::STEP], GGML_TYPE_F32), 9);
+                    indices = ggml_cast(ctx, ggml_add(ctx, ggml_arange(ctx, 0, n, 1), offset), GGML_TYPE_I32);
+                }
+                uniforms = ggml_reshape_1d(ctx, llama_spec_sampling::at(ctx, random->uniforms, indices), n);
+                recovery = ggml_reshape_1d(ctx, llama_spec_sampling::at(ctx, random->recovery, indices), n);
+                if (!llama_sampler_backend_set_uniforms(sampler, uniforms)) {
+                    return false;
+                }
+            }
             state.meta.tokens = input.tokens[n - 1];
             state.meta.kv_idxs = ggml_cast(ctx, positions, GGML_TYPE_I32);
             state.meta.positions = state.meta.kv_idxs;
@@ -753,6 +838,9 @@ bool llama_spec_pipeline::prefetch_nextn_target(llama_context & source) {
             }
             if (!lctx.model.build_graph(build_params)) {
                 state.controls.reset();
+                return false;
+            }
+            if (magic && !llama_spec_sampling::block_verify(*res, input.tokens[n - 1], uniforms, recovery)) {
                 return false;
             }
             if (tree) {
@@ -995,6 +1083,9 @@ bool llama_spec_pipeline::prefetch_nextn_target(llama_context & source) {
         LLAMA_LOG_INFO("%s: GPU NextN pipeline active; target submitted before CPU acceptance\n", __func__);
         if (tree) {
             LLAMA_LOG_INFO("%s: experimental EAGLE3 tree active (%d target rows, GPU path selection and KV commit)\n", __func__, n_max);
+        }
+        if (stochastic) {
+            LLAMA_LOG_INFO("%s: GPU MTP random sampling active (%s-indexed uniforms, magic_mtp=%d)\n", __func__, magic ? "round" : "position", (int) magic);
         }
         this->prefetch_reported = true;
     }
@@ -2365,6 +2456,9 @@ void llama_spec_pipeline::invalidate_graphs() {
 }
 
 void llama_spec_pipeline::add_memory_usage(std::map<ggml_backend_buffer_type_t, llama_memory_breakdown_data> & ret) const {
+    if (this->random && this->random->device) {
+        ret[ggml_backend_buffer_get_type(this->random->device.get())].compute += ggml_backend_buffer_get_size(this->random->device.get());
+    }
     std::set<const llama_nextn_graph *> graphs;
     auto add_graph = [&](const std::shared_ptr<llama_nextn_graph> & entry) {
         if (entry && !entry->logits.empty() &&

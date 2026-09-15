@@ -333,6 +333,7 @@ struct common_params_speculative_draft {
     bool gpu_pipeline = true;
     bool eagle3_tree = false;
     bool eagle3_tree_early_skip = true;
+    bool magic_mtp = false;
 
     common_params_model mparams;
 

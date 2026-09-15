@@ -101,6 +101,7 @@ LLAMA_API void llama_set_nextn_prefetch(struct llama_context * ctx, bool enabled
 // Experimental fixed-budget EAGLE3 tree verification in the GPU prefetch pipeline.
 LLAMA_API void llama_set_nextn_tree(struct llama_context * ctx, bool enabled);
 LLAMA_API void llama_set_nextn_tree_early_skip(struct llama_context * ctx, bool enabled);
+LLAMA_API void llama_set_nextn_magic_mtp(struct llama_context * ctx, bool enabled);
 
 // Resolve tree proposals after verification. Unused path rows force rejection at the bonus row.
 // Returns false for ordinary verification or a different draft width.

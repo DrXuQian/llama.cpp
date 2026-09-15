@@ -128,6 +128,7 @@ struct common_speculative_nextn_driver {
         llama_set_nextn_tree(params.ctx_tgt, tree);
         llama_set_nextn_tree(params.ctx_dft, tree);
         llama_set_nextn_tree_early_skip(params.ctx_dft, params.eagle3_tree_early_skip);
+        llama_set_nextn_magic_mtp(params.ctx_tgt, params.magic_mtp);
         const int n_cache = params.gpu_pipeline && n_seq == 1 && !synthetic &&
             params.p_min > 0.0f && params.n_max >= 2 && params.n_max <= 8 ? params.n_max + 1 : 0;
         llama_set_nextn_graph_cache(params.ctx_tgt, n_cache);

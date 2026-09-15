@@ -121,6 +121,7 @@ struct llama_context {
     void set_nextn_prefetch(bool enabled, bool fixed_kv = true);
     void set_nextn_tree(bool enabled);
     void set_nextn_tree_early_skip(bool enabled);
+    void set_nextn_magic_mtp(bool enabled);
     bool get_nextn_verified_draft(llama_token * tokens, int32_t n);
     void set_nextn_graph_cache(int32_t n_max);
     void set_embeddings_layer_inp(uint32_t lid, bool enable);

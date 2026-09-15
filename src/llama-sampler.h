@@ -39,6 +39,9 @@ uint32_t llama_sampler_backend_n_nodes(const llama_sampler * sampler);
 void llama_sampler_backend_begin(llama_sampler * sampler, uint32_t n_precomputed = 0);
 bool llama_sampler_backend_can_prefetch(const llama_sampler * sampler);
 bool llama_sampler_backend_same_config(const llama_sampler * a, const llama_sampler * b);
+// Stream 0 preserves dist draws; nonzero IDs select separate streams.
+bool llama_sampler_backend_export_uniforms(const llama_sampler * sampler, float * dst, size_t count, uint32_t stream);
+bool llama_sampler_backend_set_uniforms(llama_sampler * sampler, ggml_tensor * uniforms);
 
 struct llama_sampler * llama_sampler_init_dry_testing(
         float   dry_multiplier,

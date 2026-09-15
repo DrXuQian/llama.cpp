@@ -18,6 +18,7 @@ class llama_kv_cache_context;
 struct llama_nextn_handoff;
 struct llama_nextn_lookahead;
 struct llama_nextn_target;
+struct llama_nextn_random;
 
 struct llama_spec_pipeline {
     explicit llama_spec_pipeline(llama_context & context);
@@ -85,6 +86,7 @@ private:
     ggml_backend_ptr copy_backend;
     std::array<ggml_backend_event_ptr, 2> target_copied;
     std::array<std::unique_ptr<llama_nextn_target>, 20> targets;
+    std::shared_ptr<llama_nextn_random> random;
     llama_memory_context_ptr mctx;
     ggml_backend_event_ptr output_ready;
     bool output_pending = false;
@@ -95,5 +97,6 @@ private:
     bool prefetch_enabled = true;
     bool tree_enabled = false;
     bool tree_early_skip = true;
+    bool magic_mtp = false;
     bool prefetch_reported = false;
 };

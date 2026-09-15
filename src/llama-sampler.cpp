@@ -1135,9 +1135,10 @@ struct llama_sampler_dist : public llama_sampler_backend {
 
     // inputs for the current sampling graph
     std::vector<ggml_tensor *> inp_uniforms;
+    ggml_tensor * device_uniforms = nullptr;
 
     void copy_state(const llama_sampler_dist & src) {
-        // note: inp_uniforms and backend_transactional belong to the current sampling graph
+        // Uniform tensors and backend_transactional belong to the current sampling graph.
         seed_cur                  = src.seed_cur;
         rng                       = src.rng;
         rng_backend               = src.rng_backend;
@@ -1292,10 +1293,17 @@ static void llama_sampler_dist_backend_apply(
         return;
     }
 
-    ggml_tensor * inp_uniform = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
-    ggml_format_name(inp_uniform, "uniform_%zu", sctx->inp_uniforms.size());
-    ggml_set_input(inp_uniform);
-    sctx->inp_uniforms.push_back(inp_uniform);
+    ggml_tensor * inp_uniform;
+    if (sctx->device_uniforms) {
+        GGML_ASSERT(sctx->inp_uniforms.size() < (size_t) ggml_nelements(sctx->device_uniforms));
+        inp_uniform = ggml_view_1d(ctx, sctx->device_uniforms, 1, sctx->inp_uniforms.size()*sizeof(float));
+        sctx->inp_uniforms.push_back(nullptr);
+    } else {
+        inp_uniform = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
+        ggml_format_name(inp_uniform, "uniform_%zu", sctx->inp_uniforms.size());
+        ggml_set_input(inp_uniform);
+        sctx->inp_uniforms.push_back(inp_uniform);
+    }
 
     // flatten
     struct ggml_tensor * logits = ggml_reshape_1d(ctx, data->logits, ggml_nelements(data->logits));
@@ -1351,6 +1359,11 @@ static void llama_sampler_dist_backend_set_input(struct llama_sampler * smpl) {
     auto * sctx = (llama_sampler_dist *) smpl->ctx;
 
     GGML_ASSERT(!sctx->inp_uniforms.empty());
+
+    if (sctx->device_uniforms) {
+        sctx->n_backend_draws_generated += sctx->inp_uniforms.size();
+        return;
+    }
 
     // We sample in double precision and cast to float to match rnd numbers of
     // llama_sampler_dist which uses double precision (sampling from
@@ -1444,7 +1457,7 @@ void llama_sampler_backend_begin(llama_sampler * sampler, uint32_t n_precomputed
             ctx->n_backend_draws_generated = 0;
             ctx->n_backend_draws_committed = 0;
         }
-        // Preserve CPU RNG accounting when a deterministic GPU batch was queued early.
+        // Preserve CPU RNG accounting when a GPU batch was queued early.
         std::uniform_real_distribution<double> dist(0.0f, 1.0f);
         auto & rng = ctx->backend_transactional ? ctx->rng_backend : ctx->rng;
         for (uint32_t i = 0; i < n_precomputed; ++i) {
@@ -4381,13 +4394,55 @@ bool llama_sampler_backend_can_prefetch(const llama_sampler * sampler) {
         }
         return true;
     }
-    // The caller also requires one candidate per row, so dist cannot change the result.
+    // Stochastic prefetch supplies device uniforms to dist.
     const auto * iface = sampler->iface;
     return iface == &llama_sampler_empty_i || iface == &llama_sampler_greedy_i ||
         iface == &llama_sampler_dist_i || iface == &llama_sampler_top_k_i ||
         iface == &llama_sampler_top_p_i || iface == &llama_sampler_min_p_i ||
         iface == &llama_sampler_temp_i || iface == &llama_sampler_temp_ext_i ||
         iface == &llama_sampler_logit_bias_i;
+}
+
+bool llama_sampler_backend_set_uniforms(llama_sampler * sampler, ggml_tensor * uniforms) {
+    if (sampler->iface == &llama_sampler_chain_i) {
+        auto * chain = (llama_sampler_chain *) sampler->ctx;
+        for (auto & entry : chain->samplers) {
+            if (entry.is_backend && llama_sampler_backend_set_uniforms(entry.ptr, uniforms)) {
+                return true;
+            }
+        }
+    } else if (sampler->iface == &llama_sampler_dist_i) {
+        ((llama_sampler_dist *) sampler->ctx)->device_uniforms = uniforms;
+        return true;
+    }
+    return false;
+}
+
+bool llama_sampler_backend_export_uniforms(const llama_sampler * sampler, float * dst, size_t count, uint32_t stream) {
+    if (sampler->iface == &llama_sampler_chain_i) {
+        const auto * chain = (const llama_sampler_chain *) sampler->ctx;
+        for (const auto & entry : chain->samplers) {
+            if (entry.is_backend && llama_sampler_backend_export_uniforms(entry.ptr, dst, count, stream)) {
+                return true;
+            }
+        }
+    } else if (sampler->iface == &llama_sampler_dist_i) {
+        const auto & state = *(const llama_sampler_dist *) sampler->ctx;
+        auto rng = state.rng;
+        if (stream) {
+            std::seed_seq seed { uint32_t(rng()), uint32_t(rng()), uint32_t(rng()), uint32_t(rng()), uint32_t(0x4d545052), stream };
+            rng.seed(seed);
+        }
+        std::uniform_real_distribution<double> dist(0.0, 1.0);
+        for (size_t i = 0; i < count; ++i) {
+            dst[i] = float(dist(rng));
+            if (stream) {
+                dst[i] = std::max(std::numeric_limits<float>::min(), std::min(std::nextafter(1.0f, 0.0f), dst[i]));
+            }
+        }
+        return true;
+    }
+    return false;
 }
 
 bool llama_sampler_backend_same_config(const llama_sampler * a, const llama_sampler * b) {

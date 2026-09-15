@@ -1246,6 +1246,16 @@ bool llama_context::complete_nextn_draft() {
     return spec->complete_draft();
 }
 
+void llama_context::set_nextn_magic_mtp(bool enabled) {
+    if (spec->magic_mtp == enabled) {
+        return;
+    }
+    synchronize();
+    spec->magic_mtp = enabled;
+    spec->invalidate_graphs();
+    set_sched_need_reserve();
+}
+
 void llama_context::set_nextn_layer_offset(int32_t offset) {
     cparams.nextn_layer_offset = offset;
 }
@@ -4069,6 +4079,10 @@ void llama_set_nextn_tree(llama_context * ctx, bool enabled) {
 
 void llama_set_nextn_tree_early_skip(llama_context * ctx, bool enabled) {
     ctx->set_nextn_tree_early_skip(enabled);
+}
+
+void llama_set_nextn_magic_mtp(llama_context * ctx, bool enabled) {
+    ctx->set_nextn_magic_mtp(enabled);
 }
 
 bool llama_complete_nextn_draft(llama_context * ctx) {
