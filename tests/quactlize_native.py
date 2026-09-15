@@ -108,8 +108,12 @@ def selection(text, manifest, expected_ops=None):
             names = ("variant", "columns", "warps", "values", "split")
             config = {name:int(r.get(name, -1)) for name in names}
             inventory = manifest.get("execution_receipt", {}).get("simt_configs", {}).get(r.get("q"), [])
-            require(manifest.get("smallm_policy") and r.get("policy") in ("9", "10") and
-                    r.get("activation") == "FP16" and any(all(c.get(k)==v for k,v in config.items()) for c in inventory),
+            bf16 = r.get("activation") == "BF16"
+            compute = manifest.get("execution_receipt", {}).get("simt_compute_v2", {})
+            require(manifest.get("smallm_policy") and r.get("policy") in (("11",) if bf16 else ("9", "10")) and
+                    r.get("activation") in ("FP16", "BF16") and
+                    (not bf16 or (manifest.get("compute_contract") and "bf16" in compute.get("compute", []))) and
+                    any(all(c.get(k)==v for k,v in config.items()) for c in inventory),
                     "unbound small-M SIMT recipe")
         elif r["route"] in ("fq", "sf"):
             m = modules.get(r.get("build"))
@@ -118,6 +122,12 @@ def selection(text, manifest, expected_ops=None):
                 "selected parent/build not in package",
             )
             p = m["parent"]
+            compute = m["identity"].get("compute_type", "f16")
+            require(r.get("activation", "FP16") == ("BF16" if compute == "bf16" else "FP16"),
+                    "selected module compute type differs from caller")
+            if compute == "bf16":
+                require(manifest.get("compute_contract") and r.get("policy") == "11",
+                        "BF16 proposal relabeled as FP16 measurement")
             require(
                 int(r["q"]) == p["qtype"] and p["route"] == r["route"] + "-" + r["op"],
                 "route and parent differ",
@@ -179,6 +189,10 @@ def model_selection(args, text):
             require(hashlib.file_digest(stream, "sha256").hexdigest() == m["sha256"],
                     "selected module payload changed")
     evidence = selection(text, args.manifest | dict(modules=modules), getattr(args, "expected_ops", None))
+    if os.environ.get("QUACTLIZE_KPACK_COMPUTE") == "bf16":
+        for p in evidence["plans"]:
+            if p["op"] == "grouped" or int(p["rows"]) <= 8:
+                require(p.get("activation") == "BF16", "explicit BF16 request fell back to FP16 compute")
     evidence["modules"] = modules
     evidence["providers"] = provider_images(args, text, evidence["plans"])
     return evidence

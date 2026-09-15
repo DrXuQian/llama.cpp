@@ -15,6 +15,7 @@
 #include <set>
 #include <vector>
 #include <unistd.h>
+#include <cuda_bf16.h>
 
 namespace {
 enum class RouteMode { Auto, Fq, Sf, Gemv };
@@ -30,22 +31,36 @@ RouteMode route_mode() {
     return mode;
 }
 
-__global__ void gather(const float * src, half * dst, const int32_t * ids, int width, int64_t stride) {
+int compute_type(const ggml_tensor * input, const ggml_tensor * ids) {
+    static const bool bf16 = [] {
+        const char * s = getenv("QUACTLIZE_KPACK_COMPUTE");
+        if (!s || !*s || !strcmp(s, "fp16")) return false;
+        if (!strcmp(s, "bf16")) return true;
+        GGML_ABORT("[quactlize] QUACTLIZE_KPACK_COMPUTE must be fp16 or bf16");
+    }();
+    // All grouped M, plus dense decode. Dense prefill retains its existing
+    // FQ/SF/full-BF16 selection; this switch does not relabel those TC modules.
+    int64_t tokens = input->ne[1] * input->ne[2] * input->ne[3];
+    return bf16 && (ids || tokens <= 8) ? QK_COMPUTE_BF16 : QK_COMPUTE_F16;
+}
+const char * compute_name(int type) { return type == QK_COMPUTE_BF16 ? "BF16" : "FP16"; }
+
+template<class T> __global__ void gather(const float * src, T * dst, const int32_t * ids, int width, int64_t stride) {
     int64_t row = blockIdx.x;
     int64_t from = ids ? ids[row] : row;
-    for (int i = threadIdx.x; i < width; i += blockDim.x) dst[row * width + i] = __float2half(src[from * stride + i]);
+    for (int i = threadIdx.x; i < width; i += blockDim.x) dst[row * width + i] = T(src[from * stride + i]);
 }
-__global__ void scatter(const half * src, float * dst, const int32_t * ids, int width, int64_t stride) {
+template<class T> __global__ void scatter(const T * src, float * dst, const int32_t * ids, int width, int64_t stride) {
     int64_t row = blockIdx.x;
     int64_t to = ids ? ids[row] : row;
-    for (int i = threadIdx.x; i < width; i += blockDim.x) dst[to * stride + i] = __half2float(src[row * width + i]);
+    for (int i = threadIdx.x; i < width; i += blockDim.x) dst[to * stride + i] = float(src[row * width + i]);
 }
 
 size_t align256(size_t n) {
     GGML_ASSERT(n <= SIZE_MAX - 255);
     return (n + 255) & ~size_t(255);
 }
-using Key = std::array<uint64_t, 27>;
+using Key = std::array<uint64_t, 28>;
 struct Plan {
     const ggml_quactlize_execution_api * api;
     ggml_quactlize_artifact art{};
@@ -55,8 +70,8 @@ struct Plan {
     qkg_q4_decode_config_v1 q4_config{};
     qks_smallm_choice_v1 smallm{};
     void * handle = nullptr;
-    half * a = nullptr;
-    half * out = nullptr;
+    void * a = nullptr;
+    void * out = nullptr;
     uint16_t * scale = nullptr;
     uint16_t * zero = nullptr;
     uint64_t sf_plane_bytes = 0, units_bytes = 0;
@@ -68,6 +83,7 @@ struct Plan {
     bool q4_decode = false, q4_tc = false;
     bool reuse = false, table_tc = false;
     bool dense_io = false;
+    int compute = QK_COMPUTE_F16;
     void * full_handle = nullptr;
     int sf_config = -1;
     qzd_call_v1 expansion{};
@@ -177,7 +193,7 @@ Key make_key(const ggml_tensor * weight, const ggml_tensor * input, const ggml_t
         input->nb[1], input->nb[2], output->nb[1], output->nb[2],
         uint64_t(ids ? ids->ne[0] : 0), uint64_t(ids ? ids->ne[1] : 0), ids ? ids->nb[1] : 0,
         uint64_t(input->type), uint64_t(output->type), uint64_t(route_mode()),
-        uint64_t(output->ne[1]), uint64_t(output->ne[2]), uint64_t(slot)};
+        uint64_t(output->ne[1]), uint64_t(output->ne[2]), uint64_t(slot), uint64_t(compute_type(input, ids))};
 }
 
 Plan & prepare(ggml_backend_cuda_context & ctx, const ggml_tensor * weight,
@@ -210,6 +226,9 @@ Plan & prepare(ggml_backend_cuda_context & ctx, const ggml_tensor * weight,
     }
     auto p = std::make_unique<Plan>();
     p->api = owner.api; p->art = art; p->rows = tokens * topk; p->tokens = tokens; p->topk = topk;
+    p->compute = compute_type(input, ids);
+    if (p->compute == QK_COMPUTE_BF16 && !owner.api->query_compute)
+        GGML_ABORT("[quactlize] BF16 requested but the runtime has no explicit BF16 compute interface");
     const RouteMode mode = route_mode();
     // Auto uses an exact measured SIMT recipe when present; otherwise retain
     // the selected tensor-core path. Forced FQ/SF never consult this policy.
@@ -224,7 +243,19 @@ Plan & prepare(ggml_backend_cuda_context & ctx, const ggml_tensor * weight,
         c.ids_stride = ids ? ids->nb[1] / sizeof(int32_t) : 0; c.out_row_stride = art.n;
         c.a = input->data; c.low = art.low; c.high = art.high; c.units = art.units;
         c.ids = ids ? (const int32_t *) ids->data : nullptr; c.output = (float *) output->data; c.stream = stream;
-        if (mode == RouteMode::Auto && art.qtype == GGML_TYPE_Q4_K && owner.api->q4_select) {
+        if (p->compute == QK_COMPUTE_BF16 && tokens <= 8) {
+            qkg_simt_call_v2 typed{2, sizeof(typed), c, p->compute};
+            int rc = owner.api->query_smallm_compute(owner.runtime, &typed, &art.arrangement, &p->smallm);
+            if (rc != QKS_OK && rc != QKS_MISS)
+                GGML_ABORT("[quactlize] %s: BF16 decode query: %s", weight->name, owner.api->error());
+            if (rc == QKS_OK) {
+                p->direct = p->reuse = p->smallm.kind == QKS_SMALLM_SIMT;
+                p->table_tc = !p->direct;
+                if (p->table_tc) p->choice = p->smallm.tc;
+            }
+        } else if (p->compute == QK_COMPUTE_BF16) {
+            // Prefill uses the grouped TC compute interface below.
+        } else if (mode == RouteMode::Auto && art.qtype == GGML_TYPE_Q4_K && owner.api->q4_select) {
             qkg_sizes_v1 sizes{};
             int rc = owner.api->q4_select(&c, &art.arrangement, &p->q4_config, &sizes);
             if (rc != QKG_OK && rc != QKG_SHAPE)
@@ -253,7 +284,10 @@ Plan & prepare(ggml_backend_cuda_context & ctx, const ggml_tensor * weight,
     if (p->direct) {
         auto & c = p->gemv;
         qkg_sizes_v1 sizes{};
-        int rc = p->reuse ? owner.api->simt_query(&c, &p->smallm.simt, &art.arrangement, &sizes) :
+        qkg_simt_call_v2 typed{2, sizeof(typed), c, p->compute};
+        int rc = p->compute == QK_COMPUTE_BF16 ?
+            owner.api->simt_query_compute(&typed, &p->smallm.simt, &art.arrangement, &sizes) :
+            p->reuse ? owner.api->simt_query(&c, &p->smallm.simt, &art.arrangement, &sizes) :
             p->q4_decode ? owner.api->q4_select(&c, &art.arrangement, &p->q4_config, &sizes) :
             owner.api->gemv_query(&c, &p->gemv_config, &art.arrangement, &sizes);
         if (rc != QKG_OK) GGML_ABORT("[quactlize] %s: GEMV query failed rc=%d", weight->name, rc);
@@ -262,9 +296,9 @@ Plan & prepare(ggml_backend_cuda_context & ctx, const ggml_tensor * weight,
         if (p->reuse) {
             auto f = p->smallm.simt;
             GGML_LOG_INFO("[quactlize-plan] tensor=%s op=%s route=gemv reader=simt-reuse q=%d rows=%d n=%" PRId64 " k=%" PRId64
-                " variant=%d columns=%d warps=%d values=%d split=%d policy=%d activation=FP16 scale_resident=%d\n",
+                " variant=%d columns=%d warps=%d values=%d split=%d policy=%d activation=%s scale_resident=%d\n",
                 weight->name, ids ? "grouped" : "dense", art.qtype, p->rows, art.n, art.k,
-                f.variant, f.columns, f.warps, f.values, f.split, p->smallm.policy, int(art.qtype == GGML_TYPE_Q8_0));
+                f.variant, f.columns, f.warps, f.values, f.split, p->smallm.policy, compute_name(p->compute), int(art.qtype == GGML_TYPE_Q8_0));
         } else if (p->q4_decode) {
             auto f = p->q4_config;
             GGML_LOG_INFO("[quactlize-plan] tensor=%s op=%s route=gemv-q4-s1 q=%d rows=%d n=%" PRId64 " k=%" PRId64
@@ -280,13 +314,16 @@ Plan & prepare(ggml_backend_cuda_context & ctx, const ggml_tensor * weight,
             p->rows, int(art.n), int(art.k), int(art.experts), int(tokens), art.arrangement.mapping_id};
         p->dense_io = !ids && tokens <= 8 && owner.api->query_dense_io && owner.api->prepare_dense_io;
         auto query_tc = [&](bool decode = false) {
+            if (p->compute == QK_COMPUTE_BF16)
+                return owner.api->query_compute(owner.runtime, &r, p->compute, p->dense_io ? QKD_F32 : 0,
+                    int(decode), &p->choice);
             if (p->dense_io)
                 return owner.api->query_dense_io(owner.runtime, &r, QKD_F32, int(decode), &p->choice);
             return decode ? owner.api->query_decode(owner.runtime, &r, &p->choice) :
                             owner.api->query(owner.runtime, &r, &p->choice);
         };
         int status = p->table_tc ? QKS_OK : QKS_MISS;
-        if (mode == RouteMode::Auto && art.qtype == GGML_TYPE_Q4_K && owner.api->query_decode) {
+        if (p->compute == QK_COMPUTE_F16 && mode == RouteMode::Auto && art.qtype == GGML_TYPE_Q4_K && owner.api->query_decode) {
             status = query_tc(true);
             if (status != QKS_OK && status != QKS_MISS)
                 GGML_ABORT("[quactlize] %s: decode TC selection: %s", weight->name, owner.api->error());
@@ -294,7 +331,7 @@ Plan & prepare(ggml_backend_cuda_context & ctx, const ggml_tensor * weight,
         }
         int prefill_choice=-1;
         qks_prefill_choice_v1 prefill{};
-        if (!p->table_tc && !p->q4_tc && mode==RouteMode::Auto && tokens>1 && art.qtype!=GGML_TYPE_Q8_0) {
+        if (p->compute == QK_COMPUTE_F16 && !p->table_tc && !p->q4_tc && mode==RouteMode::Auto && tokens>1 && art.qtype!=GGML_TYPE_Q8_0) {
             if (owner.api->prefill_choice) {
                 int rc=owner.api->prefill_choice(&r,prefill_mask(owner.api,ids!=nullptr),&prefill);
                 if (rc!=QKS_OK && rc!=QKS_MISS) GGML_ABORT("[quactlize] prefill policy query failed rc=%d",rc);
@@ -343,9 +380,10 @@ Plan & prepare(ggml_backend_cuda_context & ctx, const ggml_tensor * weight,
             if (status != QKS_OK)
                 GGML_ABORT("[quactlize] %s: Q8 W8A16 selection: %s", weight->name, owner.api->error());
             p->sf = p->scale_resident = true;
-        } else if (mode == RouteMode::Sf || prefill_choice == 1) {
+        } else if (mode == RouteMode::Sf || prefill_choice == 1 ||
+                   (p->table_tc && !strncmp(p->choice.parent, "sf", 2))) {
             r.route = ids ? QK_GROUPED_SF : QK_DENSE_SF;
-            status = query_tc();
+            if (!p->table_tc) status = query_tc();
             if (status == QKS_OK) {
                 // Size query only. Values are expanded on the compute stream
                 // before every GEMM; no per-weight scale allocation or event.
@@ -373,6 +411,8 @@ Plan & prepare(ggml_backend_cuda_context & ctx, const ggml_tensor * weight,
             status = query_tc();
         }
         if (status == QKS_MISS) {
+            if (p->compute == QK_COMPUTE_BF16)
+                GGML_ABORT("[quactlize] %s: BF16 compute unavailable; refusing FP16 fallback: %s", weight->name, owner.api->error());
             p->legacy = true;
             GGML_LOG_INFO("[quactlize] %s: native policy miss, retain legacy K-pack FQ (%s)\n", weight->name, owner.api->error());
         } else {
@@ -390,7 +430,7 @@ Plan & prepare(ggml_backend_cuda_context & ctx, const ggml_tensor * weight,
             uint8_t * storage = slot ? owner.private_storage(head + p->choice.workspace_bytes) :
                 owner.storage(stream, head + p->choice.workspace_bytes);
             if (!p->dense_io) {
-                p->a = (half *) storage; p->out = (half *) (storage + a_bytes);
+                p->a = storage; p->out = storage + a_bytes;
             }
             if (p->sf && !p->scale_resident) {
                 p->scale = (uint16_t *) (storage + scale_offset);
@@ -416,8 +456,14 @@ Plan & prepare(ggml_backend_cuda_context & ctx, const ggml_tensor * weight,
             c.workspace = p->choice.workspace_bytes ? storage + head : nullptr;
             c.workspace_bytes = p->choice.workspace_bytes; c.stream = stream;
             qkd_dense_call_v1 typed{1,sizeof(typed),c,QKD_F32,QKD_F32};
-            int prepare_rc = p->dense_io ? owner.api->prepare_dense_io(owner.runtime, &p->choice, &typed, &p->handle) :
-                owner.api->prepare(owner.runtime, &p->choice, &c, &p->handle);
+            int prepare_rc;
+            if (p->compute == QK_COMPUTE_BF16) {
+                qkd_dense_call_v2 dense{2,sizeof(dense),typed,p->compute};
+                qk_compute_device_call_v3 grouped{3,sizeof(grouped),{2,sizeof(qk_device_call_v2),c,int(tokens),0},p->compute};
+                prepare_rc = p->dense_io ? owner.api->prepare_dense_compute(owner.runtime, &p->choice, &dense, &p->handle) :
+                    owner.api->prepare_compute(owner.runtime, &p->choice, &grouped, &p->handle);
+            } else prepare_rc = p->dense_io ? owner.api->prepare_dense_io(owner.runtime, &p->choice, &typed, &p->handle) :
+                    owner.api->prepare(owner.runtime, &p->choice, &c, &p->handle);
             if (prepare_rc != QKS_OK)
                 GGML_ABORT("[quactlize] %s: native prepare: %s", weight->name, owner.api->error());
             if (ids && owner.api->bind_indexed) {
@@ -434,9 +480,9 @@ Plan & prepare(ggml_backend_cuda_context & ctx, const ggml_tensor * weight,
                     weight->name,int(p->indexed),int(p->indexed));
             }
             GGML_LOG_INFO("[quactlize-plan] tensor=%s op=%s route=%s q=%d rows=%d n=%" PRId64 " k=%" PRId64
-                " parent=%s build=%s algorithm=%d split=%d grid=%d policy=%d prefill_choice=%d activation=FP16 scale_resident=%d\n", weight->name, ids ? "grouped" : "dense",
+                " parent=%s build=%s algorithm=%d split=%d grid=%d policy=%d prefill_choice=%d activation=%s scale_resident=%d\n", weight->name, ids ? "grouped" : "dense",
                 p->sf ? "sf" : "fq", art.qtype, p->rows, art.n, art.k, p->choice.parent, p->choice.build_key,
-                p->choice.algorithm, p->choice.split, p->choice.grid, p->choice.policy, prefill_choice, int(p->scale_resident));
+                p->choice.algorithm, p->choice.split, p->choice.grid, p->choice.policy, prefill_choice, compute_name(p->compute), int(p->scale_resident));
             if (p->dense_io)
                 GGML_LOG_INFO("[quactlize-adapter] tensor=%s dense_io=FP32 standalone_adapters=0\n", weight->name);
         }
@@ -489,6 +535,16 @@ MoePlan * prepare_moe(ggml_backend_cuda_context & ctx, const ggml_cgraph * graph
         else e.simt_config=&p->gemv_config;
     }
     auto create_mixed = [&] {
+        if (plans[0]->compute == QK_COMPUTE_BF16) {
+            qks_moe_endpoint_v4 typed[3]{};
+            for (int j=0;j<3;++j) if (plans[j]) {
+                if (plans[j]->compute != plans[0]->compute)
+                    GGML_ABORT("[quactlize] mixed compute types in one MoE chain");
+                typed[j]={4,sizeof(typed[j]),endpoints[j],plans[j]->compute};
+            }
+            return owner->api->moe_create_compute(owner->runtime,&typed[0],
+                plans[1]?&typed[1]:nullptr,&typed[2],&result->handle);
+        }
         if (owner->api->moe_create_reuse)
             return owner->api->moe_create_reuse(owner->runtime,&endpoints[0],
                 plans[1]?&endpoints[1]:nullptr,&endpoints[2],&result->handle);
@@ -500,7 +556,7 @@ MoePlan * prepare_moe(ggml_backend_cuda_context & ctx, const ggml_cgraph * graph
         return owner->api->moe_create_mixed(owner->runtime,&legacy[0],
             plans[1]?&legacy[1]:nullptr,&legacy[2],&result->handle);
     };
-    int rc=result->simt_mask ? create_mixed() :
+    int rc=(result->simt_mask || plans[0]->compute == QK_COMPUTE_BF16) ? create_mixed() :
         owner->api->moe_create(plans[0]->handle,plans[1]?plans[1]->handle:nullptr,plans[2]->handle,&result->handle);
     if (rc==QKS_MISS) return nullptr;
     if (rc!=QKS_OK) GGML_ABORT("[quactlize] MoE chain preparation: %s",owner->api->error());
@@ -512,9 +568,9 @@ MoePlan * prepare_moe(ggml_backend_cuda_context & ctx, const ggml_cgraph * graph
         if (rc==QKS_MISS) return nullptr;
         if (rc!=QKS_OK) GGML_ABORT("[quactlize] MoE finish binding: %s",owner->api->error());
     }
-    GGML_LOG_INFO("[quactlize-moe] gate=%s down=%s merged=%d rows=%d simt_mask=%u shared_prepare=1 swiglu_to_down=1 reduce_scatter=%d weighted_sum_finish=%d\n",
+    GGML_LOG_INFO("[quactlize-moe] gate=%s down=%s merged=%d rows=%d simt_mask=%u shared_prepare=1 swiglu_to_down=1 reduce_scatter=%d weighted_sum_finish=%d activation=%s\n",
         match.gate->src[0]->name,match.down->src[0]->name,int(!match.up),plans[0]->rows,result->simt_mask,
-        int(!(result->simt_mask&4)),int(match.finish!=nullptr));
+        int(!(result->simt_mask&4)),int(match.finish!=nullptr),compute_name(plans[0]->compute));
     auto * pointer=result.get(); owner->moe_plans.emplace(key,std::move(result)); return pointer;
 }
 } // namespace
@@ -603,7 +659,10 @@ bool ggml_quactlize_execution_run(ggml_backend_cuda_context & ctx, const ggml_te
             p.units_bytes, p.scale, p.zero, p.sf_plane_bytes, &p.art.arrangement, stream) != QKG_OK)
         GGML_ABORT("[quactlize] %s: per-call SF prepass failed", weight->name);
     if (p.direct) {
-        int rc = p.reuse ? p.api->simt_run(&p.gemv, &p.smallm.simt, &p.art.arrangement) :
+        qkg_simt_call_v2 typed{2,sizeof(typed),p.gemv,p.compute};
+        int rc = p.compute == QK_COMPUTE_BF16 ?
+            p.api->simt_run_compute(&typed, &p.smallm.simt, &p.art.arrangement) :
+            p.reuse ? p.api->simt_run(&p.gemv, &p.smallm.simt, &p.art.arrangement) :
             p.q4_decode ? p.api->q4_run(&p.gemv, &p.q4_config, &p.art.arrangement) :
             p.api->gemv_run(&p.gemv, &p.gemv_config, &p.art.arrangement);
         if (rc != QKG_OK)
@@ -638,10 +697,14 @@ bool ggml_quactlize_execution_run(ggml_backend_cuda_context & ctx, const ggml_te
             p.art.experts, p.tokens, p.topk, input->ne[1], ids->nb[1] / sizeof(int32_t), input->nb[2] / input->nb[1], false, stream);
         CUDA_CHECK(cudaGetLastError());
     }
-    gather<<<p.rows, 256, 0, stream>>>((const float *) input->data, p.a, p.ids_src, p.art.k, input->nb[1] / sizeof(float));
+    if (p.compute == QK_COMPUTE_BF16)
+        gather<<<p.rows, 256, 0, stream>>>((const float *) input->data, (__nv_bfloat16 *) p.a, p.ids_src, p.art.k, input->nb[1] / sizeof(float));
+    else gather<<<p.rows, 256, 0, stream>>>((const float *) input->data, (half *) p.a, p.ids_src, p.art.k, input->nb[1] / sizeof(float));
     CUDA_CHECK(cudaGetLastError());
     if (p.api->run(p.handle, stream) != QKS_OK) GGML_ABORT("[quactlize] %s: native GEMM launch failed", weight->name);
-    scatter<<<p.rows, 256, 0, stream>>>(p.out, (float *) output->data, p.ids_dst, p.art.n, output->nb[1] / sizeof(float));
+    if (p.compute == QK_COMPUTE_BF16)
+        scatter<<<p.rows, 256, 0, stream>>>((const __nv_bfloat16 *) p.out, (float *) output->data, p.ids_dst, p.art.n, output->nb[1] / sizeof(float));
+    else scatter<<<p.rows, 256, 0, stream>>>((const half *) p.out, (float *) output->data, p.ids_dst, p.art.n, output->nb[1] / sizeof(float));
     CUDA_CHECK(cudaGetLastError());
     ggml_ncp_route_log(output, p.sf ? "so-quactlize-kpack-sf" : "so-quactlize-kpack-fq-selected", nullptr);
     return true;

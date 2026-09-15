@@ -12,6 +12,7 @@ enum { QK_OK = 0, QK_UNSUPPORTED = 1, QK_INVALID = 2,
        QK_RUNTIME_ERROR = 3, QK_INITIALIZE_ERROR = 4 };
 enum { QK_DENSE_FQ = 0, QK_DENSE_SF = 1, QK_GROUPED_FQ = 2, QK_GROUPED_SF = 3 };
 enum { QK_ORDINARY = 0, QK_PERSISTENT = 1 };
+enum { QK_COMPUTE_F16=0, QK_COMPUTE_BF16=1 };
 
 typedef struct {
   uint32_t version, size;
@@ -55,6 +56,17 @@ typedef struct {
 } qk_device_call_v2;
 
 typedef struct {
+  uint32_t version,size;
+  qk_device_call_v2 device_call;
+  int32_t compute_type;
+} qk_compute_device_call_v3;
+typedef struct {
+  uint32_t version,size;
+  qk_identity_v1 const* parent;
+  int32_t compute_type;
+} qk_compute_identity_v3;
+
+typedef struct {
   uint32_t version, size;
   int32_t algorithm, split, grid;
 } qk_recipe_v1;
@@ -82,6 +94,15 @@ int quactlize_kpack_grouped_query_v2(qk_device_call_v2 const*, qk_recipe_v1 cons
 int quactlize_kpack_grouped_prepare_v2(qk_device_call_v2 const*, qk_recipe_v1 const*, void**);
 // v2 handles use the existing run_v1/destroy_v1 lifecycle. This does not
 // grant unmeasured any-M or performance admission to a particular parent.
+
+// Explicit compute successor. A/output are contiguous BF16 for BF16 compute
+// or FP16 for FP16 compute; metadata is ALWAYS the original FP16/packed-unit
+// representation. F32 llama endpoints use the fused indexed/MoE adapters.
+// BF16 modules reject v1/v2 preparation, so old callers cannot reinterpret
+// their pointers through a changed compute contract.
+qk_compute_identity_v3 const* quactlize_kpack_compute_identity_v3(void);
+int quactlize_kpack_grouped_query_v3(qk_compute_device_call_v3 const*,qk_recipe_v1 const*,qk_resources_v1*);
+int quactlize_kpack_grouped_prepare_v3(qk_compute_device_call_v3 const*,qk_recipe_v1 const*,void**);
 
 #ifdef __cplusplus
 }
