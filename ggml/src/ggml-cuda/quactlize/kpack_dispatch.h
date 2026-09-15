@@ -3,6 +3,7 @@
 #include "kpack_indexed.h"
 #include "kpack_decode_io.h"
 #include "kpack_q4_decode.h"
+#include "kpack_simt.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -12,7 +13,8 @@ enum { QKS_OK = 0, QKS_MISS = 1, QKS_INVALID = 2, QKS_BINDING = 3,
        QKS_RUNTIME = 4 };
 enum { QKS_RECENT = 1, QKS_HISTORICAL = 2, QKS_PREDICTED = 3,
        QKS_DEVICE_BOUNDS = 4, QKS_MEASURED_GROUPED = 5, QKS_Q8_INITIAL = 6,
-       QKS_DECODE_MEASURED = 7, QKS_COMPONENT_MEASURED = 8 };
+       QKS_DECODE_MEASURED = 7, QKS_COMPONENT_MEASURED = 8,
+       QKS_SMALLM_EXACT = 9, QKS_SMALLM_BUCKET = 10 };
 
 // Additive Q8_0/W8A16 intake capability, without a device/context or JIT.
 // Returns 1 for supported weight geometry and SF route (1=dense,3=grouped).
@@ -35,6 +37,24 @@ typedef struct {
     int32_t policy, algorithm, split, grid, device, compute_units;
     char parent[192], build_key[65];
 } qks_choice_v1;
+
+enum { QKS_SMALLM_TC = 0, QKS_SMALLM_SIMT = 1 };
+typedef struct {
+    uint32_t version,size;
+    int32_t kind,policy,source_n,source_k,source_tokens;
+    qkg_simt_config_v1 simt;
+    qkg_sizes_v1 sizes;
+    qks_choice_v1 tc;
+} qks_smallm_choice_v1;
+// Auto decode only: exact table, then same-format/operator logarithmic bucket.
+// Dense F32 endpoints M1..8, or indexed E256/top8 tokens1..8, channels1 or8.
+// No tuning or device ID readback. A TC choice may JIT/load its selected parent;
+// prepare remains outside graph capture. SIMT includes its real F32 reducer.
+// EXACT describes the request key, not a common-cohort performance guarantee.
+// BUCKET is predicted; source_* identify the donor. Q4's joint board is unchanged
+// and returns MISS here. A miss retains the caller's existing legal K-pack route.
+int quactlize_kpack_dispatch_query_smallm_v1(void* runtime,qkg_call_v1 const*,
+    quactlize_ppu_placed_arrangement_v2 const*,qks_smallm_choice_v1*);
 
 typedef struct {
     uint32_t version, size;
@@ -116,7 +136,33 @@ typedef struct {
 int quactlize_kpack_dispatch_moe_simt_scratch_v1(void* runtime,qkg_call_v1 const*,uint64_t*);
 int quactlize_kpack_dispatch_moe_create_v2(void* runtime,qks_moe_endpoint_v2 const* gate,
     qks_moe_endpoint_v2 const* up,qks_moe_endpoint_v2 const* down,void** chain);
-// Both chain versions use the same run/router/destroy entries. Mixed chains
+// Additive all-format register-reuse reader. Exactly one of q4_config,
+// simt_config (legacy generic) and reuse_config is present for a SIMT endpoint.
+// Recipes are explicit, not selected here. Token 1..8; canonical bytes and
+// the existing F16-activation/F32-output arithmetic contract are unchanged.
+// A Split-K SIMT call retains its own disjoint workspace from simt_query_v1,
+// in addition to the projection scratch from moe_simt_scratch_v1. Both remain
+// live until device completion. v2 callers and automatic Q4 policy are unchanged.
+typedef struct {
+    uint32_t version,size;
+    void* tc_handle;
+    qkg_call_v1 const* simt_call;
+    qkg_q4_decode_config_v1 const* q4_config;
+    qkg_config_v1 const* simt_config;
+    quactlize_ppu_placed_arrangement_v2 const* arrangement;
+    void* scratch;
+    uint64_t scratch_bytes;
+    qkg_simt_config_v1 const* reuse_config;
+} qks_moe_endpoint_v3;
+int quactlize_kpack_dispatch_moe_create_v3(void* runtime,qks_moe_endpoint_v3 const* gate,
+    qks_moe_endpoint_v3 const* up,qks_moe_endpoint_v3 const* down,void** chain);
+// Optional once-only binding outside capture. Loads the small finish module,
+// validates disjoint live inputs, and copies the immutable output contract.
+// On success run writes finish.output, not the intermediate down tensor.
+// A miss leaves the chain unchanged. No qtype/layout/config selection changes.
+int quactlize_kpack_dispatch_moe_bind_finish_v1(void* runtime,void* chain,
+    qk_llama_moe_finish_v1 const*);
+// All chain versions use the same run/router/destroy entries. Mixed chains
 // retain SIMT F32 results and TC FP16 completion semantics through SwiGLU.
 int quactlize_kpack_dispatch_moe_run_v1(void* chain,void* stream);
 // Same chain, but router+preparation are one kernel. The caller must match the

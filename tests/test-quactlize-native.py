@@ -115,6 +115,24 @@ target_link_libraries(test_moe PRIVATE ncp_moe)
         self.assertTrue(selection(text, dict(modules=[]), ["dense"])["fully_selected"])
         self.assertFalse(selection(text, dict(modules=[]), ["dense", "grouped"])["fully_selected"])
 
+    def test_smallm_simt_recipe_requires_library_inventory_and_policy(self):
+        config = dict(variant=1, columns=4, warps=8, values=2, split=1)
+        manifest = dict(modules=[], smallm_policy=dict(path="smallm-policy.json"),
+                        execution_receipt=dict(simt_configs={"8": [config]}))
+        text = ("[quactlize-plan] tensor=w op=dense route=gemv reader=simt-reuse q=8 "
+                "variant=1 columns=4 warps=8 values=2 split=1 policy=9 activation=FP16")
+        self.assertTrue(selection(text, manifest, ["dense"])["fully_selected"])
+        self.assertTrue(selection(text.replace("policy=9", "policy=10"), manifest, ["dense"])["fully_selected"])
+        for old, new in (("q=8", "q=14"), ("variant=1", "variant=3"), ("values=2", "values=8"),
+                         ("split=1", "split=8"), ("policy=9", "policy=1"), ("FP16", "BF16")):
+            with self.subTest(new=new), self.assertRaisesRegex(ValueError, "unbound small-M"):
+                selection(text.replace(old, new), manifest, ["dense"])
+        for field in ("smallm_policy", "execution_receipt"):
+            wrong = copy.deepcopy(manifest)
+            del wrong[field]
+            with self.assertRaisesRegex(ValueError, "unbound small-M"):
+                selection(text, wrong, ["dense"])
+
     def test_trace_tensor_inventory_uses_exact_names_including_dense_q8(self):
         names = ["blk.0.attn_q.weight", "blk.0.ffn_gate_exps.weight", "output.weight"]
         pattern = native.inventory_pattern(dict(eligible=names))

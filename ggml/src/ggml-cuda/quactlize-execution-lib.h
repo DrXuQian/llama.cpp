@@ -23,7 +23,9 @@ struct ggml_quactlize_execution_api {
     decltype(&quactlize_kpack_dispatch_moe_run_router_v1) moe_run_router;
     decltype(&quactlize_kpack_dispatch_moe_destroy_v1) moe_destroy;
     decltype(&quactlize_kpack_dispatch_moe_create_v2) moe_create_mixed;
+    decltype(&quactlize_kpack_dispatch_moe_create_v3) moe_create_reuse;
     decltype(&quactlize_kpack_dispatch_moe_simt_scratch_v1) moe_simt_scratch;
+    decltype(&quactlize_kpack_dispatch_moe_bind_finish_v1) moe_bind_finish;
     decltype(&quactlize_kpack_q4_decode_select_v1) q4_select;
     decltype(&quactlize_kpack_q4_decode_run_v1) q4_run;
     decltype(&quactlize_kpack_dispatch_query_decode_v1) query_decode;
@@ -40,6 +42,9 @@ struct ggml_quactlize_execution_api {
     decltype(&quactlize_kpack_prefill_destroy_v1) full_destroy;
     decltype(&quactlize_kpack_prefill_error_v1) full_error;
     decltype(&quactlize_kpack_prefill_provider_image_v1) full_image;
+    decltype(&quactlize_kpack_dispatch_query_smallm_v1) query_smallm;
+    decltype(&quactlize_kpack_simt_query_v1) simt_query;
+    decltype(&quactlize_kpack_simt_run_v1) simt_run;
 };
 
 // QUACTLIZE_KPACK_EXECUTION names the complete native package. An explicit

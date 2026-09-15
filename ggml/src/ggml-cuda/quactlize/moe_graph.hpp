@@ -9,7 +9,43 @@ struct MoeGraph {
     ggml_tensor * up = nullptr;
     ggml_tensor * down = nullptr;
     int count = 0;
+    ggml_tensor * weights = nullptr;
+    ggml_tensor * finish = nullptr;
 };
+
+inline MoeGraph extend_moe_finish(ggml_cgraph const * graph,int start,MoeGraph base) {
+    auto * down=base.down;
+    if (!down || down->ne[1]!=8 || down->ne[2]<1 || down->ne[2]>8) return base;
+    int next=start+base.count;
+    if (next+16>graph->n_nodes) return base;
+    auto * mul=graph->nodes[next];
+    if (mul->op!=GGML_OP_MUL || mul->src[0]!=down || !ggml_is_contiguous(mul)) return base;
+    auto * weights=mul->src[1];
+    if (!weights || weights->type!=GGML_TYPE_F32 || !ggml_is_contiguous(weights) ||
+        weights->ne[0]!=1 || weights->ne[1]!=8 || weights->ne[2]!=down->ne[2] || weights->ne[3]!=1)
+        return base;
+    ggml_tensor * views[8];
+    for (int slot=0;slot<8;++slot) {
+        auto * view=graph->nodes[next+1+slot];views[slot]=view;
+        if (view->op!=GGML_OP_VIEW || view->type!=GGML_TYPE_F32 || view->view_src!=mul ||
+            view->view_offs!=size_t(slot)*mul->nb[1] || view->ne[0]!=down->ne[0] ||
+            view->ne[1]!=down->ne[2] || view->ne[2]!=1 || view->ne[3]!=1 ||
+            view->nb[0]!=sizeof(float) || view->nb[1]!=mul->nb[2]) return base;
+    }
+    auto * result=views[0];
+    for (int slot=1;slot<8;++slot) {
+        auto * add=graph->nodes[next+8+slot];
+        if (add->op!=GGML_OP_ADD || add->src[0]!=result || add->src[1]!=views[slot] ||
+            add->type!=GGML_TYPE_F32 || !ggml_is_contiguous(add)) return base;
+        result=add;
+    }
+    int count=base.count+16,output=start+count-1;
+    std::vector<ggml_op> ops;
+    for (int i=0;i<count;++i) ops.push_back(graph->nodes[start+i]->op);
+    if (!ggml_can_fuse_subgraph(graph,start,count,ops.data(),&output,1)) return base;
+    base.count=count;base.weights=weights;base.finish=result;
+    return base;
+}
 
 inline MoeGraph match_moe(ggml_cgraph const * graph, int start) {
     if (!graph || start < 0 || start + 4 > graph->n_nodes) return {};
@@ -55,7 +91,7 @@ inline MoeGraph match_moe(ggml_cgraph const * graph, int start) {
     int output = start+match.count-1;
     // Views and intermediate projections must have no outside consumers.
     if (!ggml_can_fuse_subgraph(graph,start,match.count,ops,&output,1)) return {};
-    return match;
+    return extend_moe_finish(graph,start,match);
 }
 
 struct MoeRouterSpan {

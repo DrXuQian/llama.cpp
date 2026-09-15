@@ -33,6 +33,17 @@ typedef struct {
   float *weights;
 } qk_llama_router_v1;
 
+// Optional closed MoE tail: completed down -> per-slot F32 multiply ->
+// left-to-right slot sum. Strides count F32 elements. Tokens1..8, topk=8.
+// Intermediate down/weighted rows must have no outside graph consumers.
+// Preserve TC's FP16 completion before multiplying; never contract into FMA.
+typedef struct {
+  uint32_t version, size;
+  int64_t weights_stride, output_stride;
+  float const* weights;
+  float* output;
+} qk_llama_moe_finish_v1;
+
 #ifdef __cplusplus
 extern "C" {
 #endif
