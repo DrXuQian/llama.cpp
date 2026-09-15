@@ -30,6 +30,7 @@ struct llama_spec_pipeline {
     bool decode_nextn_prefetch(llama_context & source, const llama_batch & batch, int n_draft, float p_min);
     bool decode_nextn(const llama_batch & seed, int32_t n_draft, bool prefetch, float p_min);
     int32_t nextn_draft_length();
+    bool complete_draft();
     bool verified_draft(llama_token * tokens, int32_t n);
 
 private:
@@ -93,5 +94,6 @@ private:
     bool target_consume = false;
     bool prefetch_enabled = true;
     bool tree_enabled = false;
+    bool tree_early_skip = true;
     bool prefetch_reported = false;
 };

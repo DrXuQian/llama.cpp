@@ -1232,6 +1232,20 @@ bool llama_context::get_nextn_verified_draft(llama_token * tokens, int32_t n) {
     return spec->verified_draft(tokens, n);
 }
 
+void llama_context::set_nextn_tree_early_skip(bool enabled) {
+    if (spec->tree_early_skip == enabled) {
+        return;
+    }
+    synchronize();
+    spec->tree_early_skip = enabled;
+    spec->invalidate_graphs();
+    set_sched_need_reserve();
+}
+
+bool llama_context::complete_nextn_draft() {
+    return spec->complete_draft();
+}
+
 void llama_context::set_nextn_layer_offset(int32_t offset) {
     cparams.nextn_layer_offset = offset;
 }
@@ -4051,6 +4065,14 @@ void llama_set_nextn_prefetch(llama_context * ctx, bool enabled, bool fixed_kv) 
 
 void llama_set_nextn_tree(llama_context * ctx, bool enabled) {
     ctx->set_nextn_tree(enabled);
+}
+
+void llama_set_nextn_tree_early_skip(llama_context * ctx, bool enabled) {
+    ctx->set_nextn_tree_early_skip(enabled);
+}
+
+bool llama_complete_nextn_draft(llama_context * ctx) {
+    return ctx->complete_nextn_draft();
 }
 
 bool llama_get_nextn_verified_draft(llama_context * ctx, llama_token * tokens, int32_t n) {

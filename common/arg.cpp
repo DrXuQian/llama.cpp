@@ -4162,6 +4162,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
+        {"--no-spec-eagle3-tree-early-skip"},
+        "disable GPU upper-bound early skip for EAGLE3 trees with draft-n-max 7",
+        [](common_params & params) {
+            params.speculative.draft.eagle3_tree_early_skip = false;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
         {"--no-spec-gpu-pipeline"},
         "disable automatic GPU acceptance and prefetch for MTP and EAGLE3",
         [](common_params & params) {

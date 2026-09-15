@@ -100,6 +100,7 @@ LLAMA_API void llama_set_nextn_prefetch(struct llama_context * ctx, bool enabled
 
 // Experimental fixed-budget EAGLE3 tree verification in the GPU prefetch pipeline.
 LLAMA_API void llama_set_nextn_tree(struct llama_context * ctx, bool enabled);
+LLAMA_API void llama_set_nextn_tree_early_skip(struct llama_context * ctx, bool enabled);
 
 // Resolve tree proposals after verification. Unused path rows force rejection at the bonus row.
 // Returns false for ordinary verification or a different draft width.
@@ -113,6 +114,8 @@ LLAMA_API void llama_set_nextn_graph_cache(struct llama_context * ctx, int32_t n
 LLAMA_API bool llama_decode_nextn(struct llama_context * ctx, struct llama_batch batch, int32_t n_draft);
 LLAMA_API bool llama_decode_nextn_early(struct llama_context * ctx, struct llama_batch batch, int32_t n_draft, float p_min);
 LLAMA_API int32_t llama_get_nextn_draft_length(struct llama_context * ctx);
+// Materialize skipped heads before a chain fallback. A consumed tree resolves its path separately.
+LLAMA_API bool llama_complete_nextn_draft(struct llama_context * ctx);
 
 // Queue a single-sequence MTP or EAGLE3 catch-up from the target's GPU hidden states.
 // MTP uses batch.embd for its carry row; its snapshot is ready after synchronizing source.

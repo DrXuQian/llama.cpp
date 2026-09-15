@@ -76,6 +76,13 @@ struct llama_nextn_graph {
     std::vector<ggml_tensor *> candidates;
     std::vector<ggml_tensor *> logits;
     std::vector<ggml_tensor *> tree_scores;
+    std::vector<ggml_tensor *> tree_predicates;
+    ggml_tensor * tree_score_storage = nullptr;
+    ggml_tensor * tree_ids = nullptr;
+    ggml_tensor * tree_logits = nullptr;
+    ggml_tensor * tree_counts = nullptr;
+    bool tree_skip = false;
+    bool tree_verified = false;
     bool composed = false;
     bool prefetch = false;
     bool prefetched = false;
@@ -864,6 +871,10 @@ bool llama_spec_pipeline::prefetch_nextn_target(llama_context & source) {
     ggml_tensor executed = count;
     if (early) {
         executed.data = (int32_t *) executed.data + 1;
+    } else if (chain.tree_skip) {
+        executed = *chain.tree_counts;
+        executed.ne[0] = 1;
+        executed.data = (int32_t *) executed.data + 1;
     }
     const auto & previous = *chain.input;
     std::vector<const ggml_tensor *> tensors = { &position, chain.accepted, &count, &executed,
@@ -1059,6 +1070,9 @@ bool llama_spec_pipeline::decode_nextn_verify(llama_context & source, const llam
             for (int i = 0; consume_target && i < batch.pos[0]; ++i) {
                 consume_target = cells.seq_has(i, 0) && cells.pos_get(i) == i;
             }
+            if (consume_target && prepared.tree) {
+                LLAMA_LOG_DEBUG("%s: GPU tree draft executed %d/%d heads\n", __func__, control[llama_nextn_control::EXECUTED], n - 1);
+            }
         }
     }
     if (n == 1) {
@@ -1104,6 +1118,9 @@ bool llama_spec_pipeline::decode_nextn_verify(llama_context & source, const llam
         destinations.push_back((llama_token *) input->data + i);
     }
     if (!consume_target) {
+        if (!source.spec->complete_draft()) {
+            return false;
+        }
         ggml_backend_event_record(state.consumed.get(), dst_backend);
         ggml_backend_event_wait(src_backend, state.consumed.get());
         if (!get_batch(src_backend, tensors.data(), destinations.data(), tensors.size())) {
@@ -1117,6 +1134,8 @@ bool llama_spec_pipeline::decode_nextn_verify(llama_context & source, const llam
     *result = lctx.decode(batch);
     this->verify_input = nullptr;
     this->target_consume = false;
+    source.spec->graph->tree_verified = *result == 0 && consume_target && this->target_active >= 0 &&
+        (bool) this->targets[this->target_active]->tree;
     source.synchronize(true);
     for (int i = 0; i < n - 1; i++) {
         batch.token[i + 1] = source.get_sampled_candidates_ith(i)[0];
@@ -1569,6 +1588,7 @@ bool llama_spec_pipeline::prepare_draft_graph(llama_nextn_graph & chain,
     const bool eagle = lctx.model.arch == LLM_ARCH_EAGLE3;
     const auto seq_id = contexts[0]->get_ubatch().seq_id[0][0];
     const bool tree = tree_enabled && eagle && prefetch && (n_draft == 3 || n_draft == 7) && p_min == 0.0f && lctx.model.vocab.n_tokens() >= 10;
+    const bool skip = tree && tree_early_skip && chain.composed && n_draft == 7;
     auto * res = chain.res.get();
     auto params_for = [&](int i) {
         auto params = lctx.graph_params(res, contexts[i]->get_ubatch(), contexts[i].get(), lctx.ctx_type_to_graph_type(lctx.cparams.ctx_type));
@@ -1590,7 +1610,7 @@ bool llama_spec_pipeline::prepare_draft_graph(llama_nextn_graph & chain,
     };
     bool reuse = !lctx.graph_reuse_disable && (int) chain.params.size() == n_draft && chain.prefetch == prefetch &&
         chain.p_min == p_min && chain.n_verify == n_verify && chain.input == input &&
-        chain.input_sampled == sampled && chain.input_hidden == input_hidden && tree == !chain.tree_scores.empty();
+        chain.input_sampled == sampled && chain.input_hidden == input_hidden && tree == !chain.tree_scores.empty() && chain.tree_skip == skip;
     for (int i = 0; reuse && i < n_draft; i++) {
         const auto params = params_for(i);
         reuse = chain.params[i].allow_reuse(params);
@@ -1611,6 +1631,10 @@ bool llama_spec_pipeline::prepare_draft_graph(llama_nextn_graph & chain,
         chain.candidates.clear();
         chain.logits.clear();
         chain.tree_scores.clear();
+        chain.tree_predicates.clear();
+        chain.tree_skip = skip;
+        chain.tree_verified = false;
+        chain.tree_counts = nullptr;
         chain.positions.clear();
         chain.kv_positions.clear();
         chain.kv_masks.clear();
@@ -1624,7 +1648,7 @@ bool llama_spec_pipeline::prepare_draft_graph(llama_nextn_graph & chain,
             auto * ctx = res->get_ctx();
             const int n_pos = lctx.model.hparams.n_pos_per_embd();
             chain.constants_device.reset();
-            chain.constants_ctx.reset(ggml_init({ 5*ggml_tensor_overhead(), nullptr, true }));
+            chain.constants_ctx.reset(ggml_init({ (5 + (skip ? 4 : 0))*ggml_tensor_overhead(), nullptr, true }));
             auto constant = [&](ggml_type type, int64_t n) {
                 auto * tensor = ggml_new_tensor_1d(chain.constants_ctx.get(), type, n);
                 ggml_set_input(tensor);
@@ -1636,6 +1660,12 @@ bool llama_spec_pipeline::prepare_draft_graph(llama_nextn_graph & chain,
             ggml_set_input(chain.inp_positions);
             chain.inp_position_mask = constant(GGML_TYPE_F32, n_pos);
             chain.inp_out_ids = eagle ? nullptr : constant(GGML_TYPE_I32, 1);
+            if (skip) {
+                chain.tree_score_storage = constant(GGML_TYPE_F32, n_draft*n_draft);
+                chain.tree_ids = constant(GGML_TYPE_I32, 10*n_draft);
+                chain.tree_logits = constant(GGML_TYPE_F32, 10*n_draft);
+                chain.tree_counts = constant(GGML_TYPE_I32, 2);
+            }
             chain.inp_kv_positions = gpu_kv ? nullptr : ggml_new_tensor_1d(ctx, GGML_TYPE_F32, contexts[0]->get_n_kv());
             if (chain.inp_kv_positions) {
                 ggml_set_input(chain.inp_kv_positions);
@@ -1644,6 +1674,13 @@ bool llama_spec_pipeline::prepare_draft_graph(llama_nextn_graph & chain,
             chain.constants_device.reset(ggml_backend_alloc_ctx_tensors(chain.constants_ctx.get(), lctx.backend_ptrs[0]));
             if (!chain.constants_device) {
                 return false;
+            }
+            if (skip) {
+                // Unexecuted rows are placeholders until the verified tree resolves its accepted path.
+                auto * clear_logits = ggml_fill_inplace(ctx, chain.tree_logits, 0);
+                ggml_build_forward_expand(res->get_gf(), clear_logits);
+                ggml_build_forward_expand(res->get_gf(), ggml_cpy(ctx, ggml_cast(ctx, clear_logits, GGML_TYPE_I32), chain.tree_ids));
+                ggml_build_forward_expand(res->get_gf(), ggml_fill_inplace(ctx, chain.tree_score_storage, 0));
             }
             const auto & control = *input;
             auto * draft = chain.inp_bonus;
@@ -1714,6 +1751,10 @@ bool llama_spec_pipeline::prepare_draft_graph(llama_nextn_graph & chain,
             auto * logits = ggml_reshape_1d(ctx, res->get_logits(), lctx.model.vocab.n_tokens());
             auto * ids = ggml_top_k(ctx, logits, std::min<uint32_t>(10, lctx.model.vocab.n_tokens()));
             auto * values = ggml_get_rows(ctx, ggml_reshape_2d(ctx, logits, 1, logits->ne[0]), ids);
+            if (skip) {
+                ids = ggml_cpy(ctx, ids, ggml_view_1d(ctx, chain.tree_ids, 10, i*10*sizeof(int32_t)));
+                values = ggml_cpy(ctx, values, ggml_view_1d(ctx, chain.tree_logits, 10, i*10*sizeof(float)));
+            }
             ggml_set_output(ids);
             ggml_set_output(values);
             ggml_build_forward_expand(res->get_gf(), values);
@@ -1728,9 +1769,20 @@ bool llama_spec_pipeline::prepare_draft_graph(llama_nextn_graph & chain,
                 if (i) {
                     probabilities = ggml_mul(ctx, probabilities, llama_spec_tree::row(ctx, chain.tree_scores.back(), 0));
                 }
+                if (skip) {
+                    probabilities = ggml_cpy(ctx, probabilities, ggml_view_1d(ctx, chain.tree_score_storage,
+                            ggml_nelements(probabilities), i*n_draft*sizeof(float)));
+                }
                 ggml_set_output(probabilities);
                 ggml_build_forward_expand(res->get_gf(), probabilities);
                 chain.tree_scores.push_back(probabilities);
+                if (skip) {
+                    auto * predicate = llama_spec_tree::draft_continue(ctx, chain.tree_scores, n_draft);
+                    ggml_set_name(predicate, "nextn_tree_continue");
+                    ggml_set_output(predicate);
+                    ggml_build_forward_expand(res->get_gf(), predicate);
+                    chain.tree_predicates.push_back(predicate);
+                }
             }
             chain.params.push_back(std::move(params));
             chain.input_ends.push_back(res->inputs.size());
@@ -1747,6 +1799,9 @@ bool llama_spec_pipeline::prepare_draft_graph(llama_nextn_graph & chain,
         }
     } else {
         lctx.n_reused++;
+    }
+    if (skip && !ggml_backend_sched_graph_early_exit(chain.sched.get(), chain.tree_predicates.data(), n_draft, 0.0f, chain.tree_counts)) {
+        return false;
     }
     if (prefetch || p_min > 0.0f) {
         if (!chain.early_device) {
@@ -2008,6 +2063,7 @@ bool llama_spec_pipeline::decode_nextn(const llama_batch & seed, int32_t n_draft
 }
 
 void llama_spec_pipeline::collect_draft_outputs(llama_nextn_graph & chain, const llama_batch & seed, bool prefetch) {
+    chain.tree_verified = false;
     const int n_draft = chain.tokens.size();
     const float p_min = chain.p_min;
     auto * backend = ggml_backend_sched_get_tensor_backend(chain.sched.get(), chain.logits[0]);
@@ -2041,6 +2097,31 @@ void llama_spec_pipeline::collect_draft_outputs(llama_nextn_graph & chain, const
     this->outputs = true;
     chain.prefetched = prefetch;
     ++chain.generation;
+}
+
+bool llama_spec_pipeline::complete_draft() {
+    if (!this->graph || !this->graph->tree_skip || this->graph->tree_verified) {
+        return true;
+    }
+    auto & chain = *this->graph;
+    lctx.synchronize(true);
+    if (!ggml_backend_sched_graph_early_exit(chain.sched.get(), nullptr, 0, 0.0f, nullptr)) {
+        return false;
+    }
+    if (ggml_backend_sched_graph_compute_async(chain.sched.get(), chain.res->get_gf()) != GGML_STATUS_SUCCESS) {
+        return false;
+    }
+    chain.tree_skip = false;
+    auto * backend = ggml_backend_sched_get_tensor_backend(chain.sched.get(), chain.logits[0]);
+    ggml_backend_event_record(chain.done.get(), backend);
+    llama_output_copies copies;
+    const auto stride = lctx.model.vocab.n_tokens();
+    copy_tensor_async_rows(chain.logits, lctx.sampling.logits, stride, 0, chain.sched.get(), copies, &lctx.sampling.logits_count);
+    copy_tensor_async_rows(chain.candidates, lctx.sampling.candidates, stride, 0, chain.sched.get(), copies, &lctx.sampling.candidates_count);
+    this->readback = std::make_unique<llama_output_copies>(std::move(copies));
+    this->output_pending = false;
+    LLAMA_LOG_DEBUG("%s: materialized all %zu draft heads for chain fallback\n", __func__, chain.tokens.size());
+    return true;
 }
 
 int32_t llama_spec_pipeline::nextn_draft_length() {

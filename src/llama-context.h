@@ -120,6 +120,7 @@ struct llama_context {
     void set_embeddings_nextn(bool value, bool masked);
     void set_nextn_prefetch(bool enabled, bool fixed_kv = true);
     void set_nextn_tree(bool enabled);
+    void set_nextn_tree_early_skip(bool enabled);
     bool get_nextn_verified_draft(llama_token * tokens, int32_t n);
     void set_nextn_graph_cache(int32_t n_max);
     void set_embeddings_layer_inp(uint32_t lid, bool enable);
@@ -263,6 +264,7 @@ public:
 
     bool decode_nextn(const llama_batch & batch, int32_t n_draft, bool prefetch = false, float p_min = 0.0f);
     int32_t nextn_draft_length();
+    bool complete_nextn_draft();
     bool decode_nextn_prefetch(llama_context & source, const llama_batch & batch, int n_draft = 0, float p_min = 0.0f);
     bool decode_nextn_catchup(llama_context & source, const llama_batch & batch, const float ** snapshot);
     void synchronize_nextn_catchup();

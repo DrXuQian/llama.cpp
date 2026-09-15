@@ -31,6 +31,7 @@
 #define SPEC_VOCAB_CHECK_START_TOKEN_ID 5
 
 static void common_speculative_nextn_collect(llama_context * ctx, int n_max, float p_min, common_sampler * sampler, llama_tokens & result) {
+    GGML_ASSERT(llama_complete_nextn_draft(ctx));
     for (int i = 0; i < n_max; i++) {
         common_sampler_sample(sampler, ctx, i, true);
         const auto * candidates = common_sampler_get_candidates(sampler, true);
@@ -126,6 +127,7 @@ struct common_speculative_nextn_driver {
         const bool tree = params.eagle3_tree && allow_prefetch && (params.n_max == 3 || params.n_max == 7) && params.p_min == 0.0f;
         llama_set_nextn_tree(params.ctx_tgt, tree);
         llama_set_nextn_tree(params.ctx_dft, tree);
+        llama_set_nextn_tree_early_skip(params.ctx_dft, params.eagle3_tree_early_skip);
         const int n_cache = params.gpu_pipeline && n_seq == 1 && !synthetic &&
             params.p_min > 0.0f && params.n_max >= 2 && params.n_max <= 8 ? params.n_max + 1 : 0;
         llama_set_nextn_graph_cache(params.ctx_tgt, n_cache);

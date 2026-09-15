@@ -218,6 +218,7 @@ extern "C" {
     typedef bool                         (*ggml_backend_get_tensors_async_t)(ggml_backend_t backend, const struct ggml_tensor ** tensors, void ** dst, size_t count);
     // Prepare an allocated graph for replay without executing it.
     typedef bool                         (*ggml_backend_graph_prepare_t)(ggml_backend_t backend, struct ggml_cgraph * graph);
+    // F32 scores use p_min; I32 scalar predicates continue when nonzero. Zero steps disable conditional execution.
     typedef bool                         (*ggml_backend_graph_early_exit_t)(ggml_backend_t backend, struct ggml_cgraph * graph, struct ggml_tensor * const * scores, int n_steps, float p_min, struct ggml_tensor * counts);
     typedef bool                         (*ggml_backend_graph_select_t)(ggml_backend_t backend, struct ggml_cgraph * primary, struct ggml_cgraph * const * stages, int n_graphs, int n_stages, struct ggml_tensor * selector);
     // Get additional buffer types provided by the device (returns a NULL-terminated array)

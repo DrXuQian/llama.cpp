@@ -134,6 +134,23 @@ struct llama_spec_tree {
         return ggml_div(ctx, at(ctx, weights, ids), total);
     }
 
+    static ggml_tensor * draft_continue(ggml_context * ctx, const std::vector<ggml_tensor *> & scores, int n_draft) {
+        auto * bound = row(ctx, scores.back(), 0);
+        ggml_tensor * need;
+        if ((int) scores.size() == n_draft) {
+            need = ggml_fill(ctx, bound, 0);
+        } else if (n_draft == 3) {
+            need = scores.size() == 1 ? ggml_fill(ctx, bound, 1) :
+                    ggml_step(ctx, ggml_sub(ctx, bound, row(ctx, scores[0], 1)));
+        } else {
+            // Unseen descendants cannot exceed this bound; their IDs lose ties to all seen nodes.
+            auto * seen = join(ctx, scores);
+            auto * below = ggml_sum_rows(ctx, ggml_step(ctx, ggml_scale(ctx, ggml_sub(ctx, seen, bound), -1)));
+            need = ggml_step(ctx, ggml_scale_bias(ctx, below, 1, n_draft - 0.5f - seen->ne[0]));
+        }
+        return ggml_cast(ctx, need, GGML_TYPE_I32);
+    }
+
     void build_inputs(llm_graph_result & res, llm_graph_nextn_target & meta, int n_kv) {
         auto * ctx = res.get_ctx();
         auto * gf = res.get_gf();
