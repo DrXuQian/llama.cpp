@@ -29,8 +29,10 @@
 // This diagnostic changes scheduling only in tensor mode. It is not a timing mode.
 struct numerical_diagnostic {
     std::string mode;
+    std::string snapshot_until;
     int chunk = 0, batch = 0, position = 0;
     size_t nodes = 0, logits = 0;
+    size_t snapshot_bytes = 0;
     std::vector<uint8_t> data;
 };
 
@@ -94,15 +96,16 @@ static numerical_stats numerical_read(const ggml_tensor * t) {
     return numerical_scan(t, numerical_debug.data.data());
 }
 
-static void numerical_dump(const char * name) {
+static bool numerical_dump(const char * name) {
     const char * directory = getenv("LLAMA_NUMERICAL_DUMP_DIR");
-    if (!directory || numerical_debug.data.size() > 16*1024*1024) return;
+    if (!directory || numerical_debug.data.size() > 16*1024*1024) return false;
     std::string path = std::string(directory) + "/" + name + ".bin";
     std::ofstream file(path, std::ios::binary);
     file.write(reinterpret_cast<const char *>(numerical_debug.data.data()), numerical_debug.data.size());
     file.close();
     fprintf(stderr, "LLAMA_NUMERICAL_DUMP path=\"%s\" bytes=%zu status=%s\n",
         path.c_str(), numerical_debug.data.size(), file ? "SAVED" : "FAILED");
+    return bool(file);
 }
 
 [[noreturn]] static void numerical_stop(const char * reason) {
@@ -117,6 +120,16 @@ static bool numerical_callback(ggml_tensor * t, bool ask, void *) {
     if (ask) return numerical_float_type(t->type) && t->op != GGML_OP_NONE;
     auto stats = numerical_read(t);
     ++numerical_debug.nodes;
+    if (!numerical_debug.snapshot_until.empty()) {
+        if (numerical_debug.chunk != 1 || numerical_debug.batch != 1 ||
+            numerical_debug.nodes > 512 || numerical_debug.snapshot_bytes + numerical_debug.data.size() > 64*1024*1024) {
+            numerical_stop("SNAPSHOT_LIMIT");
+        }
+        const std::string name = "node-" + std::to_string(numerical_debug.nodes);
+        numerical_print(name.c_str(), t, stats);
+        if (!numerical_dump(name.c_str())) numerical_stop("SNAPSHOT_WRITE_FAILED");
+        numerical_debug.snapshot_bytes += numerical_debug.data.size();
+    }
     if (stats.first >= 0) {
         numerical_print("first_bad", t, stats);
         numerical_dump("output");
@@ -132,6 +145,12 @@ static bool numerical_callback(ggml_tensor * t, bool ask, void *) {
             }
         }
         numerical_stop("NONFINITE_TENSOR");
+    }
+    if (!numerical_debug.snapshot_until.empty() && numerical_debug.snapshot_until == t->name) {
+        fprintf(stderr, "LLAMA_NUMERICAL_SNAPSHOT_COMPLETE chunk=%d batch=%d position=%d nodes=%zu target=\"%s\"\n",
+            numerical_debug.chunk, numerical_debug.batch, numerical_debug.position, numerical_debug.nodes, t->name);
+        fflush(stderr);
+        std::exit(87);
     }
     if (numerical_debug.nodes % 4096 == 0) {
         fprintf(stderr, "LLAMA_NUMERICAL_PROGRESS chunk=%d batch=%d nodes=%zu tensor=\"%s\"\n",
@@ -2182,9 +2201,15 @@ int llama_perplexity(int argc, char ** argv) {
 
     numerical_debug = {};
     if (const char * mode = getenv("LLAMA_NUMERICAL_DEBUG")) numerical_debug.mode = mode;
+    if (const char * target = getenv("LLAMA_NUMERICAL_SNAPSHOT_UNTIL")) numerical_debug.snapshot_until = target;
     if (numerical_debug.mode == "self-test") return numerical_self_test();
     if (!numerical_debug.mode.empty() && numerical_debug.mode != "logits" && numerical_debug.mode != "tensors") {
         fprintf(stderr, "LLAMA_NUMERICAL_DEBUG must be logits, tensors or self-test\n");
+        return 1;
+    }
+    if (!numerical_debug.snapshot_until.empty() &&
+        (numerical_debug.mode != "tensors" || !getenv("LLAMA_NUMERICAL_DUMP_DIR"))) {
+        fprintf(stderr, "LLAMA_NUMERICAL_SNAPSHOT_UNTIL requires tensor diagnostics and a dump directory\n");
         return 1;
     }
 

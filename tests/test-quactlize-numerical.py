@@ -81,6 +81,19 @@ class NumericalEvidence(unittest.TestCase):
             self.assertRegex(text, rf'LLAMA_NUMERICAL_STOP mode={mode} chunk=1 .*reason={reason}')
             if mode == 'logits':
                 self.assertIn('batch=129 position=128', text)
+        dump = self.root/'snapshots'; dump.mkdir()
+        extra = ['--kl-divergence', '--kl-divergence-base', str(logits)]
+        result = subprocess.run(common + ['-m', str(good)] + extra, env=env | {
+            'LLAMA_NUMERICAL_DEBUG': 'tensors', 'LLAMA_NUMERICAL_DUMP_DIR': str(dump),
+            'LLAMA_NUMERICAL_SNAPSHOT_UNTIL': 'ffn_out-0'},
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=60)
+        self.assertEqual(result.returncode, 87, result.stdout[-6000:])
+        self.assertRegex(result.stdout, r'LLAMA_NUMERICAL_SNAPSHOT_COMPLETE chunk=1 batch=1 position=0 nodes=\d+ target="ffn_out-0"')
+        nodes = re.findall(r'role=node-(\d+) tensor="([^"]+)"', result.stdout)
+        self.assertEqual(nodes[-1][1], 'ffn_out-0')
+        self.assertEqual([int(n) for n, _ in nodes], list(range(1, len(nodes)+1)))
+        self.assertEqual(len(list(dump.glob('node-*.bin'))), len(nodes))
+        self.assertNotIn('LLAMA_NUMERICAL_COMPLETE ', result.stdout)
 
     def test_nonfinite_probe_is_on_the_kl_path_not_the_ppl_save_path(self):
         source = (Path(__file__).parents[1] / 'tools/perplexity/perplexity.cpp').read_text()
