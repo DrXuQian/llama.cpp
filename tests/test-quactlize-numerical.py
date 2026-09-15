@@ -3,6 +3,7 @@
 
 import copy
 import json
+import os
 from pathlib import Path
 import re
 import shlex
@@ -18,6 +19,85 @@ from quactlize_numerical import activity, analyze, analyze_log, gsm8k_corpus, lo
 
 
 class NumericalEvidence(unittest.TestCase):
+    @unittest.skipUnless(os.environ.get('LLAMA_NUMERICAL_TEST_BINARY'), 'set a CPU llama-perplexity binary for the real KL-loop test')
+    def test_real_kl_loop_checks_logits_and_stops_on_planted_nan(self):
+        import gguf
+        import numpy as np
+
+        binary = Path(os.environ['LLAMA_NUMERICAL_TEST_BINARY']).resolve()
+        good, bad = self.root / 'finite.gguf', self.root / 'nan.gguf'
+        for path, plant in ((good, False), (bad, True)):
+            rng = np.random.default_rng(9127)
+            writer = gguf.GGUFWriter(str(path), 'llama')
+            writer.add_context_length(256)
+            writer.add_embedding_length(32)
+            writer.add_block_count(1)
+            writer.add_feed_forward_length(32)
+            writer.add_head_count(4)
+            writer.add_head_count_kv(4)
+            writer.add_rope_dimension_count(8)
+            writer.add_layer_norm_rms_eps(1e-5)
+            writer.add_tokenizer_model('llama')
+            writer.add_token_list(['<unk>', '<s>', '</s>', '\u2581', 'a'])
+            writer.add_token_scores([0., 0., 0., 0., 0.])
+            writer.add_token_types([2, 3, 3, 1, 1])
+            writer.add_bos_token_id(1)
+            writer.add_eos_token_id(2)
+            writer.add_unk_token_id(0)
+            writer.add_add_bos_token(True)
+            for name in ('token_embd', 'output', 'blk.0.attn_q', 'blk.0.attn_k', 'blk.0.attn_v',
+                         'blk.0.attn_output', 'blk.0.ffn_gate', 'blk.0.ffn_up', 'blk.0.ffn_down'):
+                data = (rng.standard_normal((5 if name in ('token_embd', 'output') else 32, 32)) * .03).astype('f4')
+                if name == 'output' and plant:
+                    data[0, 0] = np.nan
+                writer.add_tensor(name + '.weight', data)
+            for name in ('output_norm', 'blk.0.attn_norm', 'blk.0.ffn_norm'):
+                writer.add_tensor(name + '.weight', np.ones(32, dtype='f4'))
+            writer.write_header_to_file()
+            writer.write_kv_data_to_file()
+            writer.write_tensors_to_file()
+            writer.close()
+        corpus, logits = self.root / 'corpus.txt', self.root / 'base.logits'
+        corpus.write_text('a ' * 1000)
+        env = {k: v for k, v in os.environ.items() if not k.startswith(('LLAMA_ARG_', 'LLAMA_NUMERICAL_', 'QUACTLIZE_'))}
+        env['LD_LIBRARY_PATH'] = str(binary.parent)
+        common = [str(binary), '-ngl', '0', '-c', '256', '-b', '1', '-ub', '1', '--chunks', '2',
+                  '-t', '1', '-f', str(corpus), '--no-warmup', '--log-colors', 'off']
+
+        def run(model, extra, mode=None):
+            result = subprocess.run(common + ['-m', str(model)] + extra,
+                env=env | ({'LLAMA_NUMERICAL_DEBUG': mode} if mode else {}),
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=60)
+            self.assertEqual(result.returncode, 86 if model == bad else 0, result.stdout[-6000:])
+            return result.stdout
+
+        run(good, ['--save-all-logits', str(logits)])
+        for mode in ('logits', 'tensors'):
+            extra = ['--kl-divergence', '--kl-divergence-base', str(logits)]
+            text = run(good, extra, mode)
+            self.assertRegex(text, rf'LLAMA_NUMERICAL_COMPLETE mode={mode} nodes=\d+ logits=256\b')
+            text = run(bad, extra, mode)
+            reason = 'NONFINITE_LOGITS' if mode == 'logits' else 'NONFINITE_TENSOR'
+            self.assertRegex(text, rf'LLAMA_NUMERICAL_STOP mode={mode} chunk=1 .*reason={reason}')
+            if mode == 'logits':
+                self.assertIn('batch=129 position=128', text)
+
+    def test_nonfinite_probe_is_on_the_kl_path_not_the_ppl_save_path(self):
+        source = (Path(__file__).parents[1] / 'tools/perplexity/perplexity.cpp').read_text()
+        call = 'numerical_check_logits(batch_logits, size_t(n_outputs) * n_vocab);'
+
+        def valid(text):
+            before, kl = text.split('static void kl_divergence(', 1)
+            kl, _ = kl.split('\nint llama_perplexity(', 1)
+            return (call not in before and kl.count(call) == 1 and
+                    kl.index('llama_decode(ctx, batch)') < kl.index(call) <
+                    kl.index('logits.insert(') < kl.index('process_logits('))
+
+        self.assertTrue(valid(source))
+        self.assertFalse(valid(source.replace(call, '', 1)))
+        self.assertFalse(valid(source.replace(call, '', 1).replace(
+            'static void kl_divergence(', call + '\nstatic void kl_divergence(', 1)))
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
