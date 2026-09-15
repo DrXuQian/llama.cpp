@@ -3,6 +3,7 @@
 #include "fit.h"
 #include "log.h"
 #include "llama.h"
+#include "ggml-backend.h"
 
 #include <algorithm>
 #include <array>
@@ -11,6 +12,7 @@
 #include <clocale>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <fstream>
@@ -23,6 +25,161 @@
 #if defined(_MSC_VER)
 #pragma warning(disable: 4244 4267) // possible loss of data
 #endif
+
+// This diagnostic changes scheduling only in tensor mode. It is not a timing mode.
+struct numerical_diagnostic {
+    std::string mode;
+    int chunk = 0, batch = 0, position = 0;
+    size_t nodes = 0, logits = 0;
+    std::vector<uint8_t> data;
+};
+
+static numerical_diagnostic numerical_debug;
+
+struct numerical_stats {
+    size_t count = 0, nan = 0, pos_inf = 0, neg_inf = 0;
+    int64_t first = -1;
+    uint32_t bits = 0;
+    float max_abs = 0;
+
+    void add(float value, bool allow_negative_inf = false) {
+        const bool invalid = !std::isfinite(value) && !(allow_negative_inf && value < 0);
+        if (invalid && first < 0) {
+            first = count;
+            memcpy(&bits, &value, sizeof(bits));
+        }
+        ++count;
+        if (std::isnan(value)) ++nan;
+        else if (std::isinf(value)) value > 0 ? ++pos_inf : ++neg_inf;
+        else max_abs = std::max(max_abs, std::abs(value));
+    }
+};
+
+static bool numerical_float_type(ggml_type type) {
+    return type == GGML_TYPE_F32 || type == GGML_TYPE_F16 || type == GGML_TYPE_BF16;
+}
+
+static numerical_stats numerical_scan(const ggml_tensor * t, const uint8_t * data) {
+    numerical_stats stats;
+    const bool mask = strstr(t->name, "mask") != nullptr;
+    for (int64_t i3 = 0; i3 < t->ne[3]; ++i3)
+    for (int64_t i2 = 0; i2 < t->ne[2]; ++i2)
+    for (int64_t i1 = 0; i1 < t->ne[1]; ++i1)
+    for (int64_t i0 = 0; i0 < t->ne[0]; ++i0) {
+        const uint8_t * p = data + i0*t->nb[0] + i1*t->nb[1] + i2*t->nb[2] + i3*t->nb[3];
+        float value;
+        if (t->type == GGML_TYPE_F32) memcpy(&value, p, sizeof(value));
+        else {
+            uint16_t bits;
+            memcpy(&bits, p, sizeof(bits));
+            value = t->type == GGML_TYPE_F16 ? ggml_fp16_to_fp32(bits) : ggml_bf16_to_fp32({bits});
+        }
+        stats.add(value, mask);
+    }
+    return stats;
+}
+
+static void numerical_print(const char * role, const ggml_tensor * t, const numerical_stats & s) {
+    fprintf(stderr, "LLAMA_NUMERICAL_TENSOR role=%s tensor=\"%s\" op=%s type=%s "
+        "ne=%lld,%lld,%lld,%lld nb=%zu,%zu,%zu,%zu count=%zu nan=%zu pos_inf=%zu neg_inf=%zu "
+        "first=%lld bits=0x%08x max_abs=%.9g\n", role, t->name, ggml_op_name(t->op), ggml_type_name(t->type),
+        (long long)t->ne[0], (long long)t->ne[1], (long long)t->ne[2], (long long)t->ne[3],
+        t->nb[0], t->nb[1], t->nb[2], t->nb[3], s.count, s.nan, s.pos_inf, s.neg_inf,
+        (long long)s.first, s.bits, s.max_abs);
+}
+
+static numerical_stats numerical_read(const ggml_tensor * t) {
+    numerical_debug.data.resize(ggml_nbytes(t));
+    ggml_backend_tensor_get(t, numerical_debug.data.data(), 0, numerical_debug.data.size());
+    return numerical_scan(t, numerical_debug.data.data());
+}
+
+static void numerical_dump(const char * name) {
+    const char * directory = getenv("LLAMA_NUMERICAL_DUMP_DIR");
+    if (!directory || numerical_debug.data.size() > 16*1024*1024) return;
+    std::string path = std::string(directory) + "/" + name + ".bin";
+    std::ofstream file(path, std::ios::binary);
+    file.write(reinterpret_cast<const char *>(numerical_debug.data.data()), numerical_debug.data.size());
+    file.close();
+    fprintf(stderr, "LLAMA_NUMERICAL_DUMP path=\"%s\" bytes=%zu status=%s\n",
+        path.c_str(), numerical_debug.data.size(), file ? "SAVED" : "FAILED");
+}
+
+[[noreturn]] static void numerical_stop(const char * reason) {
+    fprintf(stderr, "LLAMA_NUMERICAL_STOP mode=%s chunk=%d batch=%d position=%d nodes=%zu logits=%zu reason=%s\n",
+        numerical_debug.mode.c_str(), numerical_debug.chunk, numerical_debug.batch, numerical_debug.position,
+        numerical_debug.nodes, numerical_debug.logits, reason);
+    fflush(stderr);
+    std::exit(86);
+}
+
+static bool numerical_callback(ggml_tensor * t, bool ask, void *) {
+    if (ask) return numerical_float_type(t->type) && t->op != GGML_OP_NONE;
+    auto stats = numerical_read(t);
+    ++numerical_debug.nodes;
+    if (stats.first >= 0) {
+        numerical_print("first_bad", t, stats);
+        numerical_dump("output");
+        for (int i = 0; i < GGML_MAX_SRC; ++i) {
+            const auto * src = t->src[i];
+            if (!src) continue;
+            fprintf(stderr, "LLAMA_NUMERICAL_SOURCE index=%d tensor=\"%s\" type=%s snapshot=AFTER_NODE\n",
+                i, src->name, ggml_type_name(src->type));
+            // Quantized weights may be repacked and have no get_tensor implementation.
+            if (numerical_float_type(src->type)) {
+                numerical_print("source", src, numerical_read(src));
+                numerical_dump(("src-" + std::to_string(i)).c_str());
+            }
+        }
+        numerical_stop("NONFINITE_TENSOR");
+    }
+    if (numerical_debug.nodes % 4096 == 0) {
+        fprintf(stderr, "LLAMA_NUMERICAL_PROGRESS chunk=%d batch=%d nodes=%zu tensor=\"%s\"\n",
+            numerical_debug.chunk, numerical_debug.batch, numerical_debug.nodes, t->name);
+    }
+    return true;
+}
+
+static void numerical_check_logits(const float * values, size_t count) {
+    numerical_stats stats;
+    for (size_t i = 0; i < count; ++i) stats.add(values[i]);
+    ++numerical_debug.logits;
+    if (stats.first >= 0) {
+        fprintf(stderr, "LLAMA_NUMERICAL_LOGITS count=%zu nan=%zu pos_inf=%zu neg_inf=%zu first=%lld bits=0x%08x\n",
+            stats.count, stats.nan, stats.pos_inf, stats.neg_inf, (long long)stats.first, stats.bits);
+        numerical_stop("NONFINITE_LOGITS");
+    }
+}
+
+static int numerical_self_test() {
+    float values[8] = {1, NAN, 2, INFINITY, 3, -INFINITY, 4, NAN};
+    ggml_tensor t{};
+    t.type = GGML_TYPE_F32;
+    t.ne[0] = 2; t.ne[1] = 2; t.ne[2] = t.ne[3] = 1;
+    t.nb[0] = 8; t.nb[1] = 16;
+    auto clean = numerical_scan(&t, reinterpret_cast<uint8_t *>(values));
+    if (clean.first != -1 || clean.count != 4 || clean.max_abs != 4) return 1;
+    values[4] = NAN;
+    auto bad = numerical_scan(&t, reinterpret_cast<uint8_t *>(values));
+    if (bad.first != 2 || bad.nan != 1) return 1;
+    values[4] = -INFINITY;
+    if (numerical_scan(&t, reinterpret_cast<uint8_t *>(values)).first != 2) return 1;
+    strcpy(t.name, "kq_mask");
+    if (numerical_scan(&t, reinterpret_cast<uint8_t *>(values)).first != -1) return 1;
+    values[4] = INFINITY;
+    if (numerical_scan(&t, reinterpret_cast<uint8_t *>(values)).first != 2) return 1;
+    for (auto type : {GGML_TYPE_F16, GGML_TYPE_BF16}) {
+        uint16_t half_values[8] = {};
+        half_values[4] = type == GGML_TYPE_F16 ? 0x7e00 : 0x7fc0;
+        t.type = type; t.nb[0] = 4; t.nb[1] = 8;
+        if (numerical_scan(&t, reinterpret_cast<uint8_t *>(half_values)).first != 2) return 1;
+    }
+    numerical_stats finite;
+    finite.add(3.4e38f); finite.add(3.4e38f);
+    if (finite.first != -1) return 1;
+    fprintf(stderr, "LLAMA_NUMERICAL_SELF_TEST PASS strided=1 nan=1 signed_inf=1 mask=1 f16=1 bf16=1 no_sum_overflow=1\n");
+    return 0;
+}
 
 struct results_perplexity {
     std::vector<llama_token> tokens;
@@ -593,6 +750,9 @@ static results_perplexity perplexity(llama_context * ctx, const common_params & 
 
             if (num_batches > 1 && n_outputs > 0) {
                 const auto * batch_logits = llama_get_logits(ctx);
+                if (!numerical_debug.mode.empty()) {
+                    numerical_check_logits(batch_logits, size_t(n_outputs) * n_vocab);
+                }
                 logits.insert(logits.end(), batch_logits, batch_logits + size_t(n_outputs) * n_vocab);
             }
         }
@@ -1831,6 +1991,11 @@ static void kl_divergence(llama_context * ctx, const common_params & params) {
                 tokens[seq_start] = token_org;
             }
 
+            if (!numerical_debug.mode.empty()) {
+                numerical_debug.chunk = i + 1;
+                numerical_debug.batch = j + 1;
+                numerical_debug.position = j * n_batch;
+            }
             if (llama_decode(ctx, batch)) {
                 LOG_ERR("%s : failed to decode\n", __func__);
                 llama_batch_free(batch);
@@ -1907,6 +2072,10 @@ static void kl_divergence(llama_context * ctx, const common_params & params) {
     llama_batch_free(batch);
     LOG("\n");
 
+    if (!numerical_debug.mode.empty()) {
+        fprintf(stderr, "LLAMA_NUMERICAL_COMPLETE mode=%s nodes=%zu logits=%zu verdict=NO_NONFINITE_OBSERVED\n",
+            numerical_debug.mode.c_str(), numerical_debug.nodes, numerical_debug.logits);
+    }
     if (kld.count < 100) return; // we do not wish to do statistics on so few values
 
     std::sort(kld_values.begin(), kld_values.end());
@@ -2011,6 +2180,14 @@ int llama_perplexity(int argc, char ** argv);
 int llama_perplexity(int argc, char ** argv) {
     std::setlocale(LC_NUMERIC, "C");
 
+    numerical_debug = {};
+    if (const char * mode = getenv("LLAMA_NUMERICAL_DEBUG")) numerical_debug.mode = mode;
+    if (numerical_debug.mode == "self-test") return numerical_self_test();
+    if (!numerical_debug.mode.empty() && numerical_debug.mode != "logits" && numerical_debug.mode != "tensors") {
+        fprintf(stderr, "LLAMA_NUMERICAL_DEBUG must be logits, tensors or self-test\n");
+        return 1;
+    }
+
     common_params params;
 
     params.n_ctx = 512;
@@ -2020,6 +2197,16 @@ int llama_perplexity(int argc, char ** argv) {
 
     if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_PERPLEXITY)) {
         return 1;
+    }
+
+    if (!numerical_debug.mode.empty()) {
+        if (!params.kl_divergence || params.n_batch != 1 || params.n_ubatch != 1 || params.warmup) {
+            fprintf(stderr, "LLAMA_NUMERICAL_DEBUG requires KL divergence, -b 1 -ub 1 and --no-warmup\n");
+            return 1;
+        }
+        if (numerical_debug.mode == "tensors") params.cb_eval = numerical_callback;
+        fprintf(stderr, "LLAMA_NUMERICAL_DEBUG mode=%s callback=%d timing_valid=0\n",
+            numerical_debug.mode.c_str(), int(params.cb_eval != nullptr));
     }
 
     const int32_t n_ctx = params.n_ctx;
