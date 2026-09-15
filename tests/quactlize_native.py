@@ -85,6 +85,19 @@ def simt_symbol_recipe(name):
     return tuple(int(x or 0) for x in match.groups()) if match else None
 
 
+def q4_symbol_recipe(name):
+    match = re.search(r"quactlize::execution::q4_decode::kernel(_bf16)?<\s*" +
+                      r",\s*".join([r"(\d+)"] * 8) + r"\s*>", name)
+    return (*map(int, match.groups()[1:]), int(bool(match[1]))) if match else None
+
+
+def q4_symbol_matches_plan(recipe, plan):
+    if not recipe or plan.get("route") != "gemv-q4-s1":
+        return False
+    fields = ("reader", "variant", "warps", "values", "columns", "n", "k")
+    return recipe == (1, *[int(plan.get(k, -1)) for k in fields], int(plan.get("activation") == "BF16"))
+
+
 def selection(text, manifest, expected_ops=None):
     require(
         not re.search(r"CUDA error:|PPU error:|GGML_ASSERT|GGML_ABORT", text),
@@ -109,6 +122,15 @@ def selection(text, manifest, expected_ops=None):
                     "unbound full-BF16 prefill receipt")
         elif r["route"] == "gemv-q4-s1":
             require(r.get("q")=="12" and r.get("split")=="1", "invalid measured Q4 S1 plan")
+            require(r.get("activation", "FP16") in ("FP16", "BF16"), "invalid Q4 compute type")
+            if r.get("activation") == "BF16":
+                receipt = manifest.get("execution_receipt", {})
+                compute = receipt.get("q4_decode_compute_v2", {})
+                configs = receipt.get("q4_decode_configs", {}).get(f'{r.get("n")}x{r.get("k")}', [])
+                config = [int(r.get(k, -1)) for k in ("reader", "variant", "warps", "values", "columns")]
+                require(manifest.get("compute_contract") and "bf16" in compute.get("compute", []) and
+                        r.get("selection") == "INITIAL_COMPUTE" and config in configs,
+                        "unbound BF16 Q4 proposal or measured relabel")
         elif r["route"] == "gemv" and r.get("reader") == "simt-reuse":
             names = ("variant", "columns", "warps", "values", "split")
             config = {name:int(r.get(name, -1)) for name in names}
@@ -614,10 +636,10 @@ def proof(args):
         ).splitlines()
         require(len(decoded) == len(names), "demangled symbol count differs")
         for name, demangled in zip(names, decoded):
-            is_q4 = "quactlize::execution::q4_decode::kernel<" in demangled
+            q4 = q4_symbol_recipe(demangled)
             reuse = simt_symbol_recipe(demangled)
             is_provider = build in provider_ops and re.search(r"(?i)(?:bf16|bfloat16)",demangled) and re.search(r"(?i)gemm",demangled)
-            if "cutlass::device_kernel<" in demangled or is_q4 or reuse or is_provider or re.search(
+            if "cutlass::device_kernel<" in demangled or q4 or reuse or is_provider or re.search(
                 r"kpack_q(?:8|10|11|12|13|14)::", demangled
             ):
                 item = symbols.setdefault(
@@ -638,7 +660,7 @@ def proof(args):
                         r["op"]
                         for r in plans["plans"]
                         if (r["route"] == "gemv" and q and r["q"] == q[1]) or
-                           (is_q4 and r["route"]=="gemv-q4-s1") or
+                           q4_symbol_matches_plan(q4, r) or
                            (reuse and r.get("reader")=="simt-reuse" and reuse ==
                             (int(r["q"]),1,*[int(r[k]) for k in ("variant","columns","warps","values")],
                              int(r.get("activation")=="BF16")))
