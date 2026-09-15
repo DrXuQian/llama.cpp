@@ -117,7 +117,10 @@ inline MoeRouterSpan match_moe_router(ggml_cgraph const * graph, int start,
     if (!chain.count || chain.gate->src[2] != graph->nodes[ids_index]) return {};
     for (int j = 0; j < chain.count; ++j) ops.push_back(graph->nodes[next+j]->op);
     outputs.push_back(next + chain.count - 1);
-    if (!ggml_can_fuse_subgraph(graph, start, int(ops.size()), ops.data(), outputs.data(), int(outputs.size()))) return {};
+    // Router and weighted finish together can exceed the fixed-size wrapper.
+    std::vector<int> node_idxs(ops.size());
+    for (int j = 0; j < int(ops.size()); ++j) node_idxs[j] = start + j;
+    if (!ggml_can_fuse_subgraph_ext(graph, node_idxs.data(), int(ops.size()), ops.data(), outputs.data(), int(outputs.size()))) return {};
     return {next, int(ops.size())};
 }
 } // namespace quactlize::llama
