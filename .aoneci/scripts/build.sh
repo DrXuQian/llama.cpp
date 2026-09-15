@@ -26,6 +26,7 @@
 #   JOBS         并行编译数     (default: $(nproc))
 #   NCP_LIB_REV  ncp_flash_lib 完整 40 位 commit sha (default: .aoneci/NCP_LIB_VERSION 里记录的值)
 #   LLAMA_BUILD_DIR  New build output directory (default: LLAMA_CI_DIR/build-ci)
+#   LLAMA_BUILD_REUSE  Set to 1 to continue a matching configured build
 # ============================================================
 
 set -euo pipefail
@@ -35,7 +36,16 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/config.sh"
 
 LLAMA_BUILD_DIR=$(realpath -m -- "${LLAMA_BUILD_DIR:-${LLAMA_CI_DIR}/build-ci}")
-if [ -e "$LLAMA_BUILD_DIR" ] || [ -L "$LLAMA_BUILD_DIR" ]; then
+if [ "${LLAMA_BUILD_REUSE:-0}" = 1 ]; then
+    test -f "$LLAMA_BUILD_DIR/CMakeCache.txt"
+    recorded_source=$(sed -n 's/^CMAKE_HOME_DIRECTORY:[^=]*=//p' "$LLAMA_BUILD_DIR/CMakeCache.txt")
+    recorded_compiler=$(sed -n 's/^CMAKE_CUDA_COMPILER:[^=]*=//p' "$LLAMA_BUILD_DIR/CMakeCache.txt")
+    if [ "$recorded_source" != "$LLAMA_CI_DIR" ] || [ "$recorded_compiler" != "$PPU_NVCC" ]; then
+        echo "ERROR: reused llama build source/compiler differs: $LLAMA_BUILD_DIR" >&2
+        exit 1
+    fi
+    echo "==> Continuing llama build: $LLAMA_BUILD_DIR"
+elif [ -e "$LLAMA_BUILD_DIR" ] || [ -L "$LLAMA_BUILD_DIR" ]; then
     echo "ERROR: build output exists: $LLAMA_BUILD_DIR; set LLAMA_BUILD_DIR to a new path" >&2
     exit 1
 fi
