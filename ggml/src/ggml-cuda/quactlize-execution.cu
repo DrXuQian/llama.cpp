@@ -81,7 +81,7 @@ struct Plan {
     bool direct = false, legacy = false, sf = false, scale_resident = false;
     bool indexed = false;
     bool q4_decode = false, q4_tc = false;
-    bool reuse = false, table_tc = false;
+    bool reuse = false, table_tc = false, matched = false;
     bool dense_io = false;
     int compute = QK_COMPUTE_F16;
     void * full_handle = nullptr;
@@ -93,6 +93,29 @@ struct Plan {
         if (full_handle) api->full_destroy(full_handle);
     }
 };
+bool apply_matched(Plan & p, const qks_smallm_choice_v2 & selected) {
+    const auto & c = selected.base;
+    if (selected.version != 2 || selected.size != sizeof(selected) || selected.compute_type != p.compute ||
+        c.version != 1 || c.size != sizeof(c) || c.policy < QKS_MATCHED_EXACT || c.policy > QKS_MATCHED_ROUTER ||
+        c.kind < QKS_SMALLM_TC || c.kind > QKS_SMALLM_Q4) return false;
+    if (c.kind == QKS_SMALLM_TC && (c.tc.version != 1 || c.tc.size != sizeof(c.tc) || !c.tc.ticket || c.tc.policy != c.policy)) return false;
+    if (c.kind == QKS_SMALLM_SIMT && (c.simt.version != 1 || c.simt.size != sizeof(c.simt))) return false;
+    if (c.kind == QKS_SMALLM_Q4 && (selected.q4.version != 1 || selected.q4.size != sizeof(selected.q4))) return false;
+    p.smallm = c;
+    p.matched = true;
+    p.direct = c.kind != QKS_SMALLM_TC;
+    p.table_tc = c.kind == QKS_SMALLM_TC;
+    p.reuse = c.kind == QKS_SMALLM_SIMT;
+    p.q4_decode = c.kind == QKS_SMALLM_Q4;
+    if (p.table_tc) p.choice = c.tc;
+    if (p.q4_decode) p.q4_config = selected.q4;
+    return true;
+}
+const char * matched_name(int policy) {
+    if (policy == QKS_MATCHED_EXACT) return "MATCHED_EXACT";
+    if (policy == QKS_MATCHED_BUCKET) return "MATCHED_BUCKET_PREDICTED";
+    return "MATCHED_ROUTER_MINIMAX";
+}
 struct Scratch { void * pointer = nullptr; size_t capacity = 0; };
 struct MoePlan {
     const ggml_quactlize_execution_api * api;
@@ -243,51 +266,67 @@ Plan & prepare(ggml_backend_cuda_context & ctx, const ggml_tensor * weight,
         c.ids_stride = ids ? ids->nb[1] / sizeof(int32_t) : 0; c.out_row_stride = art.n;
         c.a = input->data; c.low = art.low; c.high = art.high; c.units = art.units;
         c.ids = ids ? (const int32_t *) ids->data : nullptr; c.output = (float *) output->data; c.stream = stream;
-        if (p->compute == QK_COMPUTE_BF16 && tokens <= 8) {
+        if (mode == RouteMode::Auto && tokens <= 8 && c.input_type == QKG_F32 && owner.api->query_smallm_matched) {
             qkg_simt_call_v2 typed{2, sizeof(typed), c, p->compute};
-            int rc = owner.api->query_smallm_compute(owner.runtime, &typed, &art.arrangement, &p->smallm);
+            qks_smallm_choice_v2 selected{};
+            int rc = owner.api->query_smallm_matched(owner.runtime, &typed, &art.arrangement, &selected);
             if (rc != QKS_OK && rc != QKS_MISS)
-                GGML_ABORT("[quactlize] %s: BF16 decode query: %s", weight->name, owner.api->error());
+                GGML_ABORT("[quactlize] %s: matched decode query: %s", weight->name, owner.api->error());
             if (rc == QKS_OK) {
-                p->direct = p->reuse = p->smallm.kind == QKS_SMALLM_SIMT;
-                p->table_tc = !p->direct;
-                if (p->table_tc) p->choice = p->smallm.tc;
+                if (!apply_matched(*p, selected))
+                    GGML_ABORT("[quactlize] %s: invalid matched decode identity", weight->name);
+                GGML_LOG_INFO("[quactlize-decode] tensor=%s table=%s kind=%d source=%dx%dx%d activation=%s\n",
+                    weight->name, matched_name(p->smallm.policy), p->smallm.kind,
+                    p->smallm.source_tokens, p->smallm.source_n, p->smallm.source_k, compute_name(p->compute));
             }
-            if (p->reuse && p->smallm.policy == QKS_COMPUTE_INITIAL && mode == RouteMode::Auto &&
-                art.qtype == GGML_TYPE_Q4_K && owner.api->q4_select_compute) {
-                qkg_sizes_v1 sizes{};
-                int q4_status = owner.api->q4_select_compute(&typed, &art.arrangement, &p->q4_config, &sizes);
-                if (q4_status != QKG_OK && q4_status != QKG_SHAPE)
-                    GGML_ABORT("[quactlize] %s: BF16 Q4 decode selection failed rc=%d", weight->name, q4_status);
-                if (q4_status == QKG_OK) {
-                    p->q4_decode = true;
-                    p->reuse = false;
+        }
+        if (!p->matched) {
+            if (p->compute == QK_COMPUTE_BF16 && tokens <= 8) {
+                qkg_simt_call_v2 typed{2, sizeof(typed), c, p->compute};
+                int rc = owner.api->query_smallm_compute(owner.runtime, &typed, &art.arrangement, &p->smallm);
+                if (rc != QKS_OK && rc != QKS_MISS)
+                    GGML_ABORT("[quactlize] %s: BF16 decode query: %s", weight->name, owner.api->error());
+                if (rc == QKS_OK) {
+                    p->direct = p->reuse = p->smallm.kind == QKS_SMALLM_SIMT;
+                    p->table_tc = !p->direct;
+                    if (p->table_tc) p->choice = p->smallm.tc;
                 }
-            }
-        } else if (p->compute == QK_COMPUTE_BF16) {
-            // Prefill uses the grouped TC compute interface below.
-        } else if (mode == RouteMode::Auto && art.qtype == GGML_TYPE_Q4_K && owner.api->q4_select) {
-            qkg_sizes_v1 sizes{};
-            int rc = owner.api->q4_select(&c, &art.arrangement, &p->q4_config, &sizes);
-            if (rc != QKG_OK && rc != QKG_SHAPE)
-                GGML_ABORT("[quactlize] %s: Q4 decode selection failed rc=%d", weight->name, rc);
-            p->direct = p->q4_decode = rc == QKG_OK;
-        } else if (mode == RouteMode::Auto && owner.api->query_smallm) {
-            int rc = owner.api->query_smallm(owner.runtime, &c, &art.arrangement, &p->smallm);
-            if (rc != QKS_OK && rc != QKS_MISS)
-                GGML_ABORT("[quactlize] %s: decode table query failed: %s", weight->name, owner.api->error());
-            if (rc == QKS_OK) {
-                p->direct = p->reuse = p->smallm.kind == QKS_SMALLM_SIMT;
-                p->table_tc = !p->direct;
-                if (p->table_tc) p->choice = p->smallm.tc;
-                GGML_LOG_INFO("[quactlize-decode] tensor=%s table=%s kind=%s source=%dx%dx%d\n",
-                    weight->name, p->smallm.policy == QKS_SMALLM_EXACT ? "EXACT" : "BUCKET_PREDICTED",
-                    p->direct ? "SIMT" : "TC", p->smallm.source_tokens, p->smallm.source_n, p->smallm.source_k);
+                if (p->reuse && p->smallm.policy == QKS_COMPUTE_INITIAL && mode == RouteMode::Auto &&
+                    art.qtype == GGML_TYPE_Q4_K && owner.api->q4_select_compute) {
+                    qkg_sizes_v1 sizes{};
+                    int q4_status = owner.api->q4_select_compute(&typed, &art.arrangement, &p->q4_config, &sizes);
+                    if (q4_status != QKG_OK && q4_status != QKG_SHAPE)
+                        GGML_ABORT("[quactlize] %s: BF16 Q4 decode selection failed rc=%d", weight->name, q4_status);
+                    if (q4_status == QKG_OK) {
+                        p->q4_decode = true;
+                        p->reuse = false;
+                    }
+                }
+            } else if (p->compute == QK_COMPUTE_BF16) {
+                // Prefill uses the grouped TC compute interface below.
+            } else if (mode == RouteMode::Auto && art.qtype == GGML_TYPE_Q4_K && owner.api->q4_select) {
+                qkg_sizes_v1 sizes{};
+                int rc = owner.api->q4_select(&c, &art.arrangement, &p->q4_config, &sizes);
+                if (rc != QKG_OK && rc != QKG_SHAPE)
+                    GGML_ABORT("[quactlize] %s: Q4 decode selection failed rc=%d", weight->name, rc);
+                p->direct = p->q4_decode = rc == QKG_OK;
+            } else if (mode == RouteMode::Auto && owner.api->query_smallm) {
+                int rc = owner.api->query_smallm(owner.runtime, &c, &art.arrangement, &p->smallm);
+                if (rc != QKS_OK && rc != QKS_MISS)
+                    GGML_ABORT("[quactlize] %s: decode table query failed: %s", weight->name, owner.api->error());
+                if (rc == QKS_OK) {
+                    p->direct = p->reuse = p->smallm.kind == QKS_SMALLM_SIMT;
+                    p->table_tc = !p->direct;
+                    if (p->table_tc) p->choice = p->smallm.tc;
+                    GGML_LOG_INFO("[quactlize-decode] tensor=%s table=%s kind=%s source=%dx%dx%d\n",
+                        weight->name, p->smallm.policy == QKS_SMALLM_EXACT ? "EXACT" : "BUCKET_PREDICTED",
+                        p->direct ? "SIMT" : "TC", p->smallm.source_tokens, p->smallm.source_n, p->smallm.source_k);
+                } else {
+                    GGML_LOG_DEBUG("[quactlize-decode] tensor=%s table=MISS retain_existing=1\n", weight->name);
+                }
             } else {
-                GGML_LOG_DEBUG("[quactlize-decode] tensor=%s table=MISS retain_existing=1\n", weight->name);
+                p->direct = ggml_quactlize_gemv_config(c, &p->gemv_config);
             }
-        } else {
-            p->direct = ggml_quactlize_gemv_config(c, &p->gemv_config);
         }
         if (!p->direct && mode == RouteMode::Gemv)
             GGML_ABORT("[quactlize] %s: forced GEMV has no measured recipe for this request", weight->name);
@@ -302,9 +341,14 @@ Plan & prepare(ggml_backend_cuda_context & ctx, const ggml_tensor * weight,
                 owner.api->simt_query_compute(&typed, &p->smallm.simt, &art.arrangement, &sizes) :
                 owner.api->simt_query(&c, &p->smallm.simt, &art.arrangement, &sizes);
         } else if (p->q4_decode) {
-            rc = p->compute == QK_COMPUTE_BF16 ?
-                owner.api->q4_select_compute(&typed, &art.arrangement, &p->q4_config, &sizes) :
-                owner.api->q4_select(&c, &art.arrangement, &p->q4_config, &sizes);
+            if (p->matched) {
+                sizes = p->smallm.sizes;
+                rc = QKG_OK;
+            } else {
+                rc = p->compute == QK_COMPUTE_BF16 ?
+                    owner.api->q4_select_compute(&typed, &art.arrangement, &p->q4_config, &sizes) :
+                    owner.api->q4_select(&c, &art.arrangement, &p->q4_config, &sizes);
+            }
         } else {
             GGML_ASSERT(p->compute == QK_COMPUTE_F16);
             rc = owner.api->gemv_query(&c, &p->gemv_config, &art.arrangement, &sizes);
@@ -321,10 +365,11 @@ Plan & prepare(ggml_backend_cuda_context & ctx, const ggml_tensor * weight,
         } else if (p->q4_decode) {
             auto f = p->q4_config;
             GGML_LOG_INFO("[quactlize-plan] tensor=%s op=%s route=gemv-q4-s1 q=%d rows=%d n=%" PRId64 " k=%" PRId64
-                " reader=%d variant=%d warps=%d values=%d columns=%d split=1 selection=%s activation=%s\n",
+                " reader=%d variant=%d warps=%d values=%d columns=%d split=1 selection=%s policy=%d activation=%s\n",
                 weight->name, ids ? "grouped" : "dense", art.qtype, p->rows, art.n, art.k,
                 f.reader, f.variant, f.warps, f.values, f.columns,
-                p->compute == QK_COMPUTE_BF16 ? "INITIAL_COMPUTE" : "MEASURED_DECODE", compute_name(p->compute));
+                p->matched ? matched_name(p->smallm.policy) : p->compute == QK_COMPUTE_BF16 ? "INITIAL_COMPUTE" : "MEASURED_DECODE",
+                p->matched ? p->smallm.policy : p->compute == QK_COMPUTE_BF16 ? QKS_COMPUTE_INITIAL : QKS_DECODE_MEASURED, compute_name(p->compute));
         } else GGML_LOG_INFO("[quactlize-plan] tensor=%s op=%s route=gemv q=%d rows=%d n=%" PRId64 " k=%" PRId64
             " columns=%d warps=%d split=%d selection=MEASURED_GEMV_POOL activation=FP16 scale_resident=%d\n", weight->name, ids ? "grouped" : "dense",
             art.qtype, p->rows, art.n, art.k, p->gemv_config.columns, p->gemv_config.warps, p->gemv_config.split,
@@ -343,7 +388,7 @@ Plan & prepare(ggml_backend_cuda_context & ctx, const ggml_tensor * weight,
                             owner.api->query(owner.runtime, &r, &p->choice);
         };
         int status = p->table_tc ? QKS_OK : QKS_MISS;
-        if (p->compute == QK_COMPUTE_F16 && mode == RouteMode::Auto && art.qtype == GGML_TYPE_Q4_K && owner.api->query_decode) {
+        if (!p->table_tc && p->compute == QK_COMPUTE_F16 && mode == RouteMode::Auto && art.qtype == GGML_TYPE_Q4_K && owner.api->query_decode) {
             status = query_tc(true);
             if (status != QKS_OK && status != QKS_MISS)
                 GGML_ABORT("[quactlize] %s: decode TC selection: %s", weight->name, owner.api->error());

@@ -543,6 +543,78 @@ int main(int argc, char ** argv) {
         with self.assertRaisesRegex(ValueError, "unbound BF16 Q4"):
             selection(line, bad)
 
+    def test_matched_caller_retains_exact_ticket_and_recipe(self):
+        root = Path(__file__).resolve().parents[1]
+        adapter = (root / "ggml/src/ggml-cuda/quactlize-execution.cu").read_text()
+        body = "bool apply_matched(" + adapter.split("bool apply_matched(", 1)[1].split("const char * matched_name", 1)[0]
+        self.assertLess(adapter.index("owner.api->query_smallm_matched(owner.runtime"), adapter.index("if (!p->matched)"))
+        self.assertIn("if (!p->table_tc && p->compute == QK_COMPUTE_F16", adapter)
+        self.assertIn("sizes = p->smallm.sizes;", adapter)
+        with tempfile.TemporaryDirectory() as tmp:
+            source, binary = Path(tmp) / "matched.cpp", Path(tmp) / "matched"
+            source.write_text('''#include "quactlize/kpack_dispatch.h"
+#include <cassert>
+#include <cstring>
+#include <initializer_list>
+struct Plan {
+  qks_smallm_choice_v1 smallm{};qks_choice_v1 choice{};qkg_q4_decode_config_v1 q4_config{};
+  int compute=0;bool matched=false,direct=false,table_tc=false,reuse=false,q4_decode=false;
+};
+''' + body + '''
+int main() {
+  for(int compute:{0,1}) for(int policy:{12,13,14}) for(int kind:{0,1,2}) {
+    Plan p;p.compute=compute;
+    qks_smallm_choice_v2 m{2,sizeof(m)};m.compute_type=compute;
+    auto& b=m.base;b.version=1;b.size=sizeof(b);b.kind=kind;b.policy=policy;
+    b.source_n=512;b.source_k=2048;b.source_tokens=8;b.sizes.workspace_bytes=16384;
+    b.simt={1,sizeof(b.simt),3,4,8,4,8};m.q4={1,sizeof(m.q4),2,7,8,8,4};
+    b.tc.version=1;b.tc.size=sizeof(b.tc);b.tc.policy=policy;b.tc.ticket=UINT64_C(0x123456789abcdef0);
+    b.tc.algorithm=4;b.tc.split=8;b.tc.grid=72;b.tc.workspace_bytes=65536;b.tc.shared_bytes=32768;
+    strcpy(b.tc.parent,"matched-parent");strcpy(b.tc.build_key,"exact-build");
+    assert(apply_matched(p,m));assert(p.matched && p.direct==(kind!=0) && p.table_tc==(kind==0));
+    assert(p.reuse==(kind==1) && p.q4_decode==(kind==2));assert(!memcmp(&p.smallm,&b,sizeof(b)));
+    if(kind==0) assert(!memcmp(&p.choice,&b.tc,sizeof(b.tc)));
+    if(kind==2) assert(!memcmp(&p.q4_config,&m.q4,sizeof(m.q4)));
+    for(int fault=0;fault<7;++fault) {
+      auto bad=m;Plan rejected;rejected.compute=compute;
+      if(fault==0) bad.version=1;if(fault==1) --bad.size;if(fault==2) bad.compute_type=1-compute;
+      if(fault==3) bad.base.version=2;if(fault==4) --bad.base.size;
+      if(fault==5) bad.base.kind=3;if(fault==6) bad.base.policy=11;
+      assert(!apply_matched(rejected,bad) && !rejected.matched);
+    }
+  }
+}
+''')
+            subprocess.run(['g++', '-std=c++17', '-O2', '-I' + str(root / 'ggml/src/ggml-cuda'),
+                            str(source), '-o', str(binary)], check=True)
+            subprocess.run([str(binary)], check=True)
+
+    def test_matched_trace_receipts_bind_compute_policy(self):
+        labels = {12: "MATCHED_EXACT", 13: "MATCHED_BUCKET_PREDICTED", 14: "MATCHED_ROUTER_MINIMAX"}
+        generic = dict(variant=3, columns=4, warps=8, values=4, split=8)
+        for compute in ("FP16", "BF16"):
+            module = dict(key="a" * 64, parent=dict(symbol="matched", qtype=12, route="fq-dense"),
+                          identity=dict(compute_type="bf16" if compute == "BF16" else "f16"))
+            manifest = dict(modules=[module], compute_contract=True, smallm_matched_policy=dict(path="smallm-matched-policy.json"),
+                            execution_receipt=dict(simt_compute_v2=dict(compute=["f16", "bf16"]),
+                                simt_configs={"12": [generic]}, q4_decode_compute_v2=dict(compute=["f16", "bf16"]),
+                                q4_decode_configs={"1024x2048": [[2, 7, 8, 8, 4]]}))
+            for policy, label in labels.items():
+                suffix = f" policy={policy} activation={compute}"
+                lines = [
+                    "[quactlize-plan] tensor=w op=dense route=fq q=12 rows=1 parent=matched build=" + "a" * 64 + " split=8 grid=72" + suffix,
+                    "[quactlize-plan] tensor=w op=dense route=gemv reader=simt-reuse q=12 variant=3 columns=4 warps=8 values=4 split=8" + suffix,
+                    "[quactlize-plan] tensor=w op=dense route=gemv-q4-s1 q=12 rows=1 n=1024 k=2048 reader=2 variant=7 warps=8 values=8 columns=4 split=1 selection=" + label + suffix,
+                ]
+                for line in lines:
+                    self.assertTrue(selection(line, manifest, ["dense"])["fully_selected"])
+                    bad = copy.deepcopy(manifest)
+                    del bad["smallm_matched_policy"]
+                    with self.assertRaisesRegex(ValueError, "unbound matched"):
+                        selection(line, bad, ["dense"])
+                with self.assertRaises(ValueError):
+                    selection(lines[2].replace(label, "INITIAL_COMPUTE"), manifest)
+
     def test_abba(self):
         arms = []
         for arm in ("reference", "native", "native", "reference"):
