@@ -104,6 +104,13 @@ def selection(text, manifest, expected_ops=None):
                     "unbound full-BF16 prefill receipt")
         elif r["route"] == "gemv-q4-s1":
             require(r.get("q")=="12" and r.get("split")=="1", "invalid measured Q4 S1 plan")
+        elif r["route"] == "gemv" and r.get("reader") == "simt-reuse":
+            names = ("variant", "columns", "warps", "values", "split")
+            config = {name:int(r.get(name, -1)) for name in names}
+            inventory = manifest.get("execution_receipt", {}).get("simt_configs", {}).get(r.get("q"), [])
+            require(manifest.get("smallm_policy") and r.get("policy") in ("9", "10") and
+                    r.get("activation") == "FP16" and any(all(c.get(k)==v for k,v in config.items()) for c in inventory),
+                    "unbound small-M SIMT recipe")
         elif r["route"] in ("fq", "sf"):
             m = modules.get(r.get("build"))
             require(
@@ -589,8 +596,9 @@ def proof(args):
         require(len(decoded) == len(names), "demangled symbol count differs")
         for name, demangled in zip(names, decoded):
             is_q4 = "quactlize::execution::q4_decode::kernel<" in demangled
+            reuse = re.search(r"quactlize::execution::simt::register_reuse<\s*(\d+),\s*(\d+),\s*(\d+),\s*(\d+),\s*(\d+),\s*(\d+)\s*>", demangled)
             is_provider = build in provider_ops and re.search(r"(?i)(?:bf16|bfloat16)",demangled) and re.search(r"(?i)gemm",demangled)
-            if "cutlass::device_kernel<" in demangled or is_q4 or is_provider or re.search(
+            if "cutlass::device_kernel<" in demangled or is_q4 or reuse or is_provider or re.search(
                 r"kpack_q(?:8|10|11|12|13|14)::", demangled
             ):
                 item = symbols.setdefault(
@@ -611,7 +619,9 @@ def proof(args):
                         r["op"]
                         for r in plans["plans"]
                         if (r["route"] == "gemv" and q and r["q"] == q[1]) or
-                           (is_q4 and r["route"]=="gemv-q4-s1")
+                           (is_q4 and r["route"]=="gemv-q4-s1") or
+                           (reuse and r.get("reader")=="simt-reuse" and tuple(map(int,reuse.groups())) ==
+                            (int(r["q"]),1,*[int(r[k]) for k in ("variant","columns","warps","values")]))
                     }
                 item["ops"] = sorted(set(item["ops"]) | ops)
     total, matched = activity(db, symbols)

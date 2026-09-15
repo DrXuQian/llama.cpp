@@ -39,6 +39,13 @@ const ggml_quactlize_execution_api * ggml_quactlize_execution_library() {
         QZ_BIND(gemv_query, device, "quactlize_kpack_gemv_query_v1");
         QZ_BIND(gemv_run, device, "quactlize_kpack_gemv_run_v1");
         QZ_BIND(sf_prepare, device, "quactlize_kpack_sf_prepare_v1");
+        result.query_smallm = reinterpret_cast<decltype(result.query_smallm)>(
+            dlsym(host, "quactlize_kpack_dispatch_query_smallm_v1"));
+        if (result.query_smallm) {
+            QZ_BIND(simt_query, device, "quactlize_kpack_simt_query_v1");
+            QZ_BIND(simt_run, device, "quactlize_kpack_simt_run_v1");
+            QZ_BIND(moe_create_reuse, host, "quactlize_kpack_dispatch_moe_create_v3");
+        }
         result.q4_select = reinterpret_cast<decltype(result.q4_select)>(
             dlsym(device, "quactlize_kpack_q4_decode_select_v1"));
         result.query_decode = reinterpret_cast<decltype(result.query_decode)>(
@@ -71,6 +78,10 @@ const ggml_quactlize_execution_api * ggml_quactlize_execution_library() {
             dlsym(host,"quactlize_kpack_dispatch_moe_create_v2"));
         result.moe_simt_scratch = reinterpret_cast<decltype(result.moe_simt_scratch)>(
             dlsym(host,"quactlize_kpack_dispatch_moe_simt_scratch_v1"));
+        result.moe_bind_finish = reinterpret_cast<decltype(result.moe_bind_finish)>(
+            dlsym(host,"quactlize_kpack_dispatch_moe_bind_finish_v1"));
+        if (result.moe_bind_finish && !dlsym(device,"quactlize_kpack_moe_weighted_finish_v1"))
+            GGML_ABORT("[quactlize] weighted MoE finish host/device package differs");
         if (bool(result.moe_create_mixed) != bool(result.moe_simt_scratch))
             GGML_ABORT("[quactlize] incomplete mixed MoE interface");
         if (result.moe_create_mixed && (!result.moe_run || !result.moe_run_router || !result.moe_destroy ||
