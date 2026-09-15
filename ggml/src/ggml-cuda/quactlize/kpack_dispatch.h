@@ -14,7 +14,8 @@ enum { QKS_OK = 0, QKS_MISS = 1, QKS_INVALID = 2, QKS_BINDING = 3,
 enum { QKS_RECENT = 1, QKS_HISTORICAL = 2, QKS_PREDICTED = 3,
        QKS_DEVICE_BOUNDS = 4, QKS_MEASURED_GROUPED = 5, QKS_Q8_INITIAL = 6,
        QKS_DECODE_MEASURED = 7, QKS_COMPONENT_MEASURED = 8,
-       QKS_SMALLM_EXACT = 9, QKS_SMALLM_BUCKET = 10 };
+       QKS_SMALLM_EXACT = 9, QKS_SMALLM_BUCKET = 10,
+       QKS_COMPUTE_INITIAL = 11 };
 
 // Additive Q8_0/W8A16 intake capability, without a device/context or JIT.
 // Returns 1 for supported weight geometry and SF route (1=dense,3=grouped).
@@ -54,6 +55,10 @@ typedef struct {
 // BUCKET is predicted; source_* identify the donor. Q4's joint board is unchanged
 // and returns MISS here. A miss retains the caller's existing legal K-pack route.
 int quactlize_kpack_dispatch_query_smallm_v1(void* runtime,qkg_call_v1 const*,
+    quactlize_ppu_placed_arrangement_v2 const*,qks_smallm_choice_v1*);
+// Explicit compute: BF16 geometry is an initial proposal, not an FP16 timing
+// relabeled as BF16. F16 delegates to the existing policy unchanged.
+int quactlize_kpack_dispatch_query_smallm_v2(void* runtime,qkg_simt_call_v2 const*,
     quactlize_ppu_placed_arrangement_v2 const*,qks_smallm_choice_v1*);
 
 typedef struct {
@@ -105,6 +110,15 @@ int quactlize_kpack_dispatch_query_dense_io_v1(void* runtime,qks_request_v1 cons
                                             int32_t endpoint_type,int32_t decode_policy,qks_choice_v1*);
 int quactlize_kpack_dispatch_prepare_dense_io_v1(void* runtime,qks_choice_v1 const*,
                                                qkd_dense_call_v1 const*,void** handle);
+// compute_type is QK_COMPUTE_F16/BF16. endpoint_type is 0 for grouped native
+// compute storage, or QKD_F32/BF16 for dense M1..8. BF16 group support includes
+// prefill. Tickets, modules and JIT keys include compute precision.
+int quactlize_kpack_dispatch_query_compute_v1(void* runtime,qks_request_v1 const*,
+    int32_t compute_type,int32_t endpoint_type,int32_t decode_policy,qks_choice_v1*);
+int quactlize_kpack_dispatch_prepare_compute_v1(void* runtime,qks_choice_v1 const*,
+    qk_compute_device_call_v3 const*,void** handle);
+int quactlize_kpack_dispatch_prepare_dense_io_v2(void* runtime,qks_choice_v1 const*,
+    qkd_dense_call_v2 const*,void** handle);
 int quactlize_kpack_dispatch_prepare_v1(void* runtime, qks_choice_v1 const*,
                                      qk_call_v1 const*, void** handle);
 int quactlize_kpack_dispatch_run_v1(void* handle, void* stream);
@@ -156,6 +170,15 @@ typedef struct {
 } qks_moe_endpoint_v3;
 int quactlize_kpack_dispatch_moe_create_v3(void* runtime,qks_moe_endpoint_v3 const* gate,
     qks_moe_endpoint_v3 const* up,qks_moe_endpoint_v3 const* down,void** chain);
+typedef struct {
+    uint32_t version,size;
+    qks_moe_endpoint_v3 endpoint;
+    int32_t compute_type;
+} qks_moe_endpoint_v4;
+// All linked projections must have the same compute type. BF16 SIMT uses
+// reuse_config and the explicit v2 reader; legacy FP16-only readers decline.
+int quactlize_kpack_dispatch_moe_create_v4(void* runtime,qks_moe_endpoint_v4 const* gate,
+    qks_moe_endpoint_v4 const* up,qks_moe_endpoint_v4 const* down,void** chain);
 // Optional once-only binding outside capture. Loads the small finish module,
 // validates disjoint live inputs, and copies the immutable output contract.
 // On success run writes finish.output, not the intermediate down tensor.

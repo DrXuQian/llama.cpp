@@ -46,6 +46,19 @@ const ggml_quactlize_execution_api * ggml_quactlize_execution_library() {
             QZ_BIND(simt_run, device, "quactlize_kpack_simt_run_v1");
             QZ_BIND(moe_create_reuse, host, "quactlize_kpack_dispatch_moe_create_v3");
         }
+        result.query_compute = reinterpret_cast<decltype(result.query_compute)>(
+            dlsym(host, "quactlize_kpack_dispatch_query_compute_v1"));
+        if (result.query_compute) {
+            QZ_BIND(prepare_compute, host, "quactlize_kpack_dispatch_prepare_compute_v1");
+            QZ_BIND(prepare_dense_compute, host, "quactlize_kpack_dispatch_prepare_dense_io_v2");
+            QZ_BIND(query_smallm_compute, host, "quactlize_kpack_dispatch_query_smallm_v2");
+            QZ_BIND(moe_create_compute, host, "quactlize_kpack_dispatch_moe_create_v4");
+            QZ_BIND(simt_query_compute, device, "quactlize_kpack_simt_query_v2");
+            QZ_BIND(simt_run_compute, device, "quactlize_kpack_simt_run_v2");
+            if (!dlsym(device, "quactlize_kpack_moe_mixed_stage_v2") ||
+                !dlsym(device, "quactlize_kpack_moe_weighted_finish_v2"))
+                GGML_ABORT("[quactlize] incomplete BF16 MoE helper package");
+        }
         result.q4_select = reinterpret_cast<decltype(result.q4_select)>(
             dlsym(device, "quactlize_kpack_q4_decode_select_v1"));
         result.query_decode = reinterpret_cast<decltype(result.query_decode)>(
