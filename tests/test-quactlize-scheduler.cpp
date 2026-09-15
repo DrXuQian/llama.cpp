@@ -92,7 +92,12 @@ int main(int argc, char ** argv) {
         CHECK(ggml_backend_supports_buft(gpu, kpack));
         CHECK(!ggml_backend_supports_buft(cpu, kpack));
         CHECK(ggml_backend_supports_buft(gpu, ggml_backend_cuda_buffer_type(0)));
-        CHECK(ggml_backend_supports_buft(gpu, ggml_backend_cuda_split_buffer_type(0, nullptr)));
+        auto split_buffer_type = (ggml_backend_split_buffer_type_t) ggml_backend_reg_get_proc_address(
+            ggml_backend_dev_backend_reg(dev), "ggml_backend_split_buffer_type");
+        if (split_buffer_type) {
+            ggml_backend_buffer_type_t split = split_buffer_type(0, nullptr);
+            CHECK(split && ggml_backend_supports_buft(gpu, split));
+        }
         ggml_backend_buffer_type foreign = *kpack;
         foreign.device = ggml_backend_get_device(cpu);
         CHECK(!ggml_backend_supports_buft(gpu, &foreign));

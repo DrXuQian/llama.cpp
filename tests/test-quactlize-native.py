@@ -15,6 +15,11 @@ from quactlize_native import timings, selection, summarize, PATTERN
 
 
 class NativeEvidence(unittest.TestCase):
+    def test_scheduler_compiles_against_current_public_backend_api(self):
+        root = Path(__file__).resolve().parents[1]
+        subprocess.run(['c++', '-std=c++17', '-fsyntax-only', '-I' + str(root / 'ggml/include'),
+                        '-I' + str(root / 'ggml/src'), str(root / 'tests/test-quactlize-scheduler.cpp')], check=True)
+
     def test_aoneci_build_enables_kpack_without_disabling_ci_hooks(self):
         root = Path(__file__).resolve().parents[1]
         script = root / '.aoneci/scripts/build.sh'
@@ -44,6 +49,13 @@ class NativeEvidence(unittest.TestCase):
             result = subprocess.run(['bash', str(scripts / 'build.sh')], env=env, capture_output=True, text=True)
             self.assertEqual(result.returncode, 1)
             self.assertIn('build output exists', result.stderr)
+            self.assertEqual(marker.read_text(), 'existing output')
+            cache = old / 'CMakeCache.txt'
+            cache.write_text('CMAKE_HOME_DIRECTORY:INTERNAL=/wrong-source\nCMAKE_CUDA_COMPILER:STRING=/wrong-nvcc\n')
+            result = subprocess.run(['bash', str(scripts / 'build.sh')], env=dict(env, LLAMA_BUILD_REUSE='1'),
+                                    capture_output=True, text=True)
+            self.assertEqual(result.returncode, 1)
+            self.assertIn('reused llama build source/compiler differs', result.stderr)
             self.assertEqual(marker.read_text(), 'existing output')
 
     def test_ncp_wrapper_link_is_target_local_and_incremental(self):
