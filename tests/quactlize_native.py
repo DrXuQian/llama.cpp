@@ -80,6 +80,11 @@ def timings(response, payload):
     )
 
 
+def simt_symbol_recipe(name):
+    match = re.search(r"quactlize::execution::simt::register_reuse<\s*(\d+),\s*(\d+),\s*(\d+),\s*(\d+),\s*(\d+),\s*(\d+)(?:,\s*(\d+))?\s*>", name)
+    return tuple(int(x or 0) for x in match.groups()) if match else None
+
+
 def selection(text, manifest, expected_ops=None):
     require(
         not re.search(r"CUDA error:|PPU error:|GGML_ASSERT|GGML_ABORT", text),
@@ -610,7 +615,7 @@ def proof(args):
         require(len(decoded) == len(names), "demangled symbol count differs")
         for name, demangled in zip(names, decoded):
             is_q4 = "quactlize::execution::q4_decode::kernel<" in demangled
-            reuse = re.search(r"quactlize::execution::simt::register_reuse<\s*(\d+),\s*(\d+),\s*(\d+),\s*(\d+),\s*(\d+),\s*(\d+)\s*>", demangled)
+            reuse = simt_symbol_recipe(demangled)
             is_provider = build in provider_ops and re.search(r"(?i)(?:bf16|bfloat16)",demangled) and re.search(r"(?i)gemm",demangled)
             if "cutlass::device_kernel<" in demangled or is_q4 or reuse or is_provider or re.search(
                 r"kpack_q(?:8|10|11|12|13|14)::", demangled
@@ -634,8 +639,9 @@ def proof(args):
                         for r in plans["plans"]
                         if (r["route"] == "gemv" and q and r["q"] == q[1]) or
                            (is_q4 and r["route"]=="gemv-q4-s1") or
-                           (reuse and r.get("reader")=="simt-reuse" and tuple(map(int,reuse.groups())) ==
-                            (int(r["q"]),1,*[int(r[k]) for k in ("variant","columns","warps","values")]))
+                           (reuse and r.get("reader")=="simt-reuse" and reuse ==
+                            (int(r["q"]),1,*[int(r[k]) for k in ("variant","columns","warps","values")],
+                             int(r.get("activation")=="BF16")))
                     }
                 item["ops"] = sorted(set(item["ops"]) | ops)
     total, matched = activity(db, symbols)
