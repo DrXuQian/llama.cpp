@@ -750,9 +750,6 @@ static results_perplexity perplexity(llama_context * ctx, const common_params & 
 
             if (num_batches > 1 && n_outputs > 0) {
                 const auto * batch_logits = llama_get_logits(ctx);
-                if (!numerical_debug.mode.empty()) {
-                    numerical_check_logits(batch_logits, size_t(n_outputs) * n_vocab);
-                }
                 logits.insert(logits.end(), batch_logits, batch_logits + size_t(n_outputs) * n_vocab);
             }
         }
@@ -2004,6 +2001,9 @@ static void kl_divergence(llama_context * ctx, const common_params & params) {
 
             if (num_batches > 1 && n_outputs > 0) {
                 const auto * batch_logits = llama_get_logits(ctx);
+                if (!numerical_debug.mode.empty()) {
+                    numerical_check_logits(batch_logits, size_t(n_outputs) * n_vocab);
+                }
                 logits.insert(logits.end(), batch_logits, batch_logits + size_t(n_outputs) * n_vocab);
             }
         }
