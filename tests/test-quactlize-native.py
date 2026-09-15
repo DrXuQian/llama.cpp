@@ -201,7 +201,7 @@ target_link_libraries(test_moe PRIVATE ncp_moe)
         directory.mkdir(parents=True)
         library = directory / "kernel.so"
         library.write_bytes(b"module fixture")
-        record = dict(key=key, parent=dict(symbol="parent", qtype=12, route="fq-grouped"),
+        record = dict(key=key, parent=dict(symbol="parent", qtype=12, route="fq-grouped"), identity=dict(compute_type="f16"),
                       sha256=hashlib.sha256(library.read_bytes()).hexdigest(),
                       path=str(library) if cached else f"modules/{key}/kernel.so")
         args = SimpleNamespace(bundle=bundle, jit_cache=cache, jit_python=Path("/python"),
@@ -487,7 +487,7 @@ int main(int argc, char ** argv) {
         manifest = dict(
             modules=[
                 dict(
-                    key="a" * 64, parent=dict(symbol="p", qtype=12, route="sf-grouped")
+                    key="a" * 64, parent=dict(symbol="p", qtype=12, route="sf-grouped"), identity=dict(compute_type="f16")
                 )
             ]
         )
@@ -521,6 +521,27 @@ int main(int argc, char ** argv) {
         self.assertEqual(selection(line,dict(modules=[]))["plans"][0]["route"], "gemv-q4-s1")
         with self.assertRaises(ValueError):
             selection(line.replace("split=1", "split=4"), dict(modules=[]))
+
+    def test_bf16_q4_fastpath_identity_is_not_a_measured_fp16_recipe(self):
+        line = ("[quactlize-plan] tensor=w op=grouped route=gemv-q4-s1 q=12 rows=8 n=1024 k=2048 "
+                "reader=2 variant=7 warps=8 values=8 columns=4 split=1 selection=INITIAL_COMPUTE activation=BF16")
+        manifest = dict(modules=[], compute_contract=True, execution_receipt=dict(
+            q4_decode_compute_v2=dict(compute=["f16", "bf16"]),
+            q4_decode_configs={"1024x2048": [[2, 7, 8, 8, 4]]}))
+        plan = selection(line, manifest, ["grouped"])["plans"][0]
+        name = "void quactlize::execution::q4_decode::kernel_bf16<1, 2, 7, 8, 8, 4, 1024, 2048>(qkg_call_v1)"
+        recipe = native.q4_symbol_recipe(name)
+        self.assertTrue(native.q4_symbol_matches_plan(recipe, plan))
+        for wrong in (name.replace("kernel_bf16", "kernel"), name.replace("<1,", "<2,"),
+                      name.replace("1024,", "512,")):
+            self.assertFalse(native.q4_symbol_matches_plan(native.q4_symbol_recipe(wrong), plan))
+        for old, new in (("INITIAL_COMPUTE", "MEASURED_DECODE"), ("variant=7", "variant=6")):
+            with self.assertRaisesRegex(ValueError, "unbound BF16 Q4"):
+                selection(line.replace(old, new), manifest)
+        bad = copy.deepcopy(manifest)
+        del bad["execution_receipt"]["q4_decode_compute_v2"]
+        with self.assertRaisesRegex(ValueError, "unbound BF16 Q4"):
+            selection(line, bad)
 
     def test_abba(self):
         arms = []

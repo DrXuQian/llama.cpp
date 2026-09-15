@@ -1,5 +1,6 @@
 #pragma once
 #include "kpack_execution.h"
+#include "kpack_simt.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -25,6 +26,15 @@ int quactlize_kpack_q4_decode_select_v1(qkg_call_v1 const*,
 // Callers retain buffers until completion and use one stream for dependencies.
 int quactlize_kpack_q4_decode_run_v1(qkg_call_v1 const*,
     qkg_q4_decode_config_v1 const*, quactlize_ppu_placed_arrangement_v2 const*);
+
+// BF16 compute is a separate arithmetic contract, not a measured BF16 policy.
+// Select transfers only the existing specialized reader geometry. A rounds to
+// BF16 from F32/BF16 storage; Q4 affine dequant and accumulation are FP32.
+// F16 delegates to v1 unchanged. No generic-reader or F16 compute fallback.
+int quactlize_kpack_q4_decode_select_v2(qkg_simt_call_v2 const*,
+    quactlize_ppu_placed_arrangement_v2 const*,qkg_q4_decode_config_v1*,qkg_sizes_v1*);
+int quactlize_kpack_q4_decode_run_v2(qkg_simt_call_v2 const*,
+    qkg_q4_decode_config_v1 const*,quactlize_ppu_placed_arrangement_v2 const*);
 
 // F32-endpoint TC adapters used by the measured decode path. Dense cast:
 // input=1 maps strided F32 -> compact F16; input=0 maps compact F16 -> F32.

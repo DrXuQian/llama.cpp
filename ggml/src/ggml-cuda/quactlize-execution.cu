@@ -253,6 +253,17 @@ Plan & prepare(ggml_backend_cuda_context & ctx, const ggml_tensor * weight,
                 p->table_tc = !p->direct;
                 if (p->table_tc) p->choice = p->smallm.tc;
             }
+            if (p->reuse && p->smallm.policy == QKS_COMPUTE_INITIAL && mode == RouteMode::Auto &&
+                art.qtype == GGML_TYPE_Q4_K && owner.api->q4_select_compute) {
+                qkg_sizes_v1 sizes{};
+                int q4_status = owner.api->q4_select_compute(&typed, &art.arrangement, &p->q4_config, &sizes);
+                if (q4_status != QKG_OK && q4_status != QKG_SHAPE)
+                    GGML_ABORT("[quactlize] %s: BF16 Q4 decode selection failed rc=%d", weight->name, q4_status);
+                if (q4_status == QKG_OK) {
+                    p->q4_decode = true;
+                    p->reuse = false;
+                }
+            }
         } else if (p->compute == QK_COMPUTE_BF16) {
             // Prefill uses the grouped TC compute interface below.
         } else if (mode == RouteMode::Auto && art.qtype == GGML_TYPE_Q4_K && owner.api->q4_select) {
@@ -285,11 +296,19 @@ Plan & prepare(ggml_backend_cuda_context & ctx, const ggml_tensor * weight,
         auto & c = p->gemv;
         qkg_sizes_v1 sizes{};
         qkg_simt_call_v2 typed{2, sizeof(typed), c, p->compute};
-        int rc = p->compute == QK_COMPUTE_BF16 ?
-            owner.api->simt_query_compute(&typed, &p->smallm.simt, &art.arrangement, &sizes) :
-            p->reuse ? owner.api->simt_query(&c, &p->smallm.simt, &art.arrangement, &sizes) :
-            p->q4_decode ? owner.api->q4_select(&c, &art.arrangement, &p->q4_config, &sizes) :
-            owner.api->gemv_query(&c, &p->gemv_config, &art.arrangement, &sizes);
+        int rc;
+        if (p->reuse) {
+            rc = p->compute == QK_COMPUTE_BF16 ?
+                owner.api->simt_query_compute(&typed, &p->smallm.simt, &art.arrangement, &sizes) :
+                owner.api->simt_query(&c, &p->smallm.simt, &art.arrangement, &sizes);
+        } else if (p->q4_decode) {
+            rc = p->compute == QK_COMPUTE_BF16 ?
+                owner.api->q4_select_compute(&typed, &art.arrangement, &p->q4_config, &sizes) :
+                owner.api->q4_select(&c, &art.arrangement, &p->q4_config, &sizes);
+        } else {
+            GGML_ASSERT(p->compute == QK_COMPUTE_F16);
+            rc = owner.api->gemv_query(&c, &p->gemv_config, &art.arrangement, &sizes);
+        }
         if (rc != QKG_OK) GGML_ABORT("[quactlize] %s: GEMV query failed rc=%d", weight->name, rc);
         c.workspace = slot ? owner.private_storage(sizes.workspace_bytes) : owner.storage(stream, sizes.workspace_bytes);
         c.workspace_bytes = sizes.workspace_bytes;
@@ -302,9 +321,10 @@ Plan & prepare(ggml_backend_cuda_context & ctx, const ggml_tensor * weight,
         } else if (p->q4_decode) {
             auto f = p->q4_config;
             GGML_LOG_INFO("[quactlize-plan] tensor=%s op=%s route=gemv-q4-s1 q=%d rows=%d n=%" PRId64 " k=%" PRId64
-                " reader=%d variant=%d warps=%d values=%d columns=%d split=1 selection=MEASURED_DECODE\n",
+                " reader=%d variant=%d warps=%d values=%d columns=%d split=1 selection=%s activation=%s\n",
                 weight->name, ids ? "grouped" : "dense", art.qtype, p->rows, art.n, art.k,
-                f.reader, f.variant, f.warps, f.values, f.columns);
+                f.reader, f.variant, f.warps, f.values, f.columns,
+                p->compute == QK_COMPUTE_BF16 ? "INITIAL_COMPUTE" : "MEASURED_DECODE", compute_name(p->compute));
         } else GGML_LOG_INFO("[quactlize-plan] tensor=%s op=%s route=gemv q=%d rows=%d n=%" PRId64 " k=%" PRId64
             " columns=%d warps=%d split=%d selection=MEASURED_GEMV_POOL activation=FP16 scale_resident=%d\n", weight->name, ids ? "grouped" : "dense",
             art.qtype, p->rows, art.n, art.k, p->gemv_config.columns, p->gemv_config.warps, p->gemv_config.split,
@@ -660,11 +680,19 @@ bool ggml_quactlize_execution_run(ggml_backend_cuda_context & ctx, const ggml_te
         GGML_ABORT("[quactlize] %s: per-call SF prepass failed", weight->name);
     if (p.direct) {
         qkg_simt_call_v2 typed{2,sizeof(typed),p.gemv,p.compute};
-        int rc = p.compute == QK_COMPUTE_BF16 ?
-            p.api->simt_run_compute(&typed, &p.smallm.simt, &p.art.arrangement) :
-            p.reuse ? p.api->simt_run(&p.gemv, &p.smallm.simt, &p.art.arrangement) :
-            p.q4_decode ? p.api->q4_run(&p.gemv, &p.q4_config, &p.art.arrangement) :
-            p.api->gemv_run(&p.gemv, &p.gemv_config, &p.art.arrangement);
+        int rc;
+        if (p.reuse) {
+            rc = p.compute == QK_COMPUTE_BF16 ?
+                p.api->simt_run_compute(&typed, &p.smallm.simt, &p.art.arrangement) :
+                p.api->simt_run(&p.gemv, &p.smallm.simt, &p.art.arrangement);
+        } else if (p.q4_decode) {
+            rc = p.compute == QK_COMPUTE_BF16 ?
+                p.api->q4_run_compute(&typed, &p.q4_config, &p.art.arrangement) :
+                p.api->q4_run(&p.gemv, &p.q4_config, &p.art.arrangement);
+        } else {
+            GGML_ASSERT(p.compute == QK_COMPUTE_F16);
+            rc = p.api->gemv_run(&p.gemv, &p.gemv_config, &p.art.arrangement);
+        }
         if (rc != QKG_OK)
             GGML_ABORT("[quactlize] %s: GEMV launch failed", weight->name);
         ggml_ncp_route_log(output, "so-quactlize-kpack-gemv", nullptr);

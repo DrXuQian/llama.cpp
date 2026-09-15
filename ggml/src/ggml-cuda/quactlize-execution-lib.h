@@ -28,6 +28,8 @@ struct ggml_quactlize_execution_api {
     decltype(&quactlize_kpack_dispatch_moe_bind_finish_v1) moe_bind_finish;
     decltype(&quactlize_kpack_q4_decode_select_v1) q4_select;
     decltype(&quactlize_kpack_q4_decode_run_v1) q4_run;
+    decltype(&quactlize_kpack_q4_decode_select_v2) q4_select_compute;
+    decltype(&quactlize_kpack_q4_decode_run_v2) q4_run_compute;
     decltype(&quactlize_kpack_dispatch_query_decode_v1) query_decode;
     decltype(&quactlize_kpack_q4_decode_cast_v1) q4_cast;
     decltype(&quactlize_kpack_q4_decode_indexed_prepare_v1) q4_prepare;

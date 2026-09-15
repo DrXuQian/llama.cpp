@@ -61,6 +61,12 @@ const ggml_quactlize_execution_api * ggml_quactlize_execution_library() {
         }
         result.q4_select = reinterpret_cast<decltype(result.q4_select)>(
             dlsym(device, "quactlize_kpack_q4_decode_select_v1"));
+        result.q4_select_compute = reinterpret_cast<decltype(result.q4_select_compute)>(
+            dlsym(device, "quactlize_kpack_q4_decode_select_v2"));
+        result.q4_run_compute = reinterpret_cast<decltype(result.q4_run_compute)>(
+            dlsym(device, "quactlize_kpack_q4_decode_run_v2"));
+        if (bool(result.q4_select_compute) != bool(result.q4_run_compute))
+            GGML_ABORT("[quactlize] incomplete typed Q4 decode package");
         result.query_decode = reinterpret_cast<decltype(result.query_decode)>(
             dlsym(host, "quactlize_kpack_dispatch_query_decode_v1"));
         if (bool(result.q4_select) != bool(result.query_decode))
