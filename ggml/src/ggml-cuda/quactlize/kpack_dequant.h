@@ -19,6 +19,14 @@ typedef struct qzd_call_v1 {
     void *stream;
 } qzd_call_v1;
 
+typedef struct qzd_call_v2 {
+    uint32_t version, size;
+    qzd_call_v1 call;
+    // SF only: 0=FP16 (legacy), 1=direct BF16 metadata. FullyDequant
+    // always emits BF16 with the unchanged single-final-rounding contract.
+    int32_t metadata_type;
+} qzd_call_v2;
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -30,6 +38,10 @@ extern "C" {
 // Full10/11=packed-code exchange K128/K256, Full12=K256 K-fast CTA order.
 // Config IDs are experimental candidates, not production heuristic choices.
 int quactlize_kpack_dequant_v1(qzd_call_v1 const*, quactlize_ppu_placed_arrangement_v2 const*);
+// BF16 SF config0 selects N-fast/block128. Config4/5 additionally expose
+// Q4/Q5's uint4 unit reader with block128/256. The FP16 config namespace and
+// all FullyDequant kernels are unchanged. Other BF16 SF configs decline.
+int quactlize_kpack_dequant_v2(qzd_call_v2 const*, quactlize_ppu_placed_arrangement_v2 const*);
 int quactlize_kpack_dequant_probe_v1(int* l2_bytes, int* sm_count, int* warp_size);
 #ifdef __cplusplus
 }

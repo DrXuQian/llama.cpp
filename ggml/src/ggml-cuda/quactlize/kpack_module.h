@@ -13,6 +13,7 @@ enum { QK_OK = 0, QK_UNSUPPORTED = 1, QK_INVALID = 2,
 enum { QK_DENSE_FQ = 0, QK_DENSE_SF = 1, QK_GROUPED_FQ = 2, QK_GROUPED_SF = 3 };
 enum { QK_ORDINARY = 0, QK_PERSISTENT = 1 };
 enum { QK_COMPUTE_F16=0, QK_COMPUTE_BF16=1 };
+enum { QK_METADATA_F16=0, QK_METADATA_BF16=1 };
 
 typedef struct {
   uint32_t version, size;
@@ -66,6 +67,20 @@ typedef struct {
   int32_t compute_type;
 } qk_compute_identity_v3;
 
+// Explicit metadata precision. For K-quants, SF metadata/zero point to
+// planes of this type; FQ still takes packed units and unfolds to this type.
+// Q8_0 has no expanded metadata: its original FP16 d plane stays FP16.
+typedef struct {
+  uint32_t version,size;
+  qk_device_call_v2 device_call;
+  int32_t compute_type, metadata_type;
+} qk_compute_device_call_v4;
+typedef struct {
+  uint32_t version,size;
+  qk_identity_v1 const* parent;
+  int32_t compute_type, metadata_type;
+} qk_compute_identity_v4;
+
 typedef struct {
   uint32_t version, size;
   int32_t algorithm, split, grid;
@@ -103,6 +118,12 @@ int quactlize_kpack_grouped_prepare_v2(qk_device_call_v2 const*, qk_recipe_v1 co
 qk_compute_identity_v3 const* quactlize_kpack_compute_identity_v3(void);
 int quactlize_kpack_grouped_query_v3(qk_compute_device_call_v3 const*,qk_recipe_v1 const*,qk_resources_v1*);
 int quactlize_kpack_grouped_prepare_v3(qk_compute_device_call_v3 const*,qk_recipe_v1 const*,void**);
+
+// Typed metadata successor. A BF16-metadata module rejects the older v3
+// entry before dereferencing any buffer. F16 modules continue to accept v3.
+qk_compute_identity_v4 const* quactlize_kpack_compute_identity_v4(void);
+int quactlize_kpack_grouped_query_v4(qk_compute_device_call_v4 const*,qk_recipe_v1 const*,qk_resources_v1*);
+int quactlize_kpack_grouped_prepare_v4(qk_compute_device_call_v4 const*,qk_recipe_v1 const*,void**);
 
 #ifdef __cplusplus
 }

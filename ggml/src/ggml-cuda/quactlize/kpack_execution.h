@@ -77,6 +77,15 @@ int quactlize_kpack_sf_prepare_v1(int qtype, int n, int k, int experts,
     uint16_t * scale, uint16_t * zero, uint64_t plane_bytes,
     quactlize_ppu_placed_arrangement_v2 const *, void * stream);
 
+// Additive BF16 scale/zero producer, with identical plane sizes/strides.
+// metadata_type: 0 delegates to the unchanged FP16 producer; 1 emits BF16.
+// Raw GGUF headers are FP16 values, but decoded scale/zero never round to
+// FP16. BF16 FQ and SF share the same per-group arithmetic/centre correction.
+int quactlize_kpack_sf_prepare_v2(int qtype, int n, int k, int experts,
+    uint8_t const * units, uint64_t units_bytes,
+    uint16_t * scale, uint16_t * zero, uint64_t plane_bytes,
+    quactlize_ppu_placed_arrangement_v2 const *, int metadata_type, void * stream);
+
 #ifdef __cplusplus
 }
 #endif
