@@ -85,7 +85,7 @@ def simt_symbol_recipe(name):
     if vector:
         storage, compute, variant, columns, warps, values = map(int, vector.groups())
         return (8, storage, variant + 4, columns, warps, values, compute)
-    match = re.search(r"quactlize::execution::simt::register_reuse<\s*(\d+),\s*(\d+),\s*(\d+),\s*(\d+),\s*(\d+),\s*(\d+)(?:,\s*(\d+))?\s*>", name)
+    match = re.search(r"quactlize::execution::simt::register_reuse<\s*(\d+),\s*(\d+),\s*(\d+),\s*(\d+),\s*(\d+),\s*(\d+)(?:,\s*(\d+))?(?:,\s*(?:0|1|3))?\s*>", name)
     return tuple(int(x or 0) for x in match.groups()) if match else None
 
 
