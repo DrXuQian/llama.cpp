@@ -81,6 +81,10 @@ def timings(response, payload):
 
 
 def simt_symbol_recipe(name):
+    vector = re.search(r"quactlize::execution::simt::q8_vector::kernel<\s*" + r",\s*".join([r"(\d+)"] * 6) + r"\s*>", name)
+    if vector:
+        storage, compute, variant, columns, warps, values = map(int, vector.groups())
+        return (8, storage, variant + 4, columns, warps, values, compute)
     match = re.search(r"quactlize::execution::simt::register_reuse<\s*(\d+),\s*(\d+),\s*(\d+),\s*(\d+),\s*(\d+),\s*(\d+)(?:,\s*(\d+))?\s*>", name)
     return tuple(int(x or 0) for x in match.groups()) if match else None
 
@@ -114,11 +118,15 @@ def selection(text, manifest, expected_ops=None):
             and r.get("route") in ("fq", "sf", "gemv", "gemv-q4-s1", "full-bf16"),
             "invalid plan receipt",
         )
-        matched_labels = {"12": "MATCHED_EXACT", "13": "MATCHED_BUCKET_PREDICTED", "14": "MATCHED_ROUTER_MINIMAX"}
+        matched_labels = {"12": "MATCHED_EXACT", "13": "MATCHED_BUCKET_PREDICTED", "14": "MATCHED_ROUTER_MINIMAX", "15": "Q8_VECTOR_MEASURED"}
         matched = r.get("policy") in matched_labels
         if matched:
             require(manifest.get("smallm_matched_policy") and r.get("activation") in ("FP16", "BF16"),
                     "unbound matched compute policy")
+        if r.get("policy") == "15":
+            require(manifest.get("q8_vector_policy") and r.get("q") == "8" and
+                    r.get("reader") == "simt-q8-vector" and r.get("variant") in ("4", "5"),
+                    "unbound Q8 vector replacement")
         if r["route"] == "full-bf16":
             require(manifest.get("prefill") and int(r.get("q",0)) in range(10,15)
                     and int(r.get("n",0))>0 and int(r.get("k",0))>0
@@ -137,7 +145,7 @@ def selection(text, manifest, expected_ops=None):
                 require((not bf16 or (manifest.get("compute_contract") and "bf16" in compute.get("compute", []))) and
                         r.get("selection") == (matched_labels[r["policy"]] if matched else "INITIAL_COMPUTE") and config in configs,
                         "unbound BF16 Q4 proposal or measured relabel")
-        elif r["route"] == "gemv" and r.get("reader") == "simt-reuse":
+        elif r["route"] == "gemv" and r.get("reader") in ("simt-reuse", "simt-q8-vector"):
             names = ("variant", "columns", "warps", "values", "split")
             config = {name:int(r.get(name, -1)) for name in names}
             inventory = manifest.get("execution_receipt", {}).get("simt_configs", {}).get(r.get("q"), [])
@@ -668,7 +676,7 @@ def proof(args):
                         for r in plans["plans"]
                         if (r["route"] == "gemv" and q and r["q"] == q[1]) or
                            q4_symbol_matches_plan(q4, r) or
-                           (reuse and r.get("reader")=="simt-reuse" and reuse ==
+                           (reuse and r.get("reader") in ("simt-reuse", "simt-q8-vector") and reuse ==
                             (int(r["q"]),1,*[int(r[k]) for k in ("variant","columns","warps","values")],
                              int(r.get("activation")=="BF16")))
                     }

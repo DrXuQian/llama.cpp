@@ -96,8 +96,9 @@ struct Plan {
 bool apply_matched(Plan & p, const qks_smallm_choice_v2 & selected) {
     const auto & c = selected.base;
     if (selected.version != 2 || selected.size != sizeof(selected) || selected.compute_type != p.compute ||
-        c.version != 1 || c.size != sizeof(c) || c.policy < QKS_MATCHED_EXACT || c.policy > QKS_MATCHED_ROUTER ||
+        c.version != 1 || c.size != sizeof(c) || c.policy < QKS_MATCHED_EXACT || c.policy > QKS_Q8_VECTOR_MEASURED ||
         c.kind < QKS_SMALLM_TC || c.kind > QKS_SMALLM_Q4) return false;
+    if (c.policy == QKS_Q8_VECTOR_MEASURED && (c.kind != QKS_SMALLM_SIMT || c.simt.variant < 4 || c.simt.variant > 5)) return false;
     if (c.kind == QKS_SMALLM_TC && (c.tc.version != 1 || c.tc.size != sizeof(c.tc) || !c.tc.ticket || c.tc.policy != c.policy)) return false;
     if (c.kind == QKS_SMALLM_SIMT && (c.simt.version != 1 || c.simt.size != sizeof(c.simt))) return false;
     if (c.kind == QKS_SMALLM_Q4 && (selected.q4.version != 1 || selected.q4.size != sizeof(selected.q4))) return false;
@@ -114,6 +115,7 @@ bool apply_matched(Plan & p, const qks_smallm_choice_v2 & selected) {
 const char * matched_name(int policy) {
     if (policy == QKS_MATCHED_EXACT) return "MATCHED_EXACT";
     if (policy == QKS_MATCHED_BUCKET) return "MATCHED_BUCKET_PREDICTED";
+    if (policy == QKS_Q8_VECTOR_MEASURED) return "Q8_VECTOR_MEASURED";
     return "MATCHED_ROUTER_MINIMAX";
 }
 struct Scratch { void * pointer = nullptr; size_t capacity = 0; };
@@ -358,18 +360,18 @@ Plan & prepare(ggml_backend_cuda_context & ctx, const ggml_tensor * weight,
         c.workspace_bytes = sizes.workspace_bytes;
         if (p->reuse) {
             auto f = p->smallm.simt;
-            GGML_LOG_INFO("[quactlize-plan] tensor=%s op=%s route=gemv reader=simt-reuse q=%d rows=%d n=%" PRId64 " k=%" PRId64
-                " variant=%d columns=%d warps=%d values=%d split=%d policy=%d activation=%s scale_resident=%d\n",
-                weight->name, ids ? "grouped" : "dense", art.qtype, p->rows, art.n, art.k,
-                f.variant, f.columns, f.warps, f.values, f.split, p->smallm.policy, compute_name(p->compute), int(art.qtype == GGML_TYPE_Q8_0));
+            GGML_LOG_INFO("[quactlize-plan] tensor=%s op=%s route=gemv reader=%s q=%d rows=%d n=%" PRId64 " k=%" PRId64
+                " variant=%d columns=%d warps=%d values=%d split=%d policy=%d activation=%s scale_resident=%d experts=%d channels=%d topk=%d\n",
+                weight->name, ids ? "grouped" : "dense", f.variant >= 4 ? "simt-q8-vector" : "simt-reuse", art.qtype, p->rows, art.n, art.k,
+                f.variant, f.columns, f.warps, f.values, f.split, p->smallm.policy, compute_name(p->compute), int(art.qtype == GGML_TYPE_Q8_0), c.experts, c.channels, c.topk);
         } else if (p->q4_decode) {
             auto f = p->q4_config;
             GGML_LOG_INFO("[quactlize-plan] tensor=%s op=%s route=gemv-q4-s1 q=%d rows=%d n=%" PRId64 " k=%" PRId64
-                " reader=%d variant=%d warps=%d values=%d columns=%d split=1 selection=%s policy=%d activation=%s\n",
+                " reader=%d variant=%d warps=%d values=%d columns=%d split=1 selection=%s policy=%d activation=%s experts=%d channels=%d topk=%d\n",
                 weight->name, ids ? "grouped" : "dense", art.qtype, p->rows, art.n, art.k,
                 f.reader, f.variant, f.warps, f.values, f.columns,
                 p->matched ? matched_name(p->smallm.policy) : p->compute == QK_COMPUTE_BF16 ? "INITIAL_COMPUTE" : "MEASURED_DECODE",
-                p->matched ? p->smallm.policy : p->compute == QK_COMPUTE_BF16 ? QKS_COMPUTE_INITIAL : QKS_DECODE_MEASURED, compute_name(p->compute));
+                p->matched ? p->smallm.policy : p->compute == QK_COMPUTE_BF16 ? QKS_COMPUTE_INITIAL : QKS_DECODE_MEASURED, compute_name(p->compute), c.experts, c.channels, c.topk);
         } else GGML_LOG_INFO("[quactlize-plan] tensor=%s op=%s route=gemv q=%d rows=%d n=%" PRId64 " k=%" PRId64
             " columns=%d warps=%d split=%d selection=MEASURED_GEMV_POOL activation=FP16 scale_resident=%d\n", weight->name, ids ? "grouped" : "dense",
             art.qtype, p->rows, art.n, art.k, p->gemv_config.columns, p->gemv_config.warps, p->gemv_config.split,
