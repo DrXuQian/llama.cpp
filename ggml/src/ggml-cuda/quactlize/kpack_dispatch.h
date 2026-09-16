@@ -91,6 +91,11 @@ typedef struct {
 // Interior knot transfer sets predicted=1; no unmeasured 5% guarantee.
 int quactlize_kpack_dispatch_prefill_v1(qks_request_v1 const*, uint32_t mask,
                                       qks_prefill_choice_v1*);
+// F16 is unchanged. BF16 grouped uses the same measured F16 component
+// ranking as an INITIAL route proposal, with predicted=1; its costs are
+// donor costs, not relabeled BF16 measurements. No small-M full expansion.
+int quactlize_kpack_dispatch_prefill_compute_v1(qks_request_v1 const*, uint32_t mask,
+    int32_t compute_type, qks_prefill_choice_v1*);
 
 // One runtime per device/context. root contains the exact modules packaged
 // with this host library. open/query/prepare belong outside graph capture.
@@ -133,6 +138,11 @@ int quactlize_kpack_dispatch_query_compute_v1(void* runtime,qks_request_v1 const
     int32_t compute_type,int32_t endpoint_type,int32_t decode_policy,qks_choice_v1*);
 int quactlize_kpack_dispatch_prepare_compute_v1(void* runtime,qks_choice_v1 const*,
     qk_compute_device_call_v3 const*,void** handle);
+// BF16 K-quant SF requires explicit BF16 metadata; v1 rejects those planes.
+// Query selection is shared, but the typed module identity is checked before
+// prepare. FQ packed bytes and Q8's original FP16 d are unchanged.
+int quactlize_kpack_dispatch_prepare_compute_v2(void* runtime,qks_choice_v1 const*,
+    qk_compute_device_call_v4 const*,void** handle);
 int quactlize_kpack_dispatch_prepare_dense_io_v2(void* runtime,qks_choice_v1 const*,
     qkd_dense_call_v2 const*,void** handle);
 int quactlize_kpack_dispatch_prepare_v1(void* runtime, qks_choice_v1 const*,

@@ -9,6 +9,8 @@ extern "C" {
 // scalar/pair/Q4 APIs and their admitted recipes remain unchanged.
 // variant bit0 shares A within Columns lanes; bit1 shares packed metadata
 // within a warp. Values is adjacent output columns owned by one thread.
+// Q8-only variants4/5 select the vector reader, with bit0 retaining its A
+// meaning. They require F32 storage; v2 selects F16 or BF16 compute explicitly.
 // Dot and output are F32. A is rounded to F16 in registers; dequantization
 // uses F32 group-affine arithmetic, not per-weight F16 reconstruction.
 typedef struct {

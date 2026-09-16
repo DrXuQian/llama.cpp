@@ -51,7 +51,9 @@ const ggml_quactlize_execution_api * ggml_quactlize_execution_library() {
         result.query_compute = reinterpret_cast<decltype(result.query_compute)>(
             dlsym(host, "quactlize_kpack_dispatch_query_compute_v1"));
         if (result.query_compute) {
-            QZ_BIND(prepare_compute, host, "quactlize_kpack_dispatch_prepare_compute_v1");
+            QZ_BIND(prepare_compute, host, "quactlize_kpack_dispatch_prepare_compute_v2");
+            QZ_BIND(sf_prepare_compute, device, "quactlize_kpack_sf_prepare_v2");
+            QZ_BIND(prefill_compute, host, "quactlize_kpack_dispatch_prefill_compute_v1");
             QZ_BIND(prepare_dense_compute, host, "quactlize_kpack_dispatch_prepare_dense_io_v2");
             QZ_BIND(query_smallm_compute, host, "quactlize_kpack_dispatch_query_smallm_v2");
             QZ_BIND(moe_create_compute, host, "quactlize_kpack_dispatch_moe_create_v4");
@@ -121,6 +123,7 @@ const ggml_quactlize_execution_api * ggml_quactlize_execution_library() {
             if (!prefill) GGML_ABORT("[quactlize] prefill runtime load: %s", dlerror());
             if (!result.prefill_choice) GGML_ABORT("[quactlize] prefill runtime lacks the matching host selector");
             QZ_BIND(dequant, prefill, "quactlize_kpack_dequant_v1");
+            QZ_BIND(dequant_compute, prefill, "quactlize_kpack_dequant_v2");
             QZ_BIND(full_query, prefill, "quactlize_kpack_prefill_query_v1");
             QZ_BIND(full_prepare, prefill, "quactlize_kpack_prefill_prepare_v1");
             QZ_BIND(full_run, prefill, "quactlize_kpack_prefill_run_v1");

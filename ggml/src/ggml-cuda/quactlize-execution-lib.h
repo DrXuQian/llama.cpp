@@ -16,6 +16,7 @@ struct ggml_quactlize_execution_api {
     decltype(&quactlize_kpack_gemv_query_v1) gemv_query;
     decltype(&quactlize_kpack_gemv_run_v1) gemv_run;
     decltype(&quactlize_kpack_sf_prepare_v1) sf_prepare;
+    decltype(&quactlize_kpack_sf_prepare_v2) sf_prepare_compute;
     decltype(&quactlize_kpack_dispatch_enable_jit_v1) enable_jit;
     decltype(&quactlize_kpack_dispatch_bind_llama_indexed_v1) bind_indexed;
     decltype(&quactlize_kpack_dispatch_moe_create_v1) moe_create;
@@ -37,7 +38,9 @@ struct ggml_quactlize_execution_api {
     decltype(&quactlize_kpack_dispatch_query_dense_io_v1) query_dense_io;
     decltype(&quactlize_kpack_dispatch_prepare_dense_io_v1) prepare_dense_io;
     decltype(&quactlize_kpack_dispatch_prefill_v1) prefill_choice;
+    decltype(&quactlize_kpack_dispatch_prefill_compute_v1) prefill_compute;
     decltype(&quactlize_kpack_dequant_v1) dequant;
+    decltype(&quactlize_kpack_dequant_v2) dequant_compute;
     decltype(&quactlize_kpack_prefill_query_v1) full_query;
     decltype(&quactlize_kpack_prefill_prepare_v1) full_prepare;
     decltype(&quactlize_kpack_prefill_run_v1) full_run;
@@ -48,7 +51,7 @@ struct ggml_quactlize_execution_api {
     decltype(&quactlize_kpack_simt_query_v1) simt_query;
     decltype(&quactlize_kpack_simt_run_v1) simt_run;
     decltype(&quactlize_kpack_dispatch_query_compute_v1) query_compute;
-    decltype(&quactlize_kpack_dispatch_prepare_compute_v1) prepare_compute;
+    decltype(&quactlize_kpack_dispatch_prepare_compute_v2) prepare_compute;
     decltype(&quactlize_kpack_dispatch_prepare_dense_io_v2) prepare_dense_compute;
     decltype(&quactlize_kpack_dispatch_query_smallm_v2) query_smallm_compute;
     decltype(&quactlize_kpack_dispatch_moe_create_v4) moe_create_compute;

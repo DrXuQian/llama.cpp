@@ -15,6 +15,33 @@ from quactlize_native import timings, selection, summarize, PATTERN
 
 
 class NativeEvidence(unittest.TestCase):
+    def test_bf16_compute_is_grouped_only(self):
+        root = Path(__file__).resolve().parents[1]
+        adapter = (root / "ggml/src/ggml-cuda/quactlize-execution.cu").read_text()
+        body = "int compute_type(" + adapter.split("int compute_type(", 1)[1].split("const char * compute_name", 1)[0]
+        with tempfile.TemporaryDirectory() as tmp:
+            source, binary = Path(tmp) / "compute.cpp", Path(tmp) / "compute"
+            source.write_text('''#include <cstdlib>
+#include <cstring>
+struct ggml_tensor {};
+enum { QK_COMPUTE_F16, QK_COMPUTE_BF16 };
+#define GGML_ABORT(...) std::exit(86)
+''' + body + '''
+int main(int argc, char **) {
+    ggml_tensor ids;
+    return compute_type(nullptr) != QK_COMPUTE_F16 || compute_type(&ids) != (argc == 2 ? QK_COMPUTE_BF16 : QK_COMPUTE_F16);
+}
+''')
+            subprocess.run(['c++', '-std=c++17', '-Wall', '-Wextra', '-Werror', str(source), '-o', str(binary)], check=True)
+            env = dict(os.environ)
+            env.pop('QUACTLIZE_KPACK_COMPUTE', None)
+            for value in (None, '', 'fp16', 'bf16', 'invalid'):
+                with self.subTest(compute=value):
+                    current = env if value is None else dict(env, QUACTLIZE_KPACK_COMPUTE=value)
+                    command = [str(binary)] + (['grouped-bf16'] if value == 'bf16' else [])
+                    result = subprocess.run(command, env=current)
+                    self.assertEqual(result.returncode, 86 if value == 'invalid' else 0)
+
     def test_scheduler_compiles_against_current_public_backend_api(self):
         root = Path(__file__).resolve().parents[1]
         subprocess.run(['c++', '-std=c++17', '-fsyntax-only', '-I' + str(root / 'ggml/include'),
