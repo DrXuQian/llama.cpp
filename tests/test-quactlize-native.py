@@ -251,6 +251,38 @@ target_link_libraries(test_moe PRIVATE ncp_moe)
                     self.assertIn("inspect", inspect.call_args.args[0])
                     self.assertIn("b"*64, inspect.call_args.args[0])
 
+    def test_model_evidence_obeys_grouped_only_bf16_scope(self):
+        for op in ("dense", "grouped"):
+            for rows in (1, 8, 9, 64, 1024, 16384):
+                for actual in ("FP16", "BF16"):
+                    with self.subTest(op=op, rows=rows, actual=actual), tempfile.TemporaryDirectory() as temp:
+                        args, record, line = self.module_fixture(Path(temp), False)
+                        record["parent"]["route"] = "fq-" + op
+                        record["identity"]["compute_type"] = "bf16" if actual == "BF16" else "f16"
+                        args.manifest["compute_contract"] = True
+                        args.expected_ops = [op]
+                        line = line.replace("op=grouped", "op=" + op).replace("rows=8", "rows=" + str(rows))
+                        line = line.replace("policy=1", "policy=11" if actual == "BF16" else "policy=1")
+                        line += " activation=" + actual
+                        expected = "BF16" if op == "grouped" else "FP16"
+                        with patch.dict(os.environ, QUACTLIZE_KPACK_COMPUTE="bf16"):
+                            if actual == expected:
+                                self.assertTrue(native.model_selection(args, line)["fully_selected"])
+                            else:
+                                with self.assertRaisesRegex(ValueError, "compute scope mismatch:.*expected=" + expected):
+                                    native.model_selection(args, line)
+
+    def test_bf16_full_prefill_still_requires_provider_evidence(self):
+        for op, rows in (("dense", 128), ("grouped", 1024)):
+            with self.subTest(op=op), tempfile.TemporaryDirectory() as temp:
+                args = SimpleNamespace(bundle=Path(temp), expected_ops=[op],
+                    manifest=dict(modules=[], prefill=dict(library="libquactlize_ppu_prefill.so")))
+                line = (f"[quactlize-plan] tensor=w op={op} route=full-bf16 q=12 rows={rows} "
+                        "n=1024 k=5120 cost_scope=ISOLATED_COMPONENT_SUM")
+                with patch.dict(os.environ, QUACTLIZE_KPACK_COMPUTE="bf16"):
+                    with self.assertRaisesRegex(ValueError, "full-BF16 composition payload differs"):
+                        native.model_selection(args, line)
+
     def test_cache_inspection_errors_do_not_admit_module(self):
         for fault in ("missing", "duplicate", "payload", "path", "parent", "compiler-failure", "bad-key"):
             with self.subTest(fault=fault), tempfile.TemporaryDirectory() as temp:
