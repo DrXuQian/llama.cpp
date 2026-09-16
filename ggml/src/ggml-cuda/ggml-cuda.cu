@@ -3140,7 +3140,8 @@ static bool ggml_cuda_check_fusion_memory_ranges(const ggml_cgraph * cgraph,
                                                  const int           node_count,
                                                  const int *         out_nodes,
                                                  const int           out_count,
-                                                 const bool          is_topk_moe = false) {
+                                                 const bool          is_topk_moe = false,
+                                                 const ggml_tensor * completed_input = nullptr) {
     auto nodes_overlap = [&](const ggml_tensor * a, const ggml_tensor * b) {
         const int64_t a_start = (int64_t) a->data;
         const int64_t a_end   = a_start + ggml_backend_buft_get_alloc_size(a->buffer->buft, a);
@@ -3172,7 +3173,8 @@ static bool ggml_cuda_check_fusion_memory_ranges(const ggml_cgraph * cgraph,
             for (int src_idx = 0; src_idx < GGML_MAX_SRC; ++src_idx) {
                 const ggml_tensor * src = cgraph->nodes[j]->src[src_idx];
 
-                if (!src || src->op == GGML_OP_NONE) {
+                // A staged fusion may finish a read before any output store.
+                if (!src || src->op == GGML_OP_NONE || src == completed_input) {
                     continue;
                 }
 
@@ -3461,9 +3463,10 @@ static int ggml_cuda_try_fuse_quactlize_router(ggml_backend_cuda_context & ctx, 
         (bias && (bias->type!=GGML_TYPE_F32 || !ggml_is_contiguous(bias)))) return 0;
     auto span=quactlize::llama::match_moe_router(graph,start,ops,ids_index,weights_index);
     if (!span.count) return 0;
-    // Preserved input views are not writes. Check only the real outputs.
+    // The dispatcher checks router snapshot aliases before launching stages.
+    // Later chain outputs may reuse logits after the router has finished.
     const int outputs[3]={ids_index,weights_index,start+span.count-1};
-    if (!ggml_cuda_check_fusion_memory_ranges(graph,start,span.count,outputs,3)) return 0;
+    if (!ggml_cuda_check_fusion_memory_ranges(graph,start,span.count,outputs,3,false,logits)) return 0;
     const qk_llama_router_v1 router{1,sizeof(router),int(args.sigmoid),int(clamp!=nullptr),
         int(args.delayed_softmax),0,clamp?ggml_get_op_params_f32(clamp,0):-INFINITY,
         scale?ggml_get_op_params_f32(scale,0):1.f,static_cast<float const*>(logits->data),
