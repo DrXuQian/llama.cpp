@@ -233,8 +233,13 @@ def model_selection(args, text):
     evidence = selection(text, args.manifest | dict(modules=modules), getattr(args, "expected_ops", None))
     if os.environ.get("QUACTLIZE_KPACK_COMPUTE") == "bf16":
         for p in evidence["plans"]:
-            if p["op"] == "grouped" or int(p["rows"]) <= 8:
-                require(p.get("activation") == "BF16", "explicit BF16 request fell back to FP16 compute")
+            if p["route"] == "full-bf16":
+                continue  # Composition has its own BF16 provider receipt below.
+            expected = "BF16" if p["op"] == "grouped" else "FP16"
+            actual = p.get("activation", "FP16")
+            require(actual == expected,
+                    f"compute scope mismatch: tensor={p.get('tensor')} op={p['op']} route={p['route']} "
+                    f"rows={p.get('rows')} expected={expected} got={actual}")
     evidence["modules"] = modules
     evidence["providers"] = provider_images(args, text, evidence["plans"])
     return evidence
