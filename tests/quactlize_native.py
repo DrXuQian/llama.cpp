@@ -81,7 +81,7 @@ def timings(response, payload):
 
 
 def simt_symbol_recipe(name):
-    vector = re.search(r"quactlize::execution::simt::q8_vector::kernel<\s*" + r",\s*".join([r"(\d+)"] * 6) + r"\s*>", name)
+    vector = re.search(r"quactlize::execution::simt::q8_vector::kernel<\s*" + r",\s*".join([r"(\d+)"] * 6) + r"(?:,\s*(?:true|false|0|1))?\s*>", name)
     if vector:
         storage, compute, variant, columns, warps, values = map(int, vector.groups())
         return (8, storage, variant + 4, columns, warps, values, compute)
