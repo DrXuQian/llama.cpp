@@ -131,6 +131,19 @@ const ggml_quactlize_execution_api * ggml_quactlize_execution_library() {
             QZ_BIND(full_error, prefill, "quactlize_kpack_prefill_error_v1");
             QZ_BIND(full_image, prefill, "quactlize_kpack_prefill_provider_image_v1");
         }
+        const char * paired = getenv("QUACTLIZE_KPACK_GATE_UP");
+        if (paired && strcmp(paired, "0") && strcmp(paired, "1"))
+            GGML_ABORT("[quactlize] QUACTLIZE_KPACK_GATE_UP must be 0 or 1");
+        if (paired && !strcmp(paired, "1")) {
+            void * fusion = dlopen((directory + "/libquactlize_ppu_gate_up.so").c_str(), RTLD_NOW | RTLD_LOCAL);
+            if (!fusion) GGML_ABORT("[quactlize] paired gate/up load: %s", dlerror());
+            QZ_BIND(paired_layout, fusion, "quactlize_gate_up_layout_v1");
+            QZ_BIND(paired_select, fusion, "quactlize_gate_up_select_v1");
+            QZ_BIND(paired_repack, fusion, "quactlize_gate_up_repack_v1");
+            QZ_BIND(paired_query, fusion, "quactlize_gate_up_query_v1");
+            QZ_BIND(paired_run, fusion, "quactlize_gate_up_run_v1");
+            QZ_BIND(moe_bind_gate_up, host, "quactlize_kpack_dispatch_moe_bind_gate_up_v1");
+        }
 #undef QZ_BIND
         GGML_LOG_INFO("[quactlize] native execution package: %s\n", root);
         return result;

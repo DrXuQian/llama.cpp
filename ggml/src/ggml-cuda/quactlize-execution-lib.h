@@ -58,6 +58,12 @@ struct ggml_quactlize_execution_api {
     decltype(&quactlize_kpack_simt_query_v2) simt_query_compute;
     decltype(&quactlize_kpack_simt_run_v2) simt_run_compute;
     decltype(&quactlize_kpack_dispatch_query_smallm_v3) query_smallm_matched;
+    decltype(&quactlize_gate_up_layout_v1) paired_layout;
+    decltype(&quactlize_gate_up_select_v1) paired_select;
+    decltype(&quactlize_gate_up_repack_v1) paired_repack;
+    decltype(&quactlize_gate_up_query_v1) paired_query;
+    decltype(&quactlize_gate_up_run_v1) paired_run;
+    decltype(&quactlize_kpack_dispatch_moe_bind_gate_up_v1) moe_bind_gate_up;
 };
 
 // QUACTLIZE_KPACK_EXECUTION names the complete native package. An explicit

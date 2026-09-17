@@ -3498,6 +3498,11 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 #ifdef GGML_NCP_QUACTLIZE
+    if (const int count = ggml_quactlize_execution_shared_nodes(cgraph,i)) {
+        const int output = i+count-1;
+        if (ggml_cuda_check_fusion_memory_ranges(cgraph,i,count,&output,1) &&
+            ggml_quactlize_execution_shared_run(*cuda_ctx,cgraph,i)) return count-1;
+    }
     if (const int count = ggml_quactlize_execution_moe_nodes(cgraph,i)) {
         const int output = i+count-1;
         if (ggml_cuda_check_fusion_memory_ranges(cgraph,i,count,&output,1) &&
