@@ -7,6 +7,7 @@
 #include "ncp-route.cuh"
 #include "ggml-impl.h"
 #include "quactlize/moe_graph.hpp"
+#include "quactlize/gate_up_graph.hpp"
 #include <array>
 #include <cinttypes>
 #include <cstdlib>
@@ -117,11 +118,22 @@ const char * matched_name(int policy) {
     return "MATCHED_ROUTER_MINIMAX";
 }
 struct Scratch { void * pointer = nullptr; size_t capacity = 0; };
+struct PairedWeights {
+    qkg_gate_up_layout_v1 layout{};
+    uint8_t * low = nullptr;
+    uint8_t * units = nullptr;
+};
+struct SharedPlan {
+    PairedWeights * weights = nullptr;
+    qkg_gate_up_call_v1 call{};
+    qkg_gate_up_config_v1 config{};
+};
 struct MoePlan {
     const ggml_quactlize_execution_api * api;
     Plan * gate, * up, * down;
     void * handle = nullptr;
     uint32_t simt_mask = 0;
+    PairedWeights * paired = nullptr;
     ~MoePlan() { if (handle) api->moe_destroy(handle); }
 };
 
@@ -130,6 +142,8 @@ struct Execution {
     void * runtime = nullptr;
     int device;
     std::map<Key, std::unique_ptr<Plan>> plans;
+    std::map<std::array<uint64_t, 9>, PairedWeights> paired_weights;
+    std::map<std::pair<Key, Key>, SharedPlan> shared_plans;
     std::map<std::tuple<Plan *,Plan *,Plan *,const ggml_tensor *,const ggml_tensor *>, std::unique_ptr<MoePlan>> moe_plans;
     std::map<cudaStream_t, Scratch> scratch;
     std::vector<void *> allocations;
@@ -178,6 +192,65 @@ Execution * execution(ggml_backend_cuda_context & ctx) {
     if (!api) return nullptr;
     if (!ctx.quactlize_execution) ctx.quactlize_execution = std::make_shared<Execution>(api, ctx.device);
     return static_cast<Execution *>(ctx.quactlize_execution.get());
+}
+
+void paired_log(const char * tensor, const char * op, int q, int tokens, int experts,
+                int compute, const qkg_gate_up_config_v1 & config) {
+    GGML_LOG_INFO("[quactlize-paired-plan] tensor=%s op=%s q=%d tokens=%d n=512 k=2048 experts=%d"
+        " backend=%s split=%d tile_m=%d warps=%d activation=%s layout=0x%016" PRIx64 "\n",
+        tensor,op,q,tokens,experts,config.backend==QKG_GATE_UP_SIMT?"simt":"tc",
+        config.split,config.tile_m,config.warps,compute_name(compute),QKG_GATE_UP_N4_V1);
+}
+
+PairedWeights * paired_weights(Execution & owner, const ggml_quactlize_artifact & gate,
+                              const ggml_quactlize_artifact * up, cudaStream_t stream,
+                              const qkg_gate_up_call_v1 & call, const qkg_gate_up_config_v1 & config) {
+    const int n = up ? gate.n : gate.n/2;
+    if (gate.high || (up && (up->high || up->qtype!=gate.qtype || up->n!=gate.n ||
+        up->k!=gate.k || up->experts!=gate.experts ||
+        memcmp(&gate.arrangement,&up->arrangement,sizeof(gate.arrangement))))) return nullptr;
+    std::array<uint64_t,9> key{uint64_t(uintptr_t(gate.low)),uint64_t(uintptr_t(gate.units)),
+        uint64_t(uintptr_t(gate.ready)),uint64_t(uintptr_t(up?up->low:nullptr)),
+        uint64_t(uintptr_t(up?up->units:nullptr)),uint64_t(uintptr_t(up?up->ready:nullptr)),
+        uint64_t(n),uint64_t(gate.k),uint64_t(gate.experts)};
+    auto found=owner.paired_weights.find(key);
+    if (found!=owner.paired_weights.end()) return &found->second;
+    cudaStreamCaptureStatus capture;
+    CUDA_CHECK(cudaStreamIsCapturing(stream,&capture));
+    GGML_ASSERT(capture==cudaStreamCaptureStatusNone);
+    PairedWeights result;
+    if (owner.api->paired_layout(gate.qtype,&result.layout)!=QKG_OK ||
+        memcmp(&gate.arrangement,&result.layout.packing,sizeof(gate.arrangement))) return nullptr;
+    qkg_sizes_v1 sizes{};
+    if (owner.api->paired_query(&call,&config,&result.layout,&sizes)!=QKG_OK || sizes.high_bytes)
+        GGML_ABORT("[quactlize] paired plane size query failed");
+    result.low=owner.private_storage(sizes.low_bytes);
+    result.units=owner.private_storage(sizes.units_bytes);
+    ggml_quactlize_wait_ready(gate,stream);
+    if (up) ggml_quactlize_wait_ready(*up,stream);
+    qkg_gate_up_repack_v1 repack{1,sizeof(repack),gate.qtype,n,int(gate.k),int(gate.experts),int(!up),
+        gate.low,gate.units,up?up->low:nullptr,up?up->units:nullptr,result.low,result.units};
+    if (owner.api->paired_repack(&repack,&result.layout,stream)!=QKG_OK)
+        GGML_ABORT("[quactlize] canonical-to-paired GPU repack failed");
+    // One-time setup, before capture. All later graphs may read the immutable
+    // auxiliary planes without an event dependency or host wait per token.
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    owner.scratch.try_emplace(stream);
+    GGML_LOG_INFO("[quactlize-paired-weights] q=%d n=%d k=%" PRId64 " experts=%" PRId64
+        " bytes=%" PRIu64 " canonical_retained=1 cache_format_unchanged=1\n",
+        gate.qtype,n,gate.k,gate.experts,sizes.low_bytes+sizes.units_bytes);
+    return &owner.paired_weights.emplace(key,result).first->second;
+}
+
+qkg_gate_up_call_v1 paired_call(int q, int experts, int tokens, int compute, bool indexed) {
+    qkg_gate_up_call_v1 d{};d.version=1;d.size=sizeof(d);
+    d.input.version=2;d.input.size=sizeof(d.input);d.input.compute_type=compute;
+    d.output_type=QKG_F32;d.round_projection=indexed;
+    auto & c=d.input.call;c.version=1;c.size=sizeof(c);c.qtype=q;
+    c.n=512;c.k=2048;c.experts=experts;c.rows=tokens*(indexed?8:1);
+    c.mode=indexed?QKG_INDEXED:QKG_DENSE;c.input_type=QKG_F32;c.channels=1;c.topk=indexed?8:1;
+    c.a_row_stride=c.k;c.a_token_stride=c.k;c.ids_stride=c.topk;c.out_row_stride=c.n;
+    return d;
 }
 
 qzd_call_v1 expansion_call(ggml_quactlize_artifact const & art, cudaStream_t stream) {
@@ -563,6 +636,39 @@ Plan & prepare(ggml_backend_cuda_context & ctx, const ggml_tensor * weight,
     owner.plans.emplace(key, std::move(p));
     return *result;
 }
+SharedPlan * prepare_shared(ggml_backend_cuda_context & ctx, const ggml_cgraph * graph, int start, bool create) {
+    auto * owner=execution(ctx);
+    if (!owner || !owner->api->paired_select || route_mode()!=RouteMode::Auto ||
+        !ctx.stream_context().concurrent_events.empty()) return nullptr;
+    auto match=quactlize::llama::match_shared_gate_up(graph,start);
+    if (!match.count) return nullptr;
+    ggml_quactlize_artifact gate{},up{};
+    if (!ggml_quactlize_artifact_for(match.gate->src[0],&gate) ||
+        !ggml_quactlize_artifact_for(match.up->src[0],&up)) return nullptr;
+    auto * input=match.gate->src[1];auto stream=ctx.stream();
+    auto key=std::make_pair(make_key(match.gate->src[0],input,nullptr,match.output,gate,stream,0),
+        make_key(match.up->src[0],input,nullptr,match.output,up,stream,0));
+    auto found=owner->shared_plans.find(key);
+    if (found!=owner->shared_plans.end()) return &found->second;
+    if (!create) return nullptr;
+    SharedPlan result;
+    int tokens=int(input->ne[1]);
+    if (owner->api->paired_select(gate.qtype,gate.n,gate.k,gate.experts,tokens,QK_COMPUTE_F16,&result.config)!=QKG_OK)
+        return nullptr;
+    result.call=paired_call(gate.qtype,gate.experts,tokens,QK_COMPUTE_F16,false);
+    result.weights=paired_weights(*owner,gate,&up,stream,result.call,result.config);
+    if (!result.weights) return nullptr;
+    auto & c=result.call.input.call;
+    c.a=input->data;c.output=static_cast<float*>(match.output->data);
+    c.low=result.weights->low;c.units=result.weights->units;c.stream=stream;
+    qkg_sizes_v1 sizes{};
+    if (owner->api->paired_query(&result.call,&result.config,&result.weights->layout,&sizes)!=QKG_OK)
+        GGML_ABORT("[quactlize] shared paired query failed");
+    if (sizes.workspace_bytes) { c.workspace=owner->private_storage(sizes.workspace_bytes);c.workspace_bytes=sizes.workspace_bytes; }
+    paired_log(match.gate->src[0]->name,"dense",gate.qtype,tokens,gate.experts,QK_COMPUTE_F16,result.config);
+    return &owner->shared_plans.emplace(key,result).first->second;
+}
+
 MoePlan * prepare_moe(ggml_backend_cuda_context & ctx, const ggml_cgraph * graph, int start, bool create) {
     auto * owner = execution(ctx);
     if (!owner || !owner->api->moe_create || !owner->api->moe_run || !owner->api->moe_destroy ||
@@ -640,12 +746,46 @@ MoePlan * prepare_moe(ggml_backend_cuda_context & ctx, const ggml_cgraph * graph
         if (rc==QKS_MISS) return nullptr;
         if (rc!=QKS_OK) GGML_ABORT("[quactlize] MoE finish binding: %s",owner->api->error());
     }
+    auto & gate=plans[0]->art;
+    if (owner->api->paired_select && route_mode()==RouteMode::Auto && !match.up &&
+        plans[0]->compute==QK_COMPUTE_BF16 && gate.qtype==12 && gate.n==1024 && gate.k==2048 &&
+        gate.experts==256 && plans[0]->topk==8 && match.gate->src[1]->ne[1]==1) {
+        qks_moe_gate_up_v1 binding{};binding.version=1;binding.size=sizeof(binding);
+        if (owner->api->paired_select(gate.qtype,gate.n/2,gate.k,gate.experts,plans[0]->tokens,
+                plans[0]->compute,&binding.config)!=QKG_OK)
+            GGML_ABORT("[quactlize] measured routed paired selection failed");
+        auto call=paired_call(gate.qtype,gate.experts,plans[0]->tokens,plans[0]->compute,true);
+        result->paired=paired_weights(*owner,gate,nullptr,ctx.stream(),call,binding.config);
+        if (!result->paired) GGML_ABORT("[quactlize] routed paired arrangement differs");
+        binding.low=result->paired->low;binding.units=result->paired->units;binding.layout=result->paired->layout;
+        qkg_sizes_v1 sizes{};
+        if (owner->api->paired_query(&call,&binding.config,&binding.layout,&sizes)!=QKG_OK)
+            GGML_ABORT("[quactlize] routed paired workspace query failed");
+        if (sizes.workspace_bytes) { binding.workspace=owner->private_storage(sizes.workspace_bytes);binding.workspace_bytes=sizes.workspace_bytes; }
+        const int paired_rc=owner->api->moe_bind_gate_up(owner->runtime,result->handle,&binding);
+        if (paired_rc!=QKS_OK)
+            GGML_ABORT("[quactlize] routed paired binding rc=%d: %s",paired_rc,owner->api->error());
+        paired_log(match.gate->src[0]->name,"grouped",gate.qtype,plans[0]->tokens,gate.experts,plans[0]->compute,binding.config);
+    }
     GGML_LOG_INFO("[quactlize-moe] gate=%s down=%s merged=%d rows=%d simt_mask=%u shared_prepare=1 swiglu_to_down=1 reduce_scatter=%d weighted_sum_finish=%d activation=%s\n",
         match.gate->src[0]->name,match.down->src[0]->name,int(!match.up),plans[0]->rows,result->simt_mask,
         int(!(result->simt_mask&4)),int(match.finish!=nullptr),compute_name(plans[0]->compute));
     auto * pointer=result.get(); owner->moe_plans.emplace(key,std::move(result)); return pointer;
 }
 } // namespace
+
+int ggml_quactlize_execution_shared_nodes(const ggml_cgraph * graph, int start) {
+    return quactlize::llama::match_shared_gate_up(graph,start).count;
+}
+bool ggml_quactlize_execution_shared_run(ggml_backend_cuda_context & ctx, ggml_cgraph * graph, int start) {
+    auto * plan=prepare_shared(ctx,graph,start,false);
+    if (!plan) return false;
+    auto call=plan->call;call.input.call.stream=ctx.stream();
+    const int rc=execution(ctx)->api->paired_run(&call,&plan->config,&plan->weights->layout);
+    if (rc!=QKG_OK) GGML_ABORT("[quactlize] shared paired launch failed rc=%d",rc);
+    ggml_ncp_route_log(graph->nodes[start+2],"so-quactlize-kpack-shared-paired",nullptr);
+    return true;
+}
 
 int ggml_quactlize_execution_moe_nodes(const ggml_cgraph * graph, int start) {
     return quactlize::llama::match_moe(graph,start).count;
@@ -674,7 +814,7 @@ static bool run_moe(ggml_backend_cuda_context & ctx, ggml_cgraph * graph, int st
     if (router && (!chain->api->moe_run_router || chain->gate->art.experts!=256)) return false;
     auto stream=ctx.stream();
     for (auto * p:{chain->gate,chain->up,chain->down}) {
-        if (!p) continue;
+        if (!p || (chain->paired && p!=chain->down)) continue;
         ggml_quactlize_wait_ready(p->art,stream);
         if (expand_sf(*p,stream)!=QKG_OK)
             GGML_ABORT("[quactlize] per-call MoE SF prepass failed");
@@ -717,7 +857,10 @@ void ggml_quactlize_execution_prepare_graph(ggml_backend_cuda_context & ctx, ggm
     }
     ctx.curr_stream_no = 0;
     if (ctx.stream_context().concurrent_events.empty())
-        for (int i=0;i<graph->n_nodes;++i) prepare_moe(ctx,graph,i,true);
+        for (int i=0;i<graph->n_nodes;++i) {
+            prepare_shared(ctx,graph,i,true);
+            prepare_moe(ctx,graph,i,true);
+        }
     ctx.curr_stream_no = saved_stream;
 }
 
@@ -803,6 +946,8 @@ bool ggml_quactlize_execution_run(ggml_backend_cuda_context & ctx, const ggml_te
 }
 #else
 void ggml_quactlize_execution_prepare_graph(ggml_backend_cuda_context &, ggml_cgraph *) {}
+int ggml_quactlize_execution_shared_nodes(const ggml_cgraph *, int) { return 0; }
+bool ggml_quactlize_execution_shared_run(ggml_backend_cuda_context &, ggml_cgraph *, int) { return false; }
 int ggml_quactlize_execution_moe_nodes(const ggml_cgraph *, int) { return 0; }
 bool ggml_quactlize_execution_moe_run(ggml_backend_cuda_context &, ggml_cgraph *, int) { return false; }
 bool ggml_quactlize_execution_moe_router_run(ggml_backend_cuda_context &, ggml_cgraph *, int,

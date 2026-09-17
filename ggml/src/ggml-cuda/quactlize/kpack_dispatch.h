@@ -4,6 +4,7 @@
 #include "kpack_decode_io.h"
 #include "kpack_q4_decode.h"
 #include "kpack_simt.h"
+#include "kpack_gate_up.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -211,6 +212,20 @@ int quactlize_kpack_dispatch_moe_create_v4(void* runtime,qks_moe_endpoint_v4 con
 // A miss leaves the chain unchanged. No qtype/layout/config selection changes.
 int quactlize_kpack_dispatch_moe_bind_finish_v1(void* runtime,void* chain,
     qk_llama_moe_finish_v1 const*);
+// Replace only gate/up and activation in an existing compatible MoE chain.
+// The caller owns paired planes and disjoint Split-K workspace. Routing,
+// down's current endpoint, weighted finish and their lifetimes are unchanged.
+// Bind outside capture; MISS leaves the chain on its original path.
+typedef struct {
+    uint32_t version,size;
+    uint8_t const * low, * high, * units;
+    void * workspace;
+    uint64_t workspace_bytes;
+    qkg_gate_up_layout_v1 layout;
+    qkg_gate_up_config_v1 config;
+} qks_moe_gate_up_v1;
+int quactlize_kpack_dispatch_moe_bind_gate_up_v1(void* runtime,void* chain,
+    qks_moe_gate_up_v1 const*);
 // All chain versions use the same run/router/destroy entries. Mixed chains
 // retain SIMT F32 results and TC FP16 completion semantics through SwiGLU.
 int quactlize_kpack_dispatch_moe_run_v1(void* chain,void* stream);

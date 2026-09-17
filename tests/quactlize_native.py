@@ -102,6 +102,46 @@ def q4_symbol_matches_plan(recipe, plan):
     return recipe == (1, *[int(plan.get(k, -1)) for k in fields], int(plan.get("activation") == "BF16"))
 
 
+def paired_symbol_recipe(name):
+    simt=re.search(r"quactlize::fusion::simt_gate_up<\s*(\d+),\s*(\d+),\s*(\d+),\s*(\d+)\s*>",name)
+    if simt:
+        q,storage,compute,warps=map(int,simt.groups())
+        return dict(q=q,storage=storage,compute=compute,warps=warps,tile_m=0,backend='simt')
+    tc=re.search(r"quactlize::fusion::tc_gate_up<quactlize::fusion::TcTypes<\s*(\d+),\s*(\d+),\s*cutlass::(half_t|bfloat16_t),\s*float\s*>",name)
+    if tc:
+        return dict(q=int(tc[1]),storage=1,compute=int(tc[3]=='bfloat16_t'),warps=0,tile_m=int(tc[2]),backend='tc')
+    return None
+
+
+def paired_matches_plan(recipe,plan):
+    return recipe and recipe==dict(q=int(plan['q']),storage=1,compute=int(plan['activation']=='BF16'),
+        warps=int(plan['warps']),tile_m=int(plan['tile_m']),backend=plan['backend'])
+
+
+def paired_selection(text,manifest):
+    records=[]
+    for line in text.splitlines():
+        if '[quactlize-paired-plan]' not in line:continue
+        r=dict(re.findall(r'([a-z_]+)=([^\s]+)',line))
+        receipt=manifest.get('paired_gate_up',{})
+        require(receipt.get('layout_id')=='0x47554e3400000001' and r.get('layout')==receipt['layout_id'],
+                'unbound paired layout receipt')
+        q,tokens,experts=map(lambda key:int(r.get(key,0)),('q','tokens','experts'))
+        require(r.get('n')=='512' and r.get('k')=='2048' and 1<=tokens<=8,'unmeasured paired shape')
+        if q==8:
+            require(r.get('op')=='dense' and experts==1 and r.get('activation')=='FP16','paired shared precision/scope differs')
+            expected=('simt',1,0,8)
+        else:
+            require(q==12 and r.get('op')=='grouped' and experts==256 and r.get('activation')=='BF16',
+                    'paired routed precision/scope differs')
+            expected=(('simt',1,0,4 if tokens==2 else 8) if tokens<=2 or tokens==4
+                      else ('tc',2 if tokens==3 else 1,16 if tokens<=6 else 8,0))
+        require((r.get('backend'),int(r.get('split',0)),int(r.get('tile_m',-1)),int(r.get('warps',-1)))==expected,
+                'paired recipe is outside the confirmed cohort')
+        records.append(r)
+    return records
+
+
 def selection(text, manifest, expected_ops=None):
     require(
         not re.search(r"CUDA error:|PPU error:|GGML_ASSERT|GGML_ABORT", text),
@@ -187,6 +227,7 @@ def selection(text, manifest, expected_ops=None):
     ]
     return dict(
         plans=plans,
+        paired_plans=paired_selection(text,manifest),
         fallbacks=fallbacks,
         prepass=prepass,
         fully_selected=not fallbacks
@@ -636,6 +677,11 @@ def proof(args):
     libraries = [(Path(m["path"]), m["origin"] + "/" + m["key"], m["key"])
                  for m in plans["modules"]]
     libraries.append((args.bundle / "libquactlize_ppu_execution.so", "execution", None))
+    if plans.get('paired_plans'):
+        receipt=args.manifest.get('paired_gate_up',{})
+        path=args.bundle/'libquactlize_ppu_gate_up.so'
+        require(path.is_file() and hashlib.sha256(path.read_bytes()).hexdigest()==receipt.get('sha256'),'paired trace library differs')
+        libraries.append((path,'paired-gate-up',None))
     provider_ops = {}
     for record in plans.get("providers", []):
         if record["provider"]=="deepgemm":
@@ -658,15 +704,18 @@ def proof(args):
         for name, demangled in zip(names, decoded):
             q4 = q4_symbol_recipe(demangled)
             reuse = simt_symbol_recipe(demangled)
+            paired = paired_symbol_recipe(demangled) if label=='paired-gate-up' else None
             is_provider = build in provider_ops and re.search(r"(?i)(?:bf16|bfloat16)",demangled) and re.search(r"(?i)gemm",demangled)
-            if "cutlass::device_kernel<" in demangled or q4 or reuse or is_provider or re.search(
+            if "cutlass::device_kernel<" in demangled or q4 or reuse or paired or is_provider or re.search(
                 r"kpack_q(?:8|10|11|12|13|14)::", demangled
             ):
                 item = symbols.setdefault(
                     name, dict(name=demangled, libraries=[], ops=[])
                 )
                 item["libraries"].append(label)
-                if build in provider_ops:
+                if paired:
+                    ops={r['op'] for r in plans.get('paired_plans',[]) if paired_matches_plan(paired,r)}
+                elif build in provider_ops:
                     ops = provider_ops[build] if is_provider else set()
                 elif build:
                     ops = {
@@ -694,8 +743,13 @@ def proof(args):
     # A proof covers its own short request. It is not counted as an untraced
     # performance sample or as device evidence for every ABBA parent.
     expected_ops = set(getattr(args, "expected_ops", ("dense", "grouped")))
+    paired_ops={op for m in matched if 'paired-gate-up' in symbols[m['mangled']]['libraries']
+                for op in symbols[m['mangled']]['ops']}
+    missing_paired={r['op'] for r in plans.get('paired_plans',[])}-paired_ops
     result = dict(
-        kernel_execution="PASS_SHORT_REQUEST" if ops == expected_ops and not missing_providers else "PARTIAL_SHORT_REQUEST",
+        kernel_execution="PASS_SHORT_REQUEST" if ops == expected_ops and not missing_providers and not missing_paired else "PARTIAL_SHORT_REQUEST",
+        paired_observed_ops=sorted(paired_ops),
+        paired_missing_ops=sorted(missing_paired),
         gpu_kernel_calls=total,
         matched=matched,
         observed_ops=sorted(ops),
