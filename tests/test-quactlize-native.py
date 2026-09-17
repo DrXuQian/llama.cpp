@@ -15,6 +15,20 @@ from quactlize_native import timings, selection, summarize, PATTERN
 
 
 class NativeEvidence(unittest.TestCase):
+    def test_measured_reader_symbols_keep_storage_compute_and_geometry(self):
+        self.assertEqual(native.simt_symbol_recipe("quactlize::execution::simt::q8_vector::kernel_model<1,0,1,8,4,4,false,2048,4096,8>"), (8,1,5,8,4,4,0))
+        self.assertEqual(native.simt_symbol_recipe("quactlize::execution::simt::q8_vector::kernel_model<1,0,1,8,4,4,true,8192,2048,1>"), (8,1,5,8,4,4,0))
+        self.assertIsNone(native.simt_symbol_recipe("quactlize::execution::simt::q8_vector::kernel_model<1,1,1,8,4,4,true,8192,2048,1>"))
+        self.assertIsNone(native.simt_symbol_recipe("quactlize::execution::simt::q8_vector::kernel_model<1,0,1,8,4,4,true,4096,2048,1>"))
+        self.assertIsNone(native.simt_symbol_recipe("quactlize::execution::simt::q8_vector::kernel_model<1,0,1,8,4,4,false,8192,2048,1>"))
+        self.assertEqual(native.simt_symbol_recipe("quactlize::execution::simt::q8_vector::kernel_s1<1,0,1,4,2,4,true>"), (8,1,5,4,2,4,0))
+        self.assertEqual(native.simt_symbol_recipe("quactlize::execution::simt::q8_vector::kernel_s1<1,0,1,4,8,4,false>"), (8,1,5,4,8,4,0))
+        self.assertIsNone(native.simt_symbol_recipe("quactlize::execution::simt::q8_vector::kernel_s1<1,1,1,4,8,4,false>"))
+        self.assertEqual(native.simt_symbol_recipe("quactlize::execution::simt::register_reuse_model<13,1,3,4,2,8,1,3>"), (13,1,3,4,2,8,1))
+        for q, compute in ((12,1),(8,0)):
+            self.assertEqual(native.paired_symbol_recipe(f"quactlize::fusion::simt_gate_up_model<{q},1,{compute},8>"),
+                             dict(q=q, storage=1, compute=compute, warps=8, tile_m=0, backend='simt'))
+
     def test_bf16_compute_is_grouped_only(self):
         root = Path(__file__).resolve().parents[1]
         adapter = (root / "ggml/src/ggml-cuda/quactlize-execution.cu").read_text()

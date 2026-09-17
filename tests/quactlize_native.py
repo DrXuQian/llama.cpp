@@ -81,11 +81,29 @@ def timings(response, payload):
 
 
 def simt_symbol_recipe(name):
+    fixed = re.search(r"quactlize::execution::simt::q8_vector::kernel_model<\s*" +
+                      r",\s*".join([r"(\d+)"] * 6) + r",\s*(true|false|0|1),\s*(\d+),\s*(\d+),\s*(\d+)\s*>", name)
+    if fixed:
+        storage, compute, variant, columns, warps, values = map(int, fixed.groups()[:6])
+        hoist = fixed.group(7) in ("true", "1")
+        if (storage, compute, variant, columns, warps, values, hoist, *map(int, fixed.groups()[7:])) not in (
+                (1, 0, 1, 8, 4, 4, False, 2048, 4096, 8), (1, 0, 1, 8, 4, 4, True, 8192, 2048, 1)):
+            return None
+        return (8, storage, variant + 4, columns, warps, values, compute)
+    single = re.search(r"quactlize::execution::simt::q8_vector::kernel_s1<\s*" +
+                       r",\s*".join([r"(\d+)"] * 6) + r",\s*(true|false|0|1)\s*>", name)
+    if single:
+        recipe = tuple(map(int, single.groups()[:6]))
+        if (*recipe, single.group(7) in ("true", "1")) not in (
+                (1, 0, 1, 4, 2, 4, True), (1, 0, 1, 4, 8, 4, False)):
+            return None
+        storage, compute, variant, columns, warps, values = recipe
+        return (8, storage, variant + 4, columns, warps, values, compute)
     vector = re.search(r"quactlize::execution::simt::q8_vector::kernel<\s*" + r",\s*".join([r"(\d+)"] * 6) + r"(?:,\s*(?:true|false|0|1))?\s*>", name)
     if vector:
         storage, compute, variant, columns, warps, values = map(int, vector.groups())
         return (8, storage, variant + 4, columns, warps, values, compute)
-    match = re.search(r"quactlize::execution::simt::register_reuse<\s*(\d+),\s*(\d+),\s*(\d+),\s*(\d+),\s*(\d+),\s*(\d+)(?:,\s*(\d+))?(?:,\s*(?:0|1|3))?\s*>", name)
+    match = re.search(r"quactlize::execution::simt::register_reuse(?:_model)?<\s*(\d+),\s*(\d+),\s*(\d+),\s*(\d+),\s*(\d+),\s*(\d+)(?:,\s*(\d+))?(?:,\s*(?:0|1|3))?\s*>", name)
     return tuple(int(x or 0) for x in match.groups()) if match else None
 
 
@@ -103,7 +121,7 @@ def q4_symbol_matches_plan(recipe, plan):
 
 
 def paired_symbol_recipe(name):
-    simt=re.search(r"quactlize::fusion::simt_gate_up<\s*(\d+),\s*(\d+),\s*(\d+),\s*(\d+)\s*>",name)
+    simt=re.search(r"quactlize::fusion::simt_gate_up(?:_model)?<\s*(\d+),\s*(\d+),\s*(\d+),\s*(\d+)\s*>",name)
     if simt:
         q,storage,compute,warps=map(int,simt.groups())
         return dict(q=q,storage=storage,compute=compute,warps=warps,tile_m=0,backend='simt')
