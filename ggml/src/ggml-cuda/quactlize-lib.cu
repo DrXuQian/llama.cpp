@@ -129,9 +129,8 @@ static const struct { int qtype; int fmt; const char * soname; } g_fmt_table[QZ_
     { GGML_TYPE_Q6_K, 4, "libquactlize_ppu_fmt4.so" },
 };
 
-// The PPU SDK wrapper, once and RTLD_GLOBAL, before any format library: the handoff's load order. On a PPU build
-// it is already a dependency of the CUDA backend, so this is normally a refcount bump; on a host without the SDK
-// it is skipped and the format libraries then fail to open on their own terms, which is the right outcome.
+// Consumers name this wrapper in DT_NEEDED. Keep it local so unrelated libraries
+// cannot bind their runtime calls to its compatibility exports.
 static void qz_preload_sdk_wrapper(void) {
     static bool done = false;
     if (done) {
@@ -143,7 +142,7 @@ static void qz_preload_sdk_wrapper(void) {
         return;
     }
     const std::string wrapper = std::string(sdk) + "/lib/libhggc_wrapper.so";
-    if (!dlopen(wrapper.c_str(), RTLD_NOW | RTLD_GLOBAL)) {
+    if (!dlopen(wrapper.c_str(), RTLD_NOW | RTLD_LOCAL)) {
         GGML_LOG_INFO("[quactlize] SDK wrapper %s not preloaded (%s)\n", wrapper.c_str(), dlerror());
     }
 }
@@ -152,10 +151,8 @@ static void qz_load_one(qz_lib * L, int qtype, int want_fmt, const char * soname
     L->handle = NULL;
     L->packed_format = -2;
 
-    // The deployment contract (quactlize docs/LLAMA_CPP_KPACK_HANDOFF.md): the SDK wrapper first and RTLD_GLOBAL,
-    // then each format library by ABSOLUTE PATH from the bundle directory, RTLD_LOCAL. QUACTLIZE_PPU_BUNDLE names
-    // that directory -- the same variable quactlize's own packer takes -- and without it the SONAME goes to the
-    // dynamic loader as before, which is how the stub-driven tests find their doubles.
+    // QUACTLIZE_PPU_BUNDLE selects an absolute library path; otherwise use its SONAME.
+    // The wrapper and each format library remain local to their consumers.
     //
     // RTLD_LOCAL is load-bearing, not hygiene: all five libraries export the same symbol names, so a global open
     // would let whichever came first answer every dlsym and silently decode one format with another's reader.
