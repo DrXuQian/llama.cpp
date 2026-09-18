@@ -15,6 +15,39 @@ from quactlize_native import timings, selection, summarize, PATTERN
 
 
 class NativeEvidence(unittest.TestCase):
+    def test_asys_preflight_retries_only_session_creation_and_never_loads_model(self):
+        for failure in ('once', 'always', 'other', 'timeout'):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as temp:
+                calls = []
+                launches = []
+                def run(command, **kwargs):
+                    calls.append(command)
+                    if command[1] != 'launch':
+                        return SimpleNamespace(returncode=0)
+                    launches.append(command)
+                    self.assertNotIn('llama-server', ' '.join(command))
+                    self.assertEqual(kwargs['timeout'], 60)
+                    if failure == 'timeout' and len(launches) == 1:
+                        raise subprocess.TimeoutExpired(command, 60)
+                    fail = failure == 'always' or failure == 'other' or (failure == 'once' and len(launches) == 1)
+                    kwargs['stdout'].write('unknown option\n' if failure == 'other' else
+                                          'session probe create timeout\n' if fail else 'KPACK_ASYS_PROBE_READY\n')
+                    return SimpleNamespace(returncode=15 if fail else 0)
+                output = Path(temp) / 'probe'
+                with patch.object(native.subprocess, 'run', side_effect=run):
+                    if failure in ('once', 'timeout'):
+                        native.asys_preflight(Path('/asys'), output, {})
+                    else:
+                        with self.assertRaisesRegex(ValueError, 'before model launch'):
+                            native.asys_preflight(Path('/asys'), output, {})
+                self.assertEqual(len(launches), 1 if failure == 'other' else 2)
+                names = [c[c.index('--session-new')+1] for c in launches]
+                self.assertEqual(len(names), len(set(names)))
+                self.assertEqual([c[c.index('--session')+1] for c in calls if c[1] == 'shutdown'], names)
+                self.assertTrue(all('shutdown' not in c or '--session' in c for c in calls))
+                receipt = json.loads((output/'summary.json').read_text())
+                self.assertEqual(receipt['status'], 'PASS' if failure in ('once', 'timeout') else 'FAIL')
+
     def test_measured_reader_symbols_keep_storage_compute_and_geometry(self):
         self.assertEqual(native.simt_symbol_recipe("quactlize::execution::simt::q8_vector::kernel_model<1,0,1,8,4,4,false,2048,4096,8>"), (8,1,5,8,4,4,0))
         self.assertEqual(native.simt_symbol_recipe("quactlize::execution::simt::q8_vector::kernel_model<1,0,1,8,4,4,true,8192,2048,1>"), (8,1,5,8,4,4,0))
@@ -355,7 +388,7 @@ target_link_libraries(test_moe PRIVATE ncp_moe)
                 if "--list-elf" in command:
                     return "Func 1: _Zparent\n"
                 return "void cutlass::device_kernel<parent>()\n"
-            with (patch.object(native.subprocess, "run"),
+            with (patch.object(native, "asys_preflight"), patch.object(native.subprocess, "run"),
                   patch.object(native.subprocess, "check_output", side_effect=listing),
                   patch.object(native, "run_arm", return_value=(dict(selection=selection,
                       records=[dict(request_sha256="request", response=dict(content="text"))]),
@@ -388,7 +421,7 @@ target_link_libraries(test_moe PRIVATE ncp_moe)
                 if fault == "custom-kernel": name = "quactlize::runtime::moe_chain_prepare<T>()"
                 if fault == "no-native-compute": name = "quantize_q8_1()"
                 kernels = [dict(name=name, mangled="_kernel", calls=3, total_ns=120, libraries=[])]
-                with (patch.object(native.subprocess, "run"),
+                with (patch.object(native, "asys_preflight"), patch.object(native.subprocess, "run"),
                       patch.object(native.subprocess, "check_output") as inspector,
                       patch.object(native, "run_arm", return_value=(dict(selection={}, records=[
                           dict(request_sha256="shared-request", response=dict(content="answer"))]), tokens)) as run,
@@ -761,11 +794,15 @@ int main() {
             profile = native.AsysSession(Path("/asys"), Path(temp))
             stale = dict(os.environ, QUACTLIZE_KPACK_EXECUTION="stale-reference",
                          QUACTLIZE_KPACK_PAIR_WEIGHTS="0", LLAMA_ARG_MODEL="wrong-model",
-                         GGML_CUDA_DISABLE_GRAPHS="1", NSIGHT_TEST_INJECTION="preserved")
+                         GGML_CUDA_DISABLE_GRAPHS="1", NSIGHT_TEST_INJECTION="preserved",
+                         DG_JIT_HGCC_COMPILER="/old-sdk/bin/hgcc", DG_JIT_CACHE_DIR="/old-cache",
+                         CUDA_HOME="/old-sdk", DG_LIBRARY_ROOT="/old-deepgemm")
             app = [sys.executable, "-I", "-c",
                    "import json,os; print(json.dumps(dict(os.environ),sort_keys=True))"]
             for arm in ("reference", "native"):
-                settings = dict(PATH=os.environ["PATH"], CUDA_VISIBLE_DEVICES="0")
+                settings = dict(PATH=os.environ["PATH"], CUDA_VISIBLE_DEVICES="0",
+                                CUDA_HOME="/current-sdk/CUDA_SDK", DG_JIT_HGCC_COMPILER="/current-sdk/bin/hgcc",
+                                DG_JIT_CACHE_DIR="/current-cache")
                 if arm == "native":
                     settings.update(QUACTLIZE_KPACK_EXECUTION="/bundle with spaces,$literal",
                                     QUACTLIZE_KPACK_JIT_HELPER="/repo/helper.py",
