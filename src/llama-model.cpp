@@ -1665,7 +1665,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
     // Inspect cache metadata before prefetching the original GGUF payload.
     if (!ml.no_alloc && params.kpack_cache_path && params.kpack_cache_path[0]) {
-        if (ml.files.size() == 1 && !ml.source_path.empty()) {
+        if (params.split_mode == LLAMA_SPLIT_MODE_TENSOR) {
+            LLAMA_LOG_WARN("[kpack-cache] tensor-parallel shards use GPU pack; disk cache requires a topology-aware format\n");
+        } else if (ml.files.size() == 1 && !ml.source_path.empty()) {
             std::vector<llama_kpack_source_tensor> inventory;
             for (const auto & entry : ml.weights_map) {
                 const auto & w = entry.second;

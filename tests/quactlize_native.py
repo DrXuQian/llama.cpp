@@ -437,6 +437,15 @@ def run_arm(args, index, arm, tokens, profile=None):
         getattr(args, "tensor_override_pattern", PATTERN)
         + "=CUDA0" + ("_KPACK" if arm == "native" else "")
     )
+    if getattr(args, "tensor_split", None):
+        command[command.index("--split-mode") + 1] = "tensor"
+        command += ["-ts", args.tensor_split]
+        if arm == "reference":
+            start = command.index("-ot")
+            del command[start:start+2]
+        if "--kpack-cache" in command:
+            start = command.index("--kpack-cache")
+            del command[start:start+2]
     command += ["--no-warmup"]
     env = {k: v for k, v in os.environ.items() if not k.startswith("LLAMA_ARG_")}
     env.pop("GGML_CUDA_DISABLE_GRAPHS", None)
@@ -614,7 +623,8 @@ def run_arm(args, index, arm, tokens, profile=None):
     require(proc.returncode in (0, -15), f"{label} failed rc={proc.returncode}")
     text = log_path.read_text(errors="replace")
     if arm == "native":
-        require("CUDA0_KPACK model buffer size" in text, "no K-pack placement")
+        require("[quactlize-shard]" in text if getattr(args, "tensor_split", None) else
+                "CUDA0_KPACK model buffer size" in text, "no K-pack placement")
         evidence = model_selection(args, text)
         require(evidence["plans"], "no native dispatch receipts")
     else:
@@ -858,10 +868,13 @@ def main():
     p.add_argument("--proof-prompt", type=int, default=128)
     p.add_argument("--proof-generate", type=int, default=8)
     p.add_argument("--tensor-inventory", type=Path, help="use the benchmark's exact eligible weight names")
+    p.add_argument("--tensor-split", help="TP2 split, e.g. 1,1; visible devices must be exactly two")
     p.add_argument("--jit-cache", type=Path)
     p.add_argument("--jit-helper", type=Path)
     p.add_argument("--jit-python", type=Path)
     a = p.parse_args()
+    if a.tensor_split:
+        require(re.fullmatch(r"[1-9][0-9]*,[1-9][0-9]*", a.tensor_split), "TP2 requires two positive split weights")
     require(a.proof_only or (a.proof_arm == "native" and a.proof_tokens is None),
             "proof arm/token overrides require --proof-only")
     a.tensor_override_pattern = (inventory_pattern(json.loads(a.tensor_inventory.read_text()))

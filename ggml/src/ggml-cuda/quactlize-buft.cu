@@ -1,6 +1,7 @@
 // The K-pack extra buffer type. See quactlize-buft.cuh for why this is a buffer type and not a cache.
 
 #include "quactlize-buft.cuh"
+#include "quactlize/upload_ranges.hpp"
 
 #include "ggml-backend-impl.h"
 
@@ -63,6 +64,8 @@ struct qz_buffer_context {
     uint8_t * scratch = nullptr;
     size_t scratch_bytes = 0;
     std::vector<void *> scratch_allocations;
+    const ggml_tensor * pending_tensor = nullptr;
+    quactlize::upload_ranges pending_ranges;
     std::array<qz_upload_slot, 2> upload_slots;
     unsigned upload_slot = 0;
 };
@@ -119,6 +122,12 @@ static void * qz_buffer_get_base(ggml_backend_buffer_t buffer) {
 static enum ggml_status qz_buffer_init_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor) {
     // No views: a view of a K-pack tensor would be a view of a layout its reader does not describe.
     GGML_ASSERT(tensor->view_src == nullptr);
+    if (ggml_nelements(tensor) && !ggml_quactlize_can_serve(tensor,
+            tensor->ne[2] * tensor->ne[3] > 1 ? GGML_OP_MUL_MAT_ID : GGML_OP_MUL_MAT)) {
+        GGML_LOG_ERROR("[quactlize] local shard is unsupported: %s q=%d N=%" PRId64 " K=%" PRId64 " E=%" PRId64 "\n",
+                      tensor->name, tensor->type, tensor->ne[1], tensor->ne[0], tensor->ne[2]*tensor->ne[3]);
+        return GGML_STATUS_FAILED;
+    }
     GGML_UNUSED(buffer);
     return GGML_STATUS_SUCCESS;
 }
@@ -228,6 +237,7 @@ void ggml_quactlize_set_planes(ggml_tensor * tensor, const ggml_quactlize_planes
 static void qz_set_raw(
         ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, const void * up, size_t offset, size_t size) {
     qz_buffer_context * ctx = (qz_buffer_context *) buffer->context;
+    GGML_ASSERT(ctx->pending_tensor == nullptr);
 
     // Whole tensor in one call. A non-default buffer type is excluded from the loader's chunked async upload
     // (llama-model-loader.cpp), which is what makes this hold -- and it must, because the K-pack address map is
@@ -317,11 +327,57 @@ static void qz_set_raw(
     ctx->artifacts[tensor] = art;
     GGML_LOG_DEBUG("[quactlize] %s: GPU pack queued, %.1f MiB, expert batch=%" PRId64 "\n",
                    tensor->name, size / 1048576.0, batch);
+    GGML_LOG_INFO("[quactlize-shard] tensor=%s device=%d q=%d n=%" PRId64 " k=%" PRId64
+        " experts=%" PRId64 " bytes=%zu producer=GPU\n", tensor->name, ctx->device, qtype, n, k, experts, size);
 }
 
 static void qz_buffer_set_tensor(ggml_backend_buffer_t buffer,ggml_tensor * tensor,
     const void * data,size_t offset,size_t size) {
     qz_set_raw(buffer,tensor,data,nullptr,offset,size);
+}
+
+static void qz_buffer_set_tensor_2d(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data,
+        size_t offset, size_t width, size_t rows, size_t dst_pitch, size_t src_pitch) {
+    auto * ctx = (qz_buffer_context *) buffer->context;
+    const size_t total = ggml_nbytes(tensor);
+    if (!total && !width) { return; }
+    GGML_ASSERT(data && width && rows && src_pitch >= width && !ctx->artifacts.count(tensor));
+    GGML_ASSERT(rows - 1 <= (SIZE_MAX - width) / src_pitch);
+    GGML_ASSERT(!ctx->pending_tensor || ctx->pending_tensor == tensor);
+    GGML_ASSERT(ctx->pending_ranges.add(offset, width, rows, dst_pitch, total));
+    ggml_cuda_set_device(ctx->device);
+    qz_init_streams(ctx);
+    if (!ctx->pending_tensor) {
+        ctx->pending_tensor = tensor;
+        if (total > ctx->scratch_bytes) {
+            void * scratch = nullptr;
+            CUDA_CHECK(cudaMalloc(&scratch, total));
+            ctx->scratch_allocations.push_back(scratch);
+            ctx->scratch = (uint8_t *) scratch;
+            ctx->scratch_bytes = total;
+        }
+    }
+    CUDA_CHECK(cudaMemcpy2DAsync(ctx->scratch + offset, dst_pitch, data, src_pitch,
+                                width, rows, cudaMemcpyHostToDevice, ctx->pack_stream));
+    CUDA_CHECK(cudaEventRecord(ctx->upload_done, ctx->pack_stream));
+    if (ctx->pending_ranges.complete(total)) {
+        quactlize_ppu_placed_arrangement_v2 arr;
+        qz_plane_sizes ps{};
+        GGML_ASSERT(ggml_quactlize_arrangement_for(tensor->type, &arr) && qz_plane_sizes_for(tensor, arr, &ps));
+        const int n = tensor->ne[1], k = tensor->ne[0], experts = tensor->ne[2] * tensor->ne[3];
+        auto * dst = (uint8_t *) tensor->data;
+        const int rc = ggml_quactlize_prepare_device(tensor->type, ctx->scratch, dst,
+            ps.high ? dst + ps.low : nullptr, dst + ps.low + ps.high, n, k, experts, &arr, ctx->pack_stream);
+        if (rc) { GGML_ABORT("[quactlize] %s: shard GPU pack failed (rc=%d)", tensor->name, rc); }
+        ctx->artifacts[tensor] = {dst, ps.high ? dst + ps.low : nullptr, dst + ps.low + ps.high,
+                                 arr, (int) tensor->type, n, k, experts, qz_record_ready(ctx)};
+        ctx->pending_tensor = nullptr;
+        ctx->pending_ranges.clear();
+        GGML_LOG_INFO("[quactlize-shard] tensor=%s device=%d q=%d n=%d k=%d experts=%d bytes=%zu producer=GPU\n",
+                      tensor->name, ctx->device, tensor->type, n, k, experts, total);
+    }
+    // Consume the caller's host bytes, but do not wait for the final pack or D2H.
+    CUDA_CHECK(cudaEventSynchronize(ctx->upload_done));
 }
 bool ggml_quactlize_pair_supported(ggml_backend_buffer_type_t buft,const ggml_tensor * merged) {
     return buft && merged && ggml_backend_buft_is_cuda_quactlize(buft) && merged->ne[1]%2==0 &&
@@ -388,7 +444,7 @@ static const ggml_backend_buffer_i qz_buffer_interface = {
     /* .memset_tensor   = */ NULL,
     /* .set_tensor      = */ qz_buffer_set_tensor,
     /* .get_tensor      = */ NULL,
-    /* .set_tensor_2d   = */ NULL,
+    /* .set_tensor_2d   = */ qz_buffer_set_tensor_2d,
     /* .get_tensor_2d   = */ NULL,
     /* .cpy_tensor      = */ NULL,
     /* .clear           = */ qz_buffer_clear,

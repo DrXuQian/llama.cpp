@@ -12,7 +12,12 @@
 #include "quactlize-lib.h"
 
 #include "ggml.h"
+#include "ggml-alloc.h"
+#include "ggml-backend-impl.h"
+#include "quactlize/upload_ranges.hpp"
 
+#include <algorithm>
+#include <array>
 #include <cstdio>
 #include <cstdlib>
 #include <chrono>
@@ -119,6 +124,168 @@ static const qz_case g_cases[] = {
 };
 
 static const size_t g_ncases = sizeof(g_cases) / sizeof(g_cases[0]);
+
+namespace meta_test {
+struct type_info { int device; bool extra; };
+struct buffer_info { void * bytes; quactlize::upload_ranges ranges; };
+static ggml_backend_reg registry{};
+static ggml_backend_device devices[3]{};
+static ggml_backend_buffer_type ordinary[3]{}, packed[3]{};
+static type_info kinds[3][2];
+static ggml_backend_buffer_type_t extras[3][2];
+static ggml_tensor * local[3]{};
+static int64_t admitted_n[3]{}, admitted_k[3]{};
+static ggml_backend_meta_split_state split{};
+static int rejected_device = -1;
+
+static void require(bool ok, int line = __builtin_LINE()) {
+    if (!ok) { fprintf(stderr, "KPACK_META_HOST invariant failed at line %d\n", line); abort(); }
+}
+
+static ggml_backend_buffer_t allocate(ggml_backend_buffer_type_t buft, size_t bytes) {
+    ggml_backend_buffer_i iface{};
+    iface.get_base = [](ggml_backend_buffer_t b) { return ((buffer_info *) b->context)->bytes; };
+    iface.free_buffer = [](ggml_backend_buffer_t b) {
+        auto * info = (buffer_info *) b->context; free(info->bytes); delete info;
+    };
+    iface.init_tensor = [](ggml_backend_buffer_t b, ggml_tensor * t) {
+        local[((type_info *) b->buft->context)->device] = t;
+        return GGML_STATUS_SUCCESS;
+    };
+    iface.set_tensor = [](ggml_backend_buffer_t b, ggml_tensor * t, const void * data, size_t offset, size_t bytes) {
+        require(((buffer_info *) b->context)->ranges.add(offset, bytes, 1, bytes, ggml_nbytes(t)));
+        memcpy((char *) t->data + offset, data, bytes);
+    };
+    iface.set_tensor_2d = [](ggml_backend_buffer_t b, ggml_tensor * t, const void * data,
+                            size_t offset, size_t width, size_t rows, size_t dst_pitch, size_t src_pitch) {
+        require(((buffer_info *) b->context)->ranges.add(offset, width, rows, dst_pitch, ggml_nbytes(t)));
+        for (size_t r = 0; r < rows; ++r) {
+            memcpy((char *) t->data + offset + r*dst_pitch, (const char *) data + r*src_pitch, width);
+        }
+    };
+    void * data = aligned_alloc(128, ((std::max<size_t>(bytes, 1) + 127) / 128) * 128);
+    require(data != nullptr);
+    memset(data, 0, bytes);
+    return ggml_backend_buffer_init(buft, iface, new buffer_info{data, {}}, bytes);
+}
+
+static void init() {
+    registry.api_version = GGML_BACKEND_API_VERSION;
+    registry.iface.get_proc_address = [](ggml_backend_reg_t, const char * name) -> void * {
+        if (strcmp(name, "ggml_backend_dev_get_extra_bufts")) { return nullptr; }
+        ggml_backend_dev_get_extra_bufts_t get = [](ggml_backend_dev_t dev) {
+            return extras[(size_t) dev->context];
+        };
+        return (void *) get;
+    };
+    for (int i = 0; i < 3; ++i) {
+        auto & dev = devices[i]; dev.reg = &registry; dev.context = (void *) (size_t) i;
+        dev.iface.get_name = [](ggml_backend_dev_t) { return "TP-host-device"; };
+        dev.iface.get_description = dev.iface.get_name;
+        dev.iface.get_buffer_type = [](ggml_backend_dev_t d) { return &ordinary[(size_t) d->context]; };
+        dev.iface.supports_buft = [](ggml_backend_dev_t d, ggml_backend_buffer_type_t b) { return b->device==d; };
+        dev.iface.supports_op = [](ggml_backend_dev_t d, const ggml_tensor * op) {
+            if (!op->src[0] || !op->src[0]->buffer) { return true; }
+            const auto * t = op->src[0];
+            auto * kind = (type_info *) t->buffer->buft->context;
+            const size_t index = (size_t) d->context;
+            require(kind->device==(int) index && kind->extra);
+            admitted_n[index]=t->ne[1]; admitted_k[index]=t->ne[0];
+            return rejected_device!=(int) index && (op->op==GGML_OP_MUL_MAT || op->op==GGML_OP_MUL_MAT_ID);
+        };
+        for (int extra = 0; extra < 2; ++extra) {
+            auto & type = extra ? packed[i] : ordinary[i];
+            kinds[i][extra]={i, bool(extra)}; type.device=&dev; type.context=&kinds[i][extra];
+            type.iface.get_name=[](ggml_backend_buffer_type_t b) { return ((type_info *) b->context)->extra ? "host-KPACK" : "host-default"; };
+            type.iface.alloc_buffer=allocate;
+            type.iface.get_alignment=[](ggml_backend_buffer_type_t) { return size_t(128); };
+        }
+        extras[i][0]=&packed[i]; extras[i][1]=nullptr;
+    }
+}
+
+static int run() {
+    init();
+    ggml_backend_dev_t simple[]={&devices[0],&devices[1]};
+    auto * dev=ggml_backend_meta_device(simple,2,[](const ggml_tensor *, void *) { return split; },nullptr);
+    auto * buft=ggml_backend_meta_buffer_type(dev,&packed[0]);
+    require(buft && ggml_backend_meta_buffer_type_count(buft)==2);
+    require(ggml_backend_meta_buffer_type(dev,&packed[1])==buft);
+    require(!ggml_backend_meta_buffer_type(dev,&packed[2]));
+    require(ggml_backend_meta_buffer_type(dev,&ordinary[0])==ggml_backend_dev_buffer_type(dev));
+    extras[1][0]=nullptr;
+    require(!ggml_backend_meta_buffer_type(dev,&packed[0]));
+    extras[1][0]=&packed[1];
+    quactlize::upload_ranges coverage;
+    require(coverage.add(0,8,2,16,32) && !coverage.complete(32));
+    require(!coverage.add(0,8,1,8,32) && !coverage.add(31,2,1,2,32));
+    require(!coverage.add(8,8,SIZE_MAX,16,32));
+    require(coverage.add(8,8,2,16,32) && coverage.complete(32));
+    int cases=0;
+    for (int q : {8,10,11,12,13,14}) for (int mode=0;mode<5;++mode) {
+        split={}; split.n_segments=1; split.nr[0]=1;
+        int64_t k=1024,n=128,experts=3;
+        if (mode==0) { split.axis=GGML_BACKEND_SPLIT_AXIS_0; split.ne[0]=512; split.ne[1]=512; }
+        if (mode==1) { split.axis=GGML_BACKEND_SPLIT_AXIS_1; split.ne[0]=32; split.ne[1]=96; }
+        if (mode==2) { split.axis=GGML_BACKEND_SPLIT_AXIS_1; split.ne[0]=16; split.ne[1]=48; split.nr[0]=2; }
+        if (mode==3) { split.axis=GGML_BACKEND_SPLIT_AXIS_0; split.ne[0]=256; split.ne[1]=256; split.nr[0]=2; experts=1; }
+        if (mode==4) { split.axis=GGML_BACKEND_SPLIT_AXIS_MIRRORED; }
+        const ggml_init_params params={1<<20,nullptr,true};
+        auto * ctx=ggml_init(params);
+        auto * weight=ggml_new_tensor_3d(ctx,(ggml_type) q,k,n,experts);
+        ggml_set_name(weight,"blk.0.ffn_gate_up_exps.weight");
+        weight->buffer=ggml_backend_buft_alloc_buffer(buft,0);
+        ggml_tensor op{}; op.op=GGML_OP_MUL_MAT; op.src[0]=weight;
+        require(ggml_backend_dev_supports_op(dev,&op));
+        rejected_device=1; require(!ggml_backend_dev_supports_op(dev,&op)); rejected_device=-1;
+        op.op=GGML_OP_DUP; require(!ggml_backend_dev_supports_op(dev,&op)); op.op=GGML_OP_MUL_MAT;
+        ggml_backend_buffer_free(weight->buffer); weight->buffer=nullptr;
+        auto * buffer=ggml_backend_alloc_ctx_tensors_from_buft(ctx,buft);
+        require(buffer && local[0] && local[1]);
+        require(ggml_backend_dev_supports_op(dev,&op));
+        for (int i=0;i<2;++i) require(admitted_n[i]==local[i]->ne[1] && admitted_k[i]==local[i]->ne[0]);
+        const size_t total=ggml_nbytes(weight), unit=ggml_type_size(weight->type);
+        std::vector<uint8_t> raw(total);
+        for (size_t i=0;i<total;++i) raw[i]=(i*19+i/23)%251;
+        if (mode==2) {
+            // Separate gate/up sources, each [E,N/2,K], never CPU-concatenated.
+            const size_t half=weight->nb[2]/2;
+            std::vector<uint8_t> gate(total/2),up(total/2);
+            for (int64_t e=0;e<experts;++e) {
+                memcpy(gate.data()+e*half,raw.data()+e*2*half,half);
+                memcpy(up.data()+e*half,raw.data()+e*2*half+half,half);
+            }
+            ggml_backend_tensor_set_2d(weight,gate.data(),0,half,experts,half*2,half);
+            ggml_backend_tensor_set_2d(weight,up.data(),half,half,experts,half*2,half);
+        } else {
+            ggml_backend_tensor_set(weight,raw.data(),0,total);
+        }
+        for (int device=0;device<2;++device) {
+            std::vector<uint8_t> expected;
+            for (int64_t e=0;e<experts;++e) for (int64_t row=0;row<n;++row) {
+                for (int64_t block=0;block<k/ggml_blck_size(weight->type);++block) {
+                    const int64_t column=block*ggml_blck_size(weight->type);
+                    bool own=mode==4;
+                    if (mode==0) own=column/512==device;
+                    if (mode==1) own=(row<32 ? 0 : 1)==device;
+                    if (mode==2) own=(row%64<16 ? 0 : 1)==device;
+                    if (mode==3) own=(column/256)%2==device;
+                    if (own) {
+                        const size_t offset=e*weight->nb[2]+row*weight->nb[1]+block*unit;
+                        expected.insert(expected.end(),raw.begin()+offset,raw.begin()+offset+unit);
+                    }
+                }
+            }
+            require(expected.size()==ggml_nbytes(local[device]));
+            require(!memcmp(expected.data(),local[device]->data,expected.size()));
+            require(((buffer_info *) local[device]->buffer->context)->ranges.complete(expected.size()));
+        }
+        ggml_backend_buffer_free(buffer); ggml_free(ctx); ++cases;
+    }
+    printf("KPACK_META_HOST PASS cases=%d formats=6 scope=RAW_GGUF_SHARD_TRANSPORT_NOT_DEVICE_NUMERICAL\n",cases);
+    return 0;
+}
+} // namespace meta_test
 
 static void print_case_failure(int status) {
     const int code = status != -1 && WIFEXITED(status) ? WEXITSTATUS(status) : -1;
@@ -414,6 +581,8 @@ int main(int argc, char ** argv) {
     if (argc >= 2 && strcmp(argv[1], "--bench") == 0) {
         return run_bench();
     }
+
+    if (meta_test::run()) { return 1; }
 
     if (argc >= 2 && strcmp(argv[1], "--real") == 0) {
         // Against a real bundle. QUACTLIZE_PPU_BUNDLE names its directory and the loader opens every format
