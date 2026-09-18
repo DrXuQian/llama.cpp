@@ -357,7 +357,7 @@ class AsysSession:
         entry = Path(__file__).with_name("quactlize_profile_env.py")
         target = [sys.executable, "-I", str(entry), json.dumps(settings, sort_keys=True), *application]
         return [str(self.executable), "launch", "--trace", "hggc", "--hggc-trace-set", "kernel-activity",
-                "--sample", "none", "--wait", "primary", "--kill", "sigterm", "--show-output", "true",
+                "--sample", "none", "--python-sampling", "false", "--wait", "primary", "--kill", "sigterm", "--show-output", "true",
                 "--session-new", self.session, *target]
 
     def control(self, action, *options, check=True):
@@ -374,6 +374,52 @@ class AsysSession:
     def close(self):
         # Only this uniquely named session; never stop another user's capture.
         self.control("shutdown", check=False)
+
+
+def asys_preflight(executable, output, environment=None):
+    """Start the service without loading a model; retry only session creation."""
+    output.mkdir(parents=True, exist_ok=False)
+    env = dict(os.environ if environment is None else environment)
+    attempts = []
+    for attempt in range(1, 3):
+        folder = output / str(attempt)
+        folder.mkdir()
+        profile = AsysSession(executable, folder)
+        command = profile.command([sys.executable, "-I", "-c", "print('KPACK_ASYS_PROBE_READY', flush=True)"], env)
+        log_path = folder / "launch.log"
+        print(f"KPACK_ASYS_PREFLIGHT attempt={attempt}/2 model_loaded=0 log={log_path}", flush=True)
+        timed_out = False
+        rc = None
+        with log_path.open("x") as log:
+            try:
+                rc = subprocess.run(command, env=env, stdout=log, stderr=subprocess.STDOUT, timeout=60).returncode
+            except subprocess.TimeoutExpired:
+                timed_out = True
+        text = log_path.read_text(errors="replace")
+        # Cleanup is confined to the probe's unique session, including failed launches.
+        with profile.log.open("a") as log:
+            try:
+                subprocess.run([str(executable), "shutdown", "--session", profile.session],
+                               env=env, stdout=log, stderr=subprocess.STDOUT, timeout=15)
+            except subprocess.TimeoutExpired:
+                pass
+        ready = rc == 0 and "KPACK_ASYS_PROBE_READY" in text
+        creation_failure = timed_out or bool(re.search(r"session .* create timeout|create template session error", text))
+        attempts.append(dict(attempt=attempt, session=profile.session, rc=rc, timeout=timed_out,
+                             ready=ready, session_creation_failure=creation_failure, log=str(log_path)))
+        save(output / "summary.json", dict(status="PASS" if ready else "FAIL", attempts=attempts,
+                                           scope="SESSION_LAUNCH_ONLY_NOT_GPU_KERNEL_CAPTURE"))
+        if ready:
+            return
+        if not creation_failure:
+            break
+    with (output / "environment.log").open("x") as log:
+        try:
+            subprocess.run([str(executable), "status", "--ppu-env"], env=env,
+                           stdout=log, stderr=subprocess.STDOUT, timeout=30)
+        except subprocess.TimeoutExpired:
+            log.write("Asys environment query exceeded 30 seconds\n")
+    raise ValueError(f"Asys session preflight failed before model launch; inspect {output}; benchmark results remain valid")
 
 
 def run_arm(args, index, arm, tokens, profile=None):
@@ -652,6 +698,7 @@ def proof_parameters(args):
 def proof(args):
     report = args.output / "proof.asysrep"
     db = args.output / "proof.sqlite"
+    asys_preflight(args.asys, args.output / "asys-preflight")
     capture = copy.copy(args)
     capture.output = args.output / "proof-request"
     capture.output.mkdir()
