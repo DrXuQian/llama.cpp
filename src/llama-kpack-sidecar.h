@@ -6,6 +6,7 @@
 // hashes. They bind to local source stat identity and tensor metadata instead.
 // Runtime loading trusts payload bytes; corruption is not detected. Neither
 // writing nor loading a runtime cache reads raw GGUF payloads to validate them.
+// Runtime v3 also binds all GGUF files and each tensor-parallel shard's split map.
 
 #include "ggml.h"
 
@@ -36,6 +37,7 @@ struct llama_kpack_source_tensor {
         std::string name;
         int32_t index = -1;
         uint64_t offset = 0, bytes = 0;
+        uint32_t file_index = 0;
     };
     std::string name;
     int32_t     gguf_index  = -1;    // position in the GGUF tensor table
@@ -44,12 +46,31 @@ struct llama_kpack_source_tensor {
     int32_t     ggml_type   = -1;
     int32_t     rank        = 0;
     int64_t     n = 0, k = 0, experts = 0;   // GGUF [K, N(, E)] -> route terms; experts = 0 for dense
-    std::vector<component> components; // runtime v2 only: gate, then up
+    std::vector<component> components; // runtime v2/v3: gate, then up
+    uint32_t file_index = 0;
     int32_t order_index() const {
         int32_t result=gguf_index;
         for (auto const& part:components) result=result<0?part.index:std::min(result,part.index);
         return result;
     }
+};
+
+struct llama_kpack_source_file {
+    std::string path;
+    int loader_fd = -1;
+};
+
+// Logical device order, not physical GPU IDs. Widths are [segment, device].
+// count == 0 denotes an unsplit tensor. A mirrored tensor still records its rank.
+struct llama_kpack_partition {
+    int32_t axis = 10;
+    uint32_t count = 0, index = 0;
+    std::vector<int64_t> widths;
+    std::vector<uint32_t> repeats;
+    bool operator==(const llama_kpack_partition & b) const {
+        return axis == b.axis && count == b.count && index == b.index && widths == b.widths && repeats == b.repeats;
+    }
+    uint32_t key() const { return count ? index + 1 : 0; }
 };
 
 // ---- reader ----
@@ -62,6 +83,7 @@ struct llama_kpack_sidecar_record {
     uint64_t    region_offset = 0, region_size = 0;
     struct span { uint64_t offset = 0, size = 0; std::vector<int64_t> shape; std::string sha256; } low, high, units;
     llama_kpack_planes planes;          // resolved after verification or explicit unchecked loading
+    llama_kpack_partition partition{};
 };
 
 class llama_kpack_sidecar_reader {
@@ -76,6 +98,8 @@ public:
     // hashing source or storage. Accepts both offline bundles and local caches.
     bool load_unchecked(const std::string & gguf_path, const std::vector<llama_kpack_source_tensor> & inventory,
                         std::string & error);
+    bool load_unchecked(const std::vector<llama_kpack_source_file> & files,
+                        const std::vector<llama_kpack_source_tensor> & inventory, std::string & error);
 
     // Prove the bundle is about THIS GGUF: size and whole-file SHA-256 match manifest.source, every recorded
     // tensor exists in `inventory` with the same index / offset / size / type / shape, and every source byte range
@@ -87,7 +111,7 @@ public:
     // no unlisted tail. After this the records' plane pointers are valid.
     bool verify_storage(int n_threads, std::string & error);
 
-    const llama_kpack_sidecar_record * find(const std::string & name) const;
+    const llama_kpack_sidecar_record * find(const std::string & name, const llama_kpack_partition & partition = {}) const;
     size_t size() const { return records.size(); }
     const std::string & dir() const { return root; }
 
@@ -98,7 +122,7 @@ private:
     std::unique_ptr<impl> pimpl;
     std::string root;
     std::vector<llama_kpack_sidecar_record> records;
-    std::map<std::string, size_t> by_name;
+    std::map<std::pair<std::string, uint32_t>, size_t> by_name;
 };
 
 // ---- writer ----
@@ -114,6 +138,7 @@ public:
     // Capture file identity, not loader-owned data. Only verified offline bundles
     // hash source data at publication; runtime caches never read it.
     bool bind_source(const std::string & path, std::string & error, int loader_fd = -1);
+    bool bind_sources(const std::vector<llama_kpack_source_file> & files, std::string & error);
 
     // Append one tensor's planes as the next region. Records MUST arrive in increasing gguf_index order with
     // disjoint, ascending byte ranges. The background writer sorts its jobs;
@@ -128,7 +153,8 @@ public:
     // not the padded file region. The returned span lives until the next read.
     // No full-tensor host allocation or raw GGUF access in this operation.
     bool add_stream(const llama_kpack_source_tensor & src, const llama_kpack_planes & planes,
-                    const read_chunk & read, size_t chunk_bytes, const cancelled & cancel, std::string & error);
+                    const read_chunk & read, size_t chunk_bytes, const cancelled & cancel, std::string & error,
+                    const llama_kpack_partition & partition = {});
 
     // Record a tensor that was NOT packed and why. The schema wants the full inventory of what was left out.
     void skip(const std::string & name, const std::string & type_name, const std::string & reason);
@@ -147,7 +173,7 @@ public:
 private:
     bool add_record(const llama_kpack_source_tensor & src, const std::string & source_sha,
                     const llama_kpack_planes & planes, const read_chunk & read, size_t chunk_bytes,
-                    const cancelled & cancel, std::string & error);
+                    const cancelled & cancel, std::string & error, const llama_kpack_partition & partition = {});
     struct impl;
     std::unique_ptr<impl> pimpl;
 };
@@ -156,6 +182,7 @@ struct llama_kpack_write_job {
     llama_kpack_source_tensor source;
     llama_kpack_planes planes;
     llama_kpack_sidecar_writer::read_chunk read;
+    llama_kpack_partition partition{};
 };
 
 // One bounded streaming writer per model. start() only transfers metadata and
@@ -166,6 +193,7 @@ public:
     llama_kpack_background_writer();
     ~llama_kpack_background_writer();
     bool prepare(const std::string & dir, const std::string & source_path, std::string & error, int loader_fd = -1);
+    bool prepare(const std::string & dir, const std::vector<llama_kpack_source_file> & files, std::string & error);
     bool start(std::vector<llama_kpack_write_job> jobs,
                const std::vector<llama_kpack_source_tensor> & inventory,
                size_t chunk_bytes, std::string & error);

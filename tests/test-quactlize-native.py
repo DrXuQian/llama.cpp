@@ -92,7 +92,8 @@ int main(int argc, char **) {
     def test_scheduler_compiles_against_current_public_backend_api(self):
         root = Path(__file__).resolve().parents[1]
         subprocess.run(['c++', '-std=c++17', '-fsyntax-only', '-I' + str(root / 'ggml/include'),
-                        '-I' + str(root / 'ggml/src'), str(root / 'tests/test-quactlize-scheduler.cpp')], check=True)
+                        '-I' + str(root / 'ggml/src'), '-I' + str(root / 'src'), '-I' + str(root / 'include'),
+                        str(root / 'tests/test-quactlize-scheduler.cpp')], check=True)
 
     def test_aoneci_build_enables_kpack_without_disabling_ci_hooks(self):
         root = Path(__file__).resolve().parents[1]

@@ -9,6 +9,8 @@
 #include "quactlize-lib.h"
 #include "quactlize-sidecar.h"
 #include "ggml-backend-impl.h"
+#include "ggml-alloc.h"
+#include <nlohmann/json.hpp>
 
 #include "ggml.h"
 #include "gguf.h"
@@ -63,9 +65,13 @@ static ggml_backend_buffer_t allocate(ggml_backend_buffer_type_t buft, size_t by
     ggml_backend_buffer_i iface{};
     iface.get_base = [](ggml_backend_buffer_t b) { return b->context; };
     iface.free_buffer = [](ggml_backend_buffer_t b) { free(b->context); };
-    return ggml_backend_buffer_init(buft, iface, malloc(bytes), bytes);
+    void * data = nullptr;
+    if (posix_memalign(&data, 128, std::max<size_t>(128, bytes))) { return nullptr; }
+    return ggml_backend_buffer_init(buft, iface, data, bytes);
 }
-static bool is_kpack(const ggml_tensor * t) { return t->buffer && t->buffer->buft == &device_buft; }
+static bool is_kpack(const ggml_tensor * t) {
+    return t->buffer && t->buffer->buft != &host_buft && t->buffer->buft->iface.alloc_buffer == allocate;
+}
 static bool layout(const ggml_tensor * t, size_t * lo, size_t * hi, size_t * un,
                    quactlize_ppu_placed_arrangement_v2 * arr) {
     int64_t l, h, u;
@@ -122,6 +128,7 @@ static void init() {
         delete (event *) ev->context; delete ev;
     };
     device_buft.device = host_buft.device = &dev;
+    device_buft.iface.alloc_buffer = allocate;
     host_buft.iface.alloc_buffer = allocate;
 }
 } // namespace cache_mock
@@ -211,6 +218,163 @@ static bool make_planes(made_tensor & t) {
     p.layout = arr.layout; p.bits = arr.bits; p.high_bits = arr.high_bits; p.artifact_tile_k = arr.artifact_tile_k;
     p.transport_tile_k = arr.transport_tile_k; p.group_size = arr.group_size; p.reserved = arr.reserved; p.mapping_id = arr.mapping_id;
     return true;
+}
+
+static ggml_backend_meta_split_state cache_split;
+
+static void test_tp_cache(const std::string & dir) {
+    printf("  [TP cache: local shards, split GGUF and topology rejection]\n");
+    static ggml_backend_device devices[2];
+    static ggml_backend_buffer_type types[2];
+    for (int i = 0; i < 2; ++i) {
+        devices[i] = cache_mock::dev;
+        devices[i].context = &types[i];
+        devices[i].iface.get_name = [](ggml_backend_dev_t) { return "snapshot-test"; };
+        devices[i].iface.get_description = devices[i].iface.get_name;
+        devices[i].iface.get_buffer_type = [](ggml_backend_dev_t d) { return (ggml_backend_buffer_type_t) d->context; };
+        types[i] = cache_mock::device_buft;
+        types[i].device = &devices[i];
+        types[i].iface.get_name = [](ggml_backend_buffer_type_t) { return "snapshot-test"; };
+        types[i].iface.get_alignment = [](ggml_backend_buffer_type_t) { return size_t(128); };
+    }
+    ggml_backend_dev_t devs[] = {&devices[0], &devices[1]};
+    auto * meta = ggml_backend_meta_device(devs, 2,
+        [](const ggml_tensor *, void *) { return cache_split; }, nullptr);
+    auto * buft = ggml_backend_dev_buffer_type(meta);
+    for (int q : {8, 10, 11, 12, 13, 14}) for (int variant = 0; variant < 4; ++variant) {
+        const std::string stem = dir + "/tp-" + std::to_string(q) + "-" + std::to_string(variant);
+        const std::string target = stem + "-cache";
+        auto * source_ctx = ggml_init({4 << 20, nullptr, false});
+        auto * ctx = ggml_init({1 << 20, nullptr, true});
+        auto * raw = ggml_new_tensor_3d(source_ctx, (ggml_type) q, 1024, 512, 2);
+        ggml_set_name(raw, "weight");
+        memset(raw->data, 0, ggml_nbytes(raw));
+        auto * gguf = gguf_init_empty(); gguf_add_tensor(gguf, raw);
+        std::vector<llama_kpack_source_file> files;
+        for (int i = 0; i < 3; ++i) {
+            files.push_back({stem + "-" + std::to_string(i) + ".gguf", -1});
+            gguf_write_to_file(gguf, files.back().path.c_str(), false);
+        }
+        llama_kpack_source_tensor src;
+        src.name = "weight"; src.gguf_index = 0; src.file_index = 1;
+        src.data_offset = gguf_get_meta_size(gguf); src.size_bytes = ggml_nbytes(raw);
+        src.ggml_type = q; src.rank = 3; src.k = 1024; src.n = 512; src.experts = 2;
+        std::vector<llama_kpack_source_tensor> inventory;
+        if (variant == 2) {
+            for (int side = 0; side < 2; ++side) {
+                auto * half = ggml_new_tensor_3d(source_ctx, (ggml_type) q, 1024, 256, 2);
+                ggml_set_name(half, side ? "up" : "gate");
+                memset(half->data, 0, ggml_nbytes(half));
+                auto * part = gguf_init_empty(); gguf_add_tensor(part, half);
+                gguf_write_to_file(part, files[side + 1].path.c_str(), false);
+                auto child = src;
+                child.components.clear();
+                child.name = half->name; child.n = 256; child.size_bytes /= 2;
+                child.file_index = side + 1; child.data_offset = gguf_get_meta_size(part);
+                inventory.push_back(child);
+                src.components.push_back({child.name, child.gguf_index, child.data_offset, child.size_bytes, child.file_index});
+                gguf_free(part);
+            }
+        }
+        inventory.push_back(src);
+        cache_split = {GGML_BACKEND_SPLIT_AXIS_0, {512, 512}, {1}, 1};
+        if (variant == 1) cache_split = {GGML_BACKEND_SPLIT_AXIS_1, {256, 256}, {1}, 1};
+        if (variant == 2) cache_split = {GGML_BACKEND_SPLIT_AXIS_1, {128, 128}, {2}, 1};
+        if (variant == 3) cache_split = {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {}, {1}, 1};
+        auto * weight = ggml_dup_tensor(ctx, raw); ggml_set_name(weight, src.name.c_str());
+        auto * buffer = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+        CHECK(buffer, "allocate real Meta shards");
+        std::vector<uint8_t> expected[2];
+        for (int d = 0; d < 2; ++d) {
+            auto * local = ggml_backend_meta_tensor_shard(weight, d, nullptr);
+            CHECK(local && local->buffer, "expose allocated local shard");
+            expected[d].resize(ggml_nbytes(local));
+            for (size_t j = 0; j < expected[d].size(); ++j) expected[d][j] = uint8_t(j * 7 + d * 97 + q);
+            memcpy(local->data, expected[d].data(), expected[d].size());
+        }
+        CHECK(!ggml_backend_meta_tensor_shard(weight, 2, nullptr), "invalid device is not a shard");
+        const int allocated = cache_mock::host_allocations;
+        {
+            llama_kpack_cache cache(target, files, inventory);
+            CHECK(!cache.load(weight), "cold load requires GPU pack");
+            cache.capture(weight); cache.capture(weight); cache.start();
+        }
+        CHECK(cache_mock::host_allocations == allocated + 4, "two staging slots per device, no duplicate capture");
+        const int copies = cache_mock::copies, uploads = cache_mock::uploads;
+        for (int d = 0; d < 2; ++d) {
+            auto * local = ggml_backend_meta_tensor_shard(weight, d, nullptr);
+            memset(local->data, 0xA5, ggml_nbytes(local));
+        }
+        {
+            llama_kpack_cache cache(target, files, inventory);
+            CHECK(cache.has_cached_tensors() && cache.load(weight), "separate cache object loads both local shards");
+            cache.start();
+        }
+        CHECK(cache_mock::uploads == uploads + 2 && cache_mock::copies == copies,
+              "hot reload uploads two shards with no D2H");
+        for (int d = 0; d < 2; ++d) {
+            auto * local = ggml_backend_meta_tensor_shard(weight, d, nullptr);
+            CHECK(!memcmp(local->data, expected[d].data(), expected[d].size()), "rank-specific plane bytes round-trip");
+        }
+        auto bytes = read_file(target + "/manifest.json");
+        const auto good = nlohmann::json::parse(bytes.begin(), bytes.end());
+        CHECK(good["source"]["files"].size() == 3 && good["tensors"].size() == 2, "all files and both ranks recorded");
+        for (int fault = 0; fault < 9; ++fault) {
+            auto bad = good;
+            if (fault == 0) bad["tensors"][1]["partition"]["index"] = 0;
+            if (fault == 1) bad["tensors"][1]["partition"]["count"] = 1;
+            if (fault == 2) bad["source"]["files"][2]["identity"]["inode"] = 0;
+            if (fault == 3) bad["tensors"][1]["source_tensor"]["components"][0]["file_index"] = 0;
+            if (fault == 4) bad["tensors"][1]["arrangement"]["mapping_id"] = 1;
+            if (fault == 5) bad["tensors"][1]["partition"]["widths"] = {256};
+            if (fault == 6) bad["tensors"][1]["source_tensor"]["k"] = 512;
+            if (fault == 7) bad["storage"]["size_bytes"] = 1;
+            if (fault == 8) {
+                // Different legal split maps can have exactly the same local shapes.
+                for (auto & record : bad["tensors"]) {
+                    auto & p = record["partition"];
+                    if (variant == 3) p["count"] = 3;
+                    else if (variant == 2) { p["widths"] = {256, 256}; p["repeats"] = {1}; }
+                    else { p["widths"] = variant == 0 ? nlohmann::json{256, 256} : nlohmann::json{128, 128}; p["repeats"] = {2}; }
+                }
+            }
+            const auto text = bad.dump(); write_file(target + "/manifest.json", {text.begin(), text.end()});
+            const int before = cache_mock::uploads;
+            {
+                llama_kpack_cache cache(target, files, inventory);
+                CHECK(!cache.load(weight), "malformed, foreign or changed layout rejected, fault=%d", fault);
+            }
+            CHECK(cache_mock::uploads == before, "all shards checked before the first upload");
+        }
+        write_file(target + "/manifest.json", bytes);
+        auto swapped = files; std::swap(swapped[0], swapped[1]);
+        llama_kpack_cache wrong(target, swapped, inventory);
+        CHECK(!wrong.has_cached_tensors(), "source-file order is part of identity");
+        if (q == 12 && variant == 0) {
+            llama_kpack_sidecar_reader reader;
+            std::string error;
+            CHECK(reader.open(target, error) && reader.load_unchecked(files, inventory, error), "%s", error.c_str());
+            const llama_kpack_partition p{0, 2, 0, {512, 512}, {1}};
+            const auto * record = reader.find(src.name, p);
+            CHECK(record, "find the exact first shard");
+            llama_kpack_sidecar_writer writer(true);
+            const std::string interrupted = stem + "-changed-source";
+            CHECK(writer.bind_sources(files, error) && writer.begin(interrupted, error), "%s", error.c_str());
+            CHECK(writer.add_stream(src, record->planes,
+                [&](size_t off, size_t, std::string &) { return expected[0].data() + off; },
+                8 << 20, {}, error, p), "%s", error.c_str());
+            // Even a file without this tensor is part of the model's identity.
+            auto changed = read_file(files[2].path); changed.push_back(0);
+            write_file(files[2].path, changed);
+            CHECK(!writer.finish("tp", files[0].path, error), "changed third source prevents publication");
+            struct stat st{};
+            CHECK(lstat(interrupted.c_str(), &st) != 0, "no partial cache visible after source change");
+        }
+        CHECK(cache_mock::violations == 0 && cache_mock::in_flight == 0, "no submit-thread D2H waits or live DMA");
+        ggml_backend_buffer_free(buffer); ggml_free(ctx); ggml_free(source_ctx); gguf_free(gguf);
+        rm_bundle(target);
+        for (const auto & file : files) unlink(file.path.c_str());
+    }
 }
 
 int main() {
@@ -664,13 +828,13 @@ int main() {
         }
         const auto bytes=read_file(target+"/manifest.json");
         std::string manifest(bytes.begin(),bytes.end());
-        const auto version=manifest.find("\"schema_version\": 2");
-        CHECK(version!=std::string::npos, "pair uses runtime v2");
+        const auto version=manifest.find("\"schema_version\": 3");
+        CHECK(version!=std::string::npos, "model cache uses runtime v3");
         if (version!=std::string::npos) {
             manifest.replace(version,19,"\"schema_version\": 1");
             write_file(target+"/manifest.json",{manifest.begin(),manifest.end()});
             llama_kpack_sidecar_reader reader;
-            CHECK(!reader.open(target,err), "v1 cannot claim paired provenance");
+            CHECK(!reader.open(target,err), "v1 cannot claim multi-file or partition provenance");
         }
         CHECK(cache_mock::violations==0 && cache_mock::in_flight==0, "no owner-thread wait or unfinished DMA");
         ggml_backend_buffer_free(merged->buffer); merged->buffer=nullptr;
@@ -782,6 +946,8 @@ int main() {
         llama_kpack_sidecar_reader r;
         CHECK(r.open(bundle, err) && !r.verify_source(gguf_path, inv2, 4, err), "inventory/offset disagreement must fail");
     }
+
+    test_tp_cache(dir);
 
     // ---- quactlize's own validator on the same bundle ----
     printf("  [interop]\n");
