@@ -472,6 +472,16 @@ if (GGML_NCP_QUACTLIZE)
     set_tests_properties(test-kpack-sidecar PROPERTIES
         TIMEOUT 30
         ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_CURRENT_BINARY_DIR}/quactlize-stub:$ENV{LD_LIBRARY_PATH};QZ_STUB_DIR=${CMAKE_CURRENT_BINARY_DIR}/quactlize-stub;QUACTLIZE_PPU_BUNDLE=${CMAKE_CURRENT_BINARY_DIR}/quactlize-stub;QUACTLIZE_PPU_PACK_LIBRARY=$<TARGET_FILE:quactlize-stub-pack>;PPU_SDK=")
+    if (TARGET ggml-cpu)
+        add_executable(test-quactlize-tp-graph test-quactlize-scheduler.cpp
+            ${PROJECT_SOURCE_DIR}/src/llama-kpack-cache.cpp ${PROJECT_SOURCE_DIR}/src/llama-kpack-sidecar.cpp)
+        target_compile_definitions(test-quactlize-tp-graph PRIVATE QUACTLIZE_TP2_HOST_TEST)
+        target_include_directories(test-quactlize-tp-graph PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src
+            ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/vendor)
+        target_link_libraries(test-quactlize-tp-graph PRIVATE ggml-base ggml-cpu Threads::Threads)
+        add_test(NAME test-quactlize-tp-graph COMMAND $<TARGET_FILE:test-quactlize-tp-graph>)
+        set_tests_properties(test-quactlize-tp-graph PROPERTIES TIMEOUT 180)
+    endif()
 endif()
 
 llama_build_and_test(test-model-load-cancel.cpp LABEL "model")
