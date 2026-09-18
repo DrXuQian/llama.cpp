@@ -38,8 +38,14 @@ static std::unique_ptr<llama_kpack_cache> weight_cache(
     if (tp_cache_root.empty()) { return {}; }
     const std::string path = tp_cache_root + "/" + key + ".gguf";
     auto * meta = gguf_init_empty();
-    gguf_add_tensor(meta, w);
-    gguf_set_tensor_data(meta, w->name, raw.data());
+    // GGUF reads through buffer callbacks when buffer is set, even with new data.
+    ggml_tensor source = *w;
+    source.buffer = nullptr;
+    source.view_src = nullptr;
+    source.view_offs = 0;
+    source.extra = nullptr;
+    source.data = const_cast<uint8_t *>(raw.data());
+    gguf_add_tensor(meta, &source);
     if (!tp_cache_hot) {
         CHECK(!std::ifstream(path).good());
         CHECK(gguf_write_to_file(meta, path.c_str(), false));
@@ -66,6 +72,9 @@ static ggml_backend_meta_split_state tp_split(const ggml_tensor * t, void *) {
 }
 
 static void tp_chain(ggml_backend_t backend, ggml_backend_buffer_type_t packed, int q, int tokens) {
+    printf("KPACK_TP2_BEGIN chain q=%d tokens=%d cache=%s\n", q, tokens,
+           tp_cache_root.empty() ? "disabled" : tp_cache_hot ? "hot" : "cold");
+    fflush(stdout);
     constexpr int k=1024, hidden=1024, n=512, experts=4, topk=2;
     tp_weight_split={GGML_BACKEND_SPLIT_AXIS_1,{hidden/2,hidden/2},{2},1};
     auto * wc=ggml_init({2<<20,nullptr,true});
@@ -143,6 +152,10 @@ static void tp_chain(ggml_backend_t backend, ggml_backend_buffer_type_t packed, 
 
 static void tp_numerical(ggml_backend_t backend, ggml_backend_buffer_type_t packed,
                          int qtype, int experts, int tokens, int axis) {
+    printf("KPACK_TP2_BEGIN cell q=%d experts=%d tokens=%d split=%c cache=%s\n",
+           qtype, experts, tokens, axis == 0 ? 'K' : 'N',
+           tp_cache_root.empty() ? "disabled" : tp_cache_hot ? "hot" : "cold");
+    fflush(stdout);
     constexpr int k = 1024, n = 512;
     const int topk = experts > 1 ? 2 : 1;
     tp_weight_split = {(ggml_backend_meta_split_axis) axis, {0}, {1}, 1};
