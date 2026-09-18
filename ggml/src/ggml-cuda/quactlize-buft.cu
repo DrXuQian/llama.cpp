@@ -232,6 +232,9 @@ void ggml_quactlize_set_planes(ggml_tensor * tensor, const ggml_quactlize_planes
     qz_buffer_context * ctx = (qz_buffer_context *) tensor->buffer->context;
     qz_install_planes(ctx, tensor, *planes, (int) tensor->type, tensor->ne[1], tensor->ne[0],
                       tensor->ne[2] * tensor->ne[3]);
+    GGML_LOG_INFO("[quactlize-shard] tensor=%s device=%d q=%d n=%" PRId64 " k=%" PRId64
+        " experts=%" PRId64 " bytes=%zu producer=CACHE\n", tensor->name, ctx->device, tensor->type,
+        tensor->ne[1], tensor->ne[0], tensor->ne[2] * tensor->ne[3], ggml_nbytes(tensor));
 }
 
 static void qz_set_raw(

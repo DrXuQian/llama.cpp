@@ -411,6 +411,11 @@ extern "C" {
     GGML_API size_t ggml_backend_meta_buffer_type_count(ggml_backend_buffer_type_t buft);
     GGML_API ggml_backend_buffer_type_t ggml_backend_meta_buffer_type_at(ggml_backend_buffer_type_t buft, size_t index);
 
+    // Loading-time access to an allocated static weight's local tensors and split map.
+    // Returns NULL for non-meta tensors, invalid indices, or unavailable local tensors.
+    GGML_API struct ggml_tensor * ggml_backend_meta_tensor_shard(
+        const struct ggml_tensor * tensor, size_t index, struct ggml_backend_meta_split_state * split);
+
     //
     // Utils
     //

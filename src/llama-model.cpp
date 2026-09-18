@@ -1665,29 +1665,32 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
     // Inspect cache metadata before prefetching the original GGUF payload.
     if (!ml.no_alloc && params.kpack_cache_path && params.kpack_cache_path[0]) {
-        if (params.split_mode == LLAMA_SPLIT_MODE_TENSOR) {
-            LLAMA_LOG_WARN("[kpack-cache] tensor-parallel shards use GPU pack; disk cache requires a topology-aware format\n");
-        } else if (ml.files.size() == 1 && !ml.source_path.empty()) {
+        if (!ml.source_paths.empty() && ml.source_paths.size() == ml.files.size()) {
+            std::vector<llama_kpack_source_file> files;
+            for (size_t index = 0; index < ml.files.size(); ++index) {
+                files.push_back({ml.source_paths[index], ml.files[index]->file_id()});
+            }
             std::vector<llama_kpack_source_tensor> inventory;
             for (const auto & entry : ml.weights_map) {
                 const auto & w = entry.second;
                 llama_kpack_source_tensor src;
                 src.name = entry.first; src.gguf_index = w.gguf_index;
                 src.data_offset = w.offs; src.size_bytes = ggml_nbytes(w.tensor);
+                src.file_index = w.idx;
                 src.ggml_type = w.tensor->type; src.rank = ggml_n_dims(w.tensor);
                 src.k = w.tensor->ne[0]; src.n = w.tensor->ne[1];
                 src.experts = src.rank == 3 ? w.tensor->ne[2] : 0;
                 for (const auto & name:w.paired_sources) {
                     const auto & part=ml.require_weight(name.c_str());
-                    src.components.push_back({name,part.gguf_index,part.offs,ggml_nbytes(part.tensor)});
+                    src.components.push_back({name,part.gguf_index,part.offs,ggml_nbytes(part.tensor),part.idx});
                 }
                 inventory.push_back(std::move(src));
             }
             pimpl->kpack_cache = std::make_unique<llama_kpack_cache>(
-                params.kpack_cache_path, ml.source_path, inventory, ml.files[0]->file_id());
+                params.kpack_cache_path, files, inventory);
             ml.kpack_cache = pimpl->kpack_cache.get();
         } else {
-            LLAMA_LOG_WARN("[kpack-cache] persistence currently requires one named GGUF file; using GPU pack\n");
+            LLAMA_LOG_WARN("[kpack-cache] persistence requires named GGUF source files; using GPU pack\n");
         }
     }
     // Keep the source mapped for uncached tensors, but fault its pages on demand.

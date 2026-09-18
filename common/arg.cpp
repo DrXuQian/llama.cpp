@@ -2690,7 +2690,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_MMAP"));
     add_opt(common_arg(
         {"--kpack-cache"}, "DIR",
-        "reuse a trusted local K-pack cache without content checksums, or write one in the background (single GGUF, PPU backend)",
+        "reuse trusted local K-pack shards without content checksums, or write them in the background (split GGUF and tensor parallel supported, PPU backend)",
         [](common_params & params, const std::string & value) {
             params.kpack_cache_path = value;
         }

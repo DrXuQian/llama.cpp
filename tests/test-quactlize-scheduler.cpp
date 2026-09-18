@@ -5,6 +5,9 @@
 #include "ggml-backend-impl.h"
 #include "ggml-cpu.h"
 #include "ggml-cuda.h"
+#include "gguf.h"
+#include "llama-kpack-cache.h"
+#include "llama-impl.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -12,12 +15,46 @@
 #include <initializer_list>
 #include <vector>
 #include <cmath>
+#include <cstdarg>
+#include <string>
+#include <fstream>
 
 #define CHECK(expr) do { \
     if (!(expr)) { fprintf(stderr, "scheduler check failed: %s\n", #expr); exit(1); } \
 } while (0)
 
 static ggml_backend_meta_split_state tp_weight_split;
+static std::string tp_cache_root;
+static bool tp_cache_hot = false;
+static std::vector<std::string> tp_cache_manifests;
+
+void llama_log_internal(ggml_log_level, const char * format, ...) {
+    va_list args;
+    va_start(args, format); vfprintf(stderr, format, args); va_end(args);
+}
+
+static std::unique_ptr<llama_kpack_cache> weight_cache(
+        ggml_tensor * w, const std::vector<uint8_t> & raw, const std::string & key) {
+    if (tp_cache_root.empty()) { return {}; }
+    const std::string path = tp_cache_root + "/" + key + ".gguf";
+    auto * meta = gguf_init_empty();
+    gguf_add_tensor(meta, w);
+    gguf_set_tensor_data(meta, w->name, raw.data());
+    if (!tp_cache_hot) {
+        CHECK(!std::ifstream(path).good());
+        CHECK(gguf_write_to_file(meta, path.c_str(), false));
+    }
+    tp_cache_manifests.push_back(path + ".cache/manifest.json");
+    llama_kpack_source_tensor src;
+    src.name = w->name; src.gguf_index = 0; src.data_offset = gguf_get_meta_size(meta);
+    src.ggml_type = w->type; src.rank = ggml_n_dims(w); src.size_bytes = raw.size();
+    src.n = w->ne[1]; src.k = w->ne[0]; src.experts = src.rank == 3 ? w->ne[2] : 0;
+    gguf_free(meta);
+    auto cache = std::make_unique<llama_kpack_cache>(path + ".cache", path,
+        std::vector<llama_kpack_source_tensor>{src});
+    CHECK(cache->load(w) == tp_cache_hot);
+    return cache;
+}
 
 static ggml_backend_meta_split_state tp_split(const ggml_tensor * t, void *) {
     if (!strcmp(t->name, "tp-down")) return {GGML_BACKEND_SPLIT_AXIS_0, {512,512}, {1}, 1};
@@ -39,6 +76,7 @@ static void tp_chain(ggml_backend_t backend, ggml_backend_buffer_type_t packed, 
     auto * wb=ggml_backend_alloc_ctx_tensors_from_buft(wc,packed); CHECK(wb);
     ggml_backend_buffer_set_usage(wb,GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
     std::vector<float> gold[2];
+    std::unique_ptr<llama_kpack_cache> caches[2];
     int index=0;
     for (auto * w : {gate,down}) {
         std::vector<float> source(ggml_nelements(w)),importance(w->ne[0],1.f);
@@ -46,14 +84,17 @@ static void tp_chain(ggml_backend_t backend, ggml_backend_buffer_type_t packed, 
         for (size_t i=0;i<source.size();++i) source[i]=float(int((i*19+i/23)%71)-35)/256.f;
         CHECK(ggml_quantize_chunk(w->type,source.data(),raw.data(),0,w->ne[1]*experts,w->ne[0],importance.data())==raw.size());
         ggml_get_type_traits(w->type)->to_float(raw.data(),gold[index].data(),gold[index].size());
-        if (w==gate) {
+        caches[index] = weight_cache(w, raw, "chain-" + std::to_string(q) + "-" +
+            std::to_string(tokens) + "-" + std::to_string(index));
+        if (!tp_cache_hot && w==gate) {
             const size_t half=w->nb[2]/2;
             std::vector<uint8_t> part(raw.size()/2);
             for (int side=0;side<2;++side) {
                 for (int e=0;e<experts;++e) memcpy(part.data()+e*half,raw.data()+e*half*2+side*half,half);
                 ggml_backend_tensor_set_2d(w,part.data(),side*half,half,experts,half*2,half);
             }
-        } else ggml_backend_tensor_set(w,raw.data(),0,raw.size());
+        } else if (!tp_cache_hot) ggml_backend_tensor_set(w,raw.data(),0,raw.size());
+        if (caches[index]) { caches[index]->capture(w); caches[index]->start(); }
         ++index;
     }
     auto * a=ggml_new_tensor_3d(ctx,GGML_TYPE_F32,k,1,tokens); ggml_set_name(a,"tp-input");
@@ -96,6 +137,7 @@ static void tp_chain(ggml_backend_t backend, ggml_backend_buffer_type_t packed, 
     }
     printf("KPACK_TP2_CHAIN q=%d tokens=%d experts=4 topk=2 replays=3 error=%.8g status=PASS\n",q,tokens,maximum);
     fflush(stdout);
+    for (auto & cache : caches) { cache.reset(); }
     ggml_backend_buffer_free(cb); ggml_backend_buffer_free(wb); ggml_free(ctx); ggml_free(wc);
 }
 
@@ -118,7 +160,10 @@ static void tp_numerical(ggml_backend_t backend, ggml_backend_buffer_type_t pack
     for (size_t i = 0; i < source.size(); ++i) source[i] = float(int((i*17+i/29)%97)-48)/128.f;
     CHECK(ggml_quantize_chunk(w->type, source.data(), raw.data(), 0, n*experts, k, importance.data()) == raw.size());
     ggml_get_type_traits(w->type)->to_float(raw.data(), dequant.data(), dequant.size());
-    ggml_backend_tensor_set(w, raw.data(), 0, raw.size());
+    auto cache = weight_cache(w, raw, "cell-" + std::to_string(qtype) + "-" +
+        std::to_string(experts) + "-" + std::to_string(tokens) + "-" + std::to_string(axis));
+    if (!tp_cache_hot) { ggml_backend_tensor_set(w, raw.data(), 0, raw.size()); }
+    if (cache) { cache->capture(w); cache->start(); }
     auto * a = experts > 1 ? ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, topk, tokens) :
                             ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, tokens);
     ggml_set_name(a, "tp-input");
@@ -156,6 +201,7 @@ static void tp_numerical(ggml_backend_t backend, ggml_backend_buffer_type_t pack
     printf("KPACK_TP2_CELL q=%d experts=%d tokens=%d split=%c replays=3 error=%.8g status=PASS\n",
            qtype, experts, tokens, axis == 0 ? 'K' : 'N', max_error);
     fflush(stdout);
+    cache.reset();
     ggml_backend_buffer_free(cb); ggml_backend_buffer_free(wb);
     ggml_free(ctx); ggml_free(weights);
 }
@@ -176,7 +222,11 @@ static int run_tp2() {
     }
     for (int q : {8,12}) for (int m : {1,8,32}) tp_chain(backend, packed, q, m);
     ggml_backend_free(backend);
+    for (const auto & manifest : tp_cache_manifests) {
+        CHECK(std::ifstream(manifest).peek() != std::char_traits<char>::eof());
+    }
     puts("KPACK_TP2_DEVICE PASS formats=6 cases=72 chains=6 replays=3 oracle=GGUF_FP32_DOT_SQUARE allreduce=K_SPLIT");
+    if (!tp_cache_root.empty()) printf("KPACK_TP2_CACHE PASS mode=%s cases=72 chains=6\n", tp_cache_hot ? "hot" : "cold");
     return 0;
 }
 
@@ -237,6 +287,11 @@ static void run_case(ggml_backend_t gpu, ggml_backend_t cpu, ggml_backend_buffer
 
 int main(int argc, char ** argv) {
     if (argc == 2 && !strcmp(argv[1], "--tp2")) return run_tp2();
+    if (argc == 3 && (!strcmp(argv[1], "--tp2-cache-write") || !strcmp(argv[1], "--tp2-cache-read"))) {
+        tp_cache_root = argv[2];
+        tp_cache_hot = !strcmp(argv[1], "--tp2-cache-read");
+        return run_tp2();
+    }
     const bool reserve_only = argc == 2 && strcmp(argv[1], "--reserve-only") == 0;
     CHECK(argc == 1 || reserve_only);
     if (ggml_backend_cuda_get_device_count() == 0) {

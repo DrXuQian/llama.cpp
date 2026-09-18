@@ -443,9 +443,6 @@ def run_arm(args, index, arm, tokens, profile=None):
         if arm == "reference":
             start = command.index("-ot")
             del command[start:start+2]
-        if "--kpack-cache" in command:
-            start = command.index("--kpack-cache")
-            del command[start:start+2]
     command += ["--no-warmup"]
     env = {k: v for k, v in os.environ.items() if not k.startswith("LLAMA_ARG_")}
     env.pop("GGML_CUDA_DISABLE_GRAPHS", None)

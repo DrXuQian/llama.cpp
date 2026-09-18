@@ -128,6 +128,43 @@ bool same_layout(const llama_kpack_planes & a, const llama_kpack_planes & b) {
         a.group_size == b.group_size && a.reserved == b.reserved && a.mapping_id == b.mapping_id;
 }
 
+struct resident_shard {
+    ggml_tensor * tensor;
+    llama_kpack_partition partition;
+    cache_api api;
+};
+
+std::vector<resident_shard> resident_shards(ggml_tensor * tensor) {
+    std::vector<resident_shard> result;
+    if (!tensor || !tensor->buffer) { return result; }
+    const size_t count = ggml_backend_meta_buffer_type_count(ggml_backend_buffer_get_type(tensor->buffer));
+    for (size_t index = 0; index < std::max<size_t>(1, count); ++index) {
+        ggml_backend_meta_split_state split{};
+        auto * local = count ? ggml_backend_meta_tensor_shard(tensor, index, &split) : tensor;
+        if (!local) { return {}; }
+        if (!ggml_nelements(local)) { continue; }
+        const auto api = api_for(local);
+        if (!api.is_kpack || !api.is_kpack(local)) { return {}; }
+        llama_kpack_partition p;
+        if (count) {
+            p.axis = split.axis; p.count = count; p.index = index;
+            if (split.axis != GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
+                if (split.axis < 0 || split.axis >= GGML_MAX_DIMS || split.n_segments > 16) { return {}; }
+                p.widths.assign(split.ne, split.ne + split.n_segments * count);
+                p.repeats.assign(split.nr, split.nr + split.n_segments);
+            }
+        }
+        result.push_back({local, std::move(p), api});
+    }
+    return result;
+}
+
+bool matches_source(const ggml_tensor * tensor, const llama_kpack_source_tensor & src) {
+    return tensor->type == src.ggml_type && (src.rank == 2 || src.rank == 3) &&
+        tensor->ne[0] == src.k && tensor->ne[1] == src.n &&
+        tensor->ne[2] * tensor->ne[3] == std::max<int64_t>(1, src.experts) && ggml_nbytes(tensor) == src.size_bytes;
+}
+
 } // namespace
 
 struct llama_kpack_cache::impl {
@@ -143,24 +180,19 @@ struct llama_kpack_cache::impl {
 };
 
 llama_kpack_cache::llama_kpack_cache(const std::string & dir, const std::string & source,
-        const std::vector<llama_kpack_source_tensor> & inventory, int loader_fd) : pimpl(new impl) {
+        const std::vector<llama_kpack_source_tensor> & inventory, int loader_fd)
+    : llama_kpack_cache(dir, std::vector<llama_kpack_source_file>{{source, loader_fd}}, inventory) {}
+
+llama_kpack_cache::llama_kpack_cache(const std::string & dir, const std::vector<llama_kpack_source_file> & files,
+        const std::vector<llama_kpack_source_tensor> & inventory) : pimpl(new impl) {
     auto & I = *pimpl;
     I.inventory = inventory;
     for (const auto & src : inventory) { I.sources.emplace(src.name, src); }
     std::string error;
-    const auto same_source = [&]() {
-        if (loader_fd < 0) { return true; }
-        struct stat loaded{}, named{};
-        return fstat(loader_fd, &loaded) == 0 && stat(source.c_str(), &named) == 0 &&
-            loaded.st_dev == named.st_dev && loaded.st_ino == named.st_ino && loaded.st_size == named.st_size &&
-            loaded.st_mtim.tv_sec == named.st_mtim.tv_sec && loaded.st_mtim.tv_nsec == named.st_mtim.tv_nsec &&
-            loaded.st_ctim.tv_sec == named.st_ctim.tv_sec && loaded.st_ctim.tv_nsec == named.st_ctim.tv_nsec;
-    };
-    if (!same_source()) { LLAMA_LOG_WARN("[kpack-cache] source path differs from the loader's file; cache disabled\n"); return; }
     struct stat st{};
     if (lstat(dir.c_str(), &st) == 0) {
         auto reader = std::make_unique<llama_kpack_sidecar_reader>();
-        if (reader->open(dir, error) && reader->load_unchecked(source, inventory, error) && same_source()) {
+        if (reader->open(dir, error) && reader->load_unchecked(files, inventory, error)) {
             LLAMA_LOG_INFO("[kpack-cache] ready: tensors=%zu content_checks=disabled path=%s\n", reader->size(), dir.c_str());
             I.reader = std::move(reader);
         } else {
@@ -169,7 +201,7 @@ llama_kpack_cache::llama_kpack_cache(const std::string & dir, const std::string 
         return;
     }
     if (errno != ENOENT) { LLAMA_LOG_WARN("[kpack-cache] cannot inspect %s: %s\n", dir.c_str(), strerror(errno)); return; }
-    I.writable = I.writer.prepare(dir, source, error, loader_fd);
+    I.writable = I.writer.prepare(dir, files, error);
     if (!I.writable) { LLAMA_LOG_WARN("[kpack-cache] persistence disabled: %s\n", error.c_str()); }
 }
 
@@ -190,62 +222,67 @@ bool llama_kpack_cache::has_cached_tensors() const {
 bool llama_kpack_cache::load(ggml_tensor * tensor) {
     auto & I = *pimpl;
     if (!I.reader) { return false; }
-    const auto api = api_for(tensor);
-    if (!api.is_kpack || !api.is_kpack(tensor)) { return false; }
-    ++I.resident_requests;
-    if (!api.layout || !api.set) { return false; }
-    const auto * rec = I.reader->find(tensor->name);
-    if (!rec) { return false; }
+    const auto shards = resident_shards(tensor);
+    if (shards.empty()) { return false; }
+    I.resident_requests += shards.size();
     const auto src = I.sources.find(tensor->name);
-    if (src == I.sources.end() || tensor->type != src->second.ggml_type ||
-        (src->second.rank != 2 && src->second.rank != 3) ||
-        tensor->ne[0] != src->second.k || tensor->ne[1] != src->second.n ||
-        tensor->ne[2] * tensor->ne[3] != std::max<int64_t>(1, src->second.experts)) { return false; }
-    ggml_quactlize_planes p{};
-    if (!api.layout(tensor, &p.low_bytes, &p.high_bytes, &p.units_bytes, &p.arrangement) ||
-        p.arrangement.version != 2 || !same_layout(describe(p), rec->planes)) { return false; }
-    p.low = rec->planes.low; p.high = rec->planes.high; p.units = rec->planes.units;
-    api.set(tensor, &p);
-    ++I.cache_uploads;
+    if (src == I.sources.end() || !matches_source(tensor, src->second)) { return false; }
+    std::vector<ggml_quactlize_planes> planes;
+    // Admit every local shard before installing any. A miss must leave the raw loader untouched.
+    for (const auto & shard : shards) {
+        const auto * rec = I.reader->find(tensor->name, shard.partition);
+        const auto & api = shard.api;
+        auto * local = shard.tensor;
+        ggml_quactlize_planes p{};
+        if (!rec || !api.layout || !api.set || rec->n != local->ne[1] || rec->k != local->ne[0] ||
+            std::max<int64_t>(1, rec->experts) != local->ne[2] * local->ne[3] ||
+            !api.layout(local, &p.low_bytes, &p.high_bytes, &p.units_bytes, &p.arrangement) ||
+            p.arrangement.version != 2 || !same_layout(describe(p), rec->planes)) { return false; }
+        p.low = rec->planes.low; p.high = rec->planes.high; p.units = rec->planes.units;
+        planes.push_back(p);
+    }
+    for (size_t index = 0; index < shards.size(); ++index) { shards[index].api.set(shards[index].tensor, &planes[index]); }
+    I.cache_uploads += shards.size();
     return true;
 }
 
 void llama_kpack_cache::capture(ggml_tensor * tensor) {
     auto & I = *pimpl;
     if (!I.writable || I.started || I.captured.count(tensor->name)) { return; }
-    const auto api = api_for(tensor);
-    if (!api.is_kpack || !api.is_kpack(tensor)) { return; }
+    const auto shards = resident_shards(tensor);
+    if (shards.empty()) { return; }
     const auto disable = [&](const char * why) {
         LLAMA_LOG_WARN("[kpack-cache] persistence disabled: %s\n", why);
         I.writable = false; I.jobs.clear(); I.writer.cancel();
     };
-    if (!api.layout || !api.copy || !api.wait) { disable("resident backend lacks snapshot support"); return; }
     const auto src = I.sources.find(tensor->name);
-    if (src == I.sources.end() || tensor->type != src->second.ggml_type ||
-        (src->second.rank != 2 && src->second.rank != 3) ||
-        tensor->ne[0] != src->second.k || tensor->ne[1] != src->second.n ||
-        tensor->ne[2] * tensor->ne[3] != std::max<int64_t>(1, src->second.experts) ||
-        ggml_nbytes(tensor) != src->second.size_bytes) { disable("resident tensor does not match its source record"); return; }
-    ggml_quactlize_planes p{};
-    if (!api.layout(tensor, &p.low_bytes, &p.high_bytes, &p.units_bytes, &p.arrangement) || p.arrangement.version != 2) {
-        disable("resident descriptor is unavailable"); return;
+    if (src == I.sources.end() || !matches_source(tensor, src->second)) {
+        disable("resident tensor does not match its source record"); return;
     }
-    auto * dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(tensor->buffer));
-    auto & slot = I.slots[dev];
-    if (!slot) {
-        // Allocate before inference starts; never allocate/free pinned storage in
-        // the running writer, where runtime allocation could synchronize a device.
-        slot = std::make_shared<copy_slots>();
-        if (!(*slot)[0].allocate(dev) || !(*slot)[1].allocate(dev)) {
-            disable("pinned staging unavailable"); return;
+    for (const auto & shard : shards) {
+        const auto & api = shard.api;
+        auto * local = shard.tensor;
+        if (!api.layout || !api.copy || !api.wait) { disable("resident backend lacks snapshot support"); return; }
+        ggml_quactlize_planes p{};
+        if (!api.layout(local, &p.low_bytes, &p.high_bytes, &p.units_bytes, &p.arrangement) || p.arrangement.version != 2) {
+            disable("resident descriptor is unavailable"); return;
         }
+        auto * dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(local->buffer));
+        auto & slot = I.slots[dev];
+        if (!slot) {
+            // Allocate before inference starts, never from the snapshot worker.
+            slot = std::make_shared<copy_slots>();
+            if (!(*slot)[0].allocate(dev) || !(*slot)[1].allocate(dev)) {
+                disable("pinned staging unavailable"); return;
+            }
+        }
+        llama_kpack_write_job job{src->second, describe(p), {}, shard.partition};
+        auto reader = std::make_shared<copy_reader>(local, slot, api, job.planes);
+        job.read = [reader](size_t offset, size_t bytes, std::string & error) {
+            return reader->read(offset, bytes, error);
+        };
+        I.jobs.push_back(std::move(job));
     }
-    llama_kpack_write_job job{src->second, describe(p), {}};
-    auto reader = std::make_shared<copy_reader>(tensor, slot, api, job.planes);
-    job.read = [reader](size_t offset, size_t bytes, std::string & error) {
-        return reader->read(offset, bytes, error);
-    };
-    I.jobs.push_back(std::move(job));
     I.captured.insert(tensor->name);
 }
 

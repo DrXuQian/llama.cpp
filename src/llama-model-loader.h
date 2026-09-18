@@ -94,6 +94,7 @@ struct llama_model_loader {
 
     llama_files files;
     std::string source_path;
+    std::vector<std::string> source_paths;
     llama_kpack_cache * kpack_cache = nullptr; // owned by the model
     llama_ftype ftype;
     llama_fver  fver;

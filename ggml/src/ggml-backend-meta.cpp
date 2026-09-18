@@ -1268,6 +1268,15 @@ static void * ggml_backend_meta_buffer_get_base(ggml_backend_buffer_t buffer) {
     return (void *) 0x1000000000000000; // FIXME
 }
 
+struct ggml_tensor * ggml_backend_meta_tensor_shard(
+        const struct ggml_tensor * tensor, size_t index, struct ggml_backend_meta_split_state * split) {
+    if (!tensor || !tensor->buffer || !ggml_backend_buffer_is_meta(tensor->buffer) ||
+        index >= ggml_backend_meta_buffer_n_bufs(tensor->buffer)) { return nullptr; }
+    auto * local = ggml_backend_meta_buffer_simple_tensor(tensor, index);
+    if (local && split) { *split = ggml_backend_meta_get_split_state(tensor, false); }
+    return local;
+}
+
 static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_meta_simple_tensor_container & stc, ggml_tensor * tensor) {
     GGML_ASSERT(ggml_backend_buffer_is_meta(tensor->buffer));
     ggml_backend_meta_buffer_context * buf_ctx = (ggml_backend_meta_buffer_context *) tensor->buffer->context;
