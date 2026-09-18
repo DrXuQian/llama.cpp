@@ -18,6 +18,7 @@
 #include <cstdarg>
 #include <string>
 #include <fstream>
+#include <set>
 
 #define CHECK(expr) do { \
     if (!(expr)) { fprintf(stderr, "scheduler check failed: %s\n", #expr); exit(1); } \
@@ -297,6 +298,155 @@ int main() {
     puts("KPACK_TP2_HOST PASS cells=72 f32_chains=3 missing_reduce=EXPECTED_RED device_admission=PENDING");
 }
 #else
+static void tp_comm_libraries() {
+#ifdef __linux__
+    std::ifstream maps("/proc/self/maps");
+    std::set<std::string> libraries;
+    std::string line;
+    while (std::getline(maps,line)) {
+        const auto start=line.find('/');
+        if (start==std::string::npos) continue;
+        const auto path=line.substr(start);
+        for (const char * name : {"libnccl", "libpccl", "libhggc", "libhgrtc", "libcuda", "libggml", "libquactlize"}) {
+            if (path.find(name)!=std::string::npos) libraries.insert(path);
+        }
+    }
+    for (const auto & path : libraries) printf("KPACK_TP2_COMM_LIBRARY path=%s\n",path.c_str());
+    fflush(stdout);
+#endif
+}
+
+static double tp_comm_error(const std::vector<float> & got, const std::vector<float> & want) {
+    CHECK(got.size()==want.size());
+    double error=0, norm=0;
+    for (size_t i=0;i<got.size();++i) {
+        CHECK(std::isfinite(got[i]) && std::isfinite(want[i]));
+        const double delta=double(got[i])-want[i];
+        error+=delta*delta; norm+=double(want[i])*want[i];
+    }
+    return std::sqrt(error/std::max(norm,1.e-30));
+}
+
+// Use the caller's unchanged communication entry, with synchronized local oracles.
+static int run_tp2_comm(const char * arm, int count) {
+    const bool copy=!strcmp(arm,"copy"), packed=!strcmp(arm,"kpack");
+    CHECK(copy || packed || !strcmp(arm,"raw"));
+    CHECK(count==512 || (copy && (count==3072 || count==32768)));
+    CHECK(ggml_backend_cuda_get_device_count()==2);
+    printf("KPACK_TP2_COMM_BEGIN arm=%s count=%d bytes=%zu\n",arm,count,size_t(count)*sizeof(float));
+    for (const char * name : {"CUDA_VISIBLE_DEVICES", "GGML_CUDA_ALLREDUCE", "PCCL_ENABLE_EXT_KERNEL", "PCCL_EXT_KERNEL_PLUGIN", "PCCL_ALGO", "PCCL_PROTO"}) {
+        const char * value=std::getenv(name);
+        printf("KPACK_TP2_COMM_ENV %s=%s\n",name,value?value:"UNSET");
+    }
+    fflush(stdout);
+    ggml_backend_t backends[]={ggml_backend_cuda_init(0),ggml_backend_cuda_init(1)};
+    CHECK(backends[0] && backends[1]);
+    auto * reg=ggml_backend_dev_backend_reg(ggml_backend_get_device(backends[0]));
+    auto init=(ggml_backend_comm_init_t)ggml_backend_reg_get_proc_address(reg,"ggml_backend_comm_init");
+    auto reduce=(ggml_backend_comm_allreduce_tensor_t)ggml_backend_reg_get_proc_address(reg,"ggml_backend_comm_allreduce_tensor");
+    auto release=(ggml_backend_comm_free_t)ggml_backend_reg_get_proc_address(reg,"ggml_backend_comm_free");
+    CHECK(init && reduce && release);
+    auto * comm=init(backends,2); CHECK(comm);
+    tp_comm_libraries();
+
+    constexpr int global_k=1024, local_k=512;
+    std::vector<uint8_t> raw;
+    std::vector<float> gold;
+    if (!copy) {
+        std::vector<float> source(size_t(global_k)*count), importance(global_k,1.f);
+        raw.resize(ggml_row_size(GGML_TYPE_Q8_0,global_k)*count); gold.resize(source.size());
+        for (size_t i=0;i<source.size();++i) source[i]=float(int((i*17+i/29)%97)-48)/128.f;
+        CHECK(ggml_quantize_chunk(GGML_TYPE_Q8_0,source.data(),raw.data(),0,count,global_k,importance.data())==raw.size());
+        ggml_get_type_traits(GGML_TYPE_Q8_0)->to_float(raw.data(),gold.data(),gold.size());
+    }
+    ggml_context * weights[2]{}, * inputs[2]{}, * ctx[2]{};
+    ggml_backend_buffer_t wb[2]{}, ib[2]{};
+    ggml_gallocr_t ga[2]{};
+    ggml_tensor * a[2]{}, * output[2]{};
+    ggml_cgraph * graph[2]{};
+    std::vector<float> expected[2]={std::vector<float>(count),std::vector<float>(count)};
+    for (int rank=0;rank<2;++rank) {
+        inputs[rank]=ggml_init({2<<20,nullptr,true});
+        ctx[rank]=ggml_init({2<<20,nullptr,true}); CHECK(inputs[rank] && ctx[rank]);
+        if (copy) {
+            output[rank]=ggml_new_tensor_1d(inputs[rank],GGML_TYPE_F32,count);
+        } else {
+            weights[rank]=ggml_init({2<<20,nullptr,true}); CHECK(weights[rank]);
+            auto * w=ggml_new_tensor_2d(weights[rank],GGML_TYPE_Q8_0,local_k,count);
+            ggml_set_name(w,"tp-weight");
+            auto * buft=ggml_backend_get_default_buffer_type(backends[rank]);
+            if (packed) {
+                auto extras=(ggml_backend_dev_get_extra_bufts_t)ggml_backend_reg_get_proc_address(reg,"ggml_backend_dev_get_extra_bufts");
+                CHECK(extras);
+                auto ** list=extras(ggml_backend_get_device(backends[rank])); CHECK(list && list[0]);
+                buft=list[0];
+            }
+            wb[rank]=ggml_backend_alloc_ctx_tensors_from_buft(weights[rank],buft); CHECK(wb[rank]);
+            ggml_backend_buffer_set_usage(wb[rank],GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+            const size_t row=ggml_row_size(w->type,local_k);
+            std::vector<uint8_t> shard(row*count);
+            for (int col=0;col<count;++col) memcpy(shard.data()+col*row,raw.data()+(2*col+rank)*row,row);
+            ggml_backend_tensor_set(w,shard.data(),0,shard.size());
+            a[rank]=ggml_new_tensor_2d(inputs[rank],GGML_TYPE_F32,local_k,1);
+            output[rank]=ggml_mul_mat(ctx[rank],w,a[rank]);
+            ggml_set_output(output[rank]);
+            graph[rank]=ggml_new_graph_custom(ctx[rank],16,false);
+            ggml_build_forward_expand(graph[rank],output[rank]);
+        }
+        ib[rank]=ggml_backend_alloc_ctx_tensors(inputs[rank],backends[rank]); CHECK(ib[rank]);
+        if (!copy) {
+            ga[rank]=ggml_gallocr_new(ggml_backend_get_default_buffer_type(backends[rank]));
+            CHECK(ga[rank] && ggml_gallocr_alloc_graph(ga[rank],graph[rank]));
+        }
+        output[rank]->flags|=GGML_TENSOR_FLAG_COMPUTE;
+    }
+    for (int replay=0;replay<3;++replay) {
+        std::vector<float> input(global_k), got(count), sum(count);
+        for (size_t i=0;i<input.size();++i) input[i]=float(int((i*13+i/37+replay*5)%61)-30)/128.f;
+        for (int rank=0;rank<2;++rank) {
+            printf("KPACK_TP2_COMM_LOCAL_BEGIN arm=%s rank=%d replay=%d\n",arm,rank,replay); fflush(stdout);
+            for (int col=0;col<count;++col) {
+                double dot=0;
+                if (copy) dot=float((col*7+rank*5+replay*3)%61-30)/8.f;
+                else for (int c=rank*local_k;c<(rank+1)*local_k;++c) dot+=double(input[c])*gold[size_t(col)*global_k+c];
+                expected[rank][col]=float(dot);
+            }
+            if (copy) ggml_backend_tensor_set(output[rank],expected[rank].data(),0,count*sizeof(float));
+            else {
+                ggml_backend_tensor_set(a[rank],input.data()+rank*local_k,0,local_k*sizeof(float));
+                CHECK(ggml_backend_graph_compute(backends[rank],graph[rank])==GGML_STATUS_SUCCESS);
+            }
+            ggml_backend_synchronize(backends[rank]);
+            ggml_backend_tensor_get(output[rank],got.data(),0,count*sizeof(float));
+            const double error=tp_comm_error(got,expected[rank]);
+            const bool valid=copy?error==0:error<.02;
+            printf("KPACK_TP2_COMM_LOCAL arm=%s rank=%d replay=%d error=%.9g synchronized=1 status=%s\n",
+                   arm,rank,replay,error,valid?"PASS":"FAIL"); fflush(stdout);
+            CHECK(valid);
+        }
+        for (int col=0;col<count;++col) sum[col]=expected[0][col]+expected[1][col];
+        tp_comm_libraries();
+        printf("KPACK_TP2_COMM_REDUCE_BEGIN arm=%s count=%d replay=%d\n",arm,count,replay); fflush(stdout);
+        CHECK(reduce(comm,output));
+        for (int rank=0;rank<2;++rank) {
+            ggml_backend_synchronize(backends[rank]);
+            ggml_backend_tensor_get(output[rank],got.data(),0,count*sizeof(float));
+            const double error=tp_comm_error(got,sum);
+            const bool valid=copy?error==0:error<.02;
+            printf("KPACK_TP2_COMM_SUM arm=%s rank=%d replay=%d error=%.9g status=%s\n",
+                   arm,rank,replay,error,valid?"PASS":"FAIL"); fflush(stdout);
+            CHECK(valid);
+        }
+    }
+    release(comm);
+    for (int rank=0;rank<2;++rank) {
+        ggml_gallocr_free(ga[rank]); ggml_backend_buffer_free(ib[rank]); ggml_backend_buffer_free(wb[rank]);
+        ggml_free(inputs[rank]); ggml_free(ctx[rank]); ggml_free(weights[rank]); ggml_backend_free(backends[rank]);
+    }
+    printf("KPACK_TP2_COMM PASS arm=%s count=%d replays=3\n",arm,count);
+    return 0;
+}
+
 static int run_tp2() {
     CHECK(ggml_backend_cuda_get_device_count() == 2);
     ggml_backend_dev_t devs[2];
@@ -377,6 +527,7 @@ static void run_case(ggml_backend_t gpu, ggml_backend_t cpu, ggml_backend_buffer
 }
 
 int main(int argc, char ** argv) {
+    if (argc==4 && !strcmp(argv[1],"--tp2-comm")) return run_tp2_comm(argv[2],std::stoi(argv[3]));
     if (argc == 2 && !strcmp(argv[1], "--tp2")) return run_tp2();
     if (argc == 3 && (!strcmp(argv[1], "--tp2-cache-write") || !strcmp(argv[1], "--tp2-cache-read"))) {
         tp_cache_root = argv[2];
