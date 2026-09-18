@@ -1131,6 +1131,56 @@ static bool fsync_path(const std::string & path, std::string & error) {
     return ok;
 }
 
+static bool publish_cache_files(const std::string & staging, const std::string & target, std::string & error) {
+    const int source_fd = open(staging.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (source_fd < 0) { error = staging + ": open: " + strerror(errno); return false; }
+    if (mkdir(target.c_str(), 0755) != 0) {
+        error = target + ": exclusive mkdir: " + strerror(errno);
+        close(source_fd);
+        return false;
+    }
+    const int target_fd = open(target.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (target_fd < 0) {
+        error = target + ": open: " + strerror(errno);
+        close(source_fd);
+        return false;
+    }
+    bool weights_linked = false;
+    bool published = false;
+    bool ok = false;
+    // Readers require the manifest. Publish it only after the data link is durable.
+    if (linkat(source_fd, "weights.bin", target_fd, "weights.bin", 0) != 0) {
+        error = target + ": link weights.bin: " + strerror(errno);
+    } else {
+        weights_linked = true;
+        if (fsync(target_fd) != 0) {
+            error = target + ": sync data link: " + strerror(errno);
+        } else if (linkat(source_fd, "manifest.json", target_fd, "manifest.json", 0) != 0) {
+            error = target + ": publish manifest.json: " + strerror(errno);
+        } else {
+            published = true;
+            ok = fsync(target_fd) == 0;
+            if (!ok) { error = target + ": sync published manifest: " + strerror(errno); }
+        }
+    }
+    if (!published) {
+        // Remove only this writer's link, never a replacement made by another writer.
+        struct stat source{}, linked{}, owned{}, current{};
+        if (weights_linked && fstatat(source_fd, "weights.bin", &source, AT_SYMLINK_NOFOLLOW) == 0 &&
+                fstatat(target_fd, "weights.bin", &linked, AT_SYMLINK_NOFOLLOW) == 0 &&
+                source.st_dev == linked.st_dev && source.st_ino == linked.st_ino) {
+            unlinkat(target_fd, "weights.bin", 0);
+        }
+        if (fstat(target_fd, &owned) == 0 && lstat(target.c_str(), &current) == 0 &&
+                owned.st_dev == current.st_dev && owned.st_ino == current.st_ino) {
+            rmdir(target.c_str());
+        }
+    }
+    close(target_fd);
+    close(source_fd);
+    return ok;
+}
+
 bool llama_kpack_sidecar_writer::finish(const std::string & model_label, const std::string & gguf_path,
                                       std::string & error, const cancelled & cancel) {
     auto & I = *pimpl;
@@ -1242,15 +1292,22 @@ bool llama_kpack_sidecar_writer::finish(const std::string & model_label, const s
     if (!fsync_path(I.staging, error)) { abort(); return false; }
     if (cancel && cancel()) { error = "cache write cancelled"; abort(); return false; }
 
-    // Publish without ever replacing: the kernel's RENAME_NOREPLACE, not a racy existence check.
+    // Keep no-replace semantics on filesystems without renameat2 flags.
 #ifndef RENAME_NOREPLACE
 #define RENAME_NOREPLACE (1 << 0)
 #endif
     if (syscall(SYS_renameat2, AT_FDCWD, I.staging.c_str(), AT_FDCWD, I.final_dir.c_str(), RENAME_NOREPLACE) != 0) {
-        error = "refusing to overwrite existing output " + I.final_dir + " (" + strerror(errno) + ")";
-        abort(); return false;
+        const int saved_errno = errno;
+        if (!I.local_cache || (saved_errno != EINVAL && saved_errno != ENOSYS && saved_errno != EOPNOTSUPP)) {
+            error = I.final_dir + ": renameat2(RENAME_NOREPLACE): " + strerror(saved_errno);
+            abort(); return false;
+        }
+        if (!publish_cache_files(I.staging, I.final_dir, error)) { abort(); return false; }
+        I.remove_staging();
+        GGML_LOG_INFO("[kpack-cache] published with manifest-last links: %s\n", I.final_dir.c_str());
+    } else {
+        I.staging.clear();
     }
-    I.staging.clear();
     I.source.close();
     std::string parent = I.final_dir;
     const size_t slash = parent.find_last_of('/');

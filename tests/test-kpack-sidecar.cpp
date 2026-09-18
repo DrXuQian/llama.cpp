@@ -21,11 +21,16 @@
 #include <chrono>
 #include <csignal>
 #include <future>
+#include <linux/filter.h>
+#include <linux/seccomp.h>
 #include <cstdarg>
 #include <thread>
 #include <string>
 #include <sys/stat.h>
 #include <sys/resource.h>
+#include <sys/prctl.h>
+#include <sys/syscall.h>
+#include <sys/wait.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <vector>
@@ -142,6 +147,18 @@ static void copy_bundle(const std::string & src, const std::string & dst) {
 }
 static void rm_bundle(const std::string & d) {
     unlink((d + "/manifest.json").c_str()); unlink((d + "/weights.bin").c_str()); unlink((d + "/extra").c_str()); rmdir(d.c_str());
+}
+
+static bool reject_publish_syscall(int number, int error) {
+    sock_filter filter[] = {
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(seccomp_data, nr)),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, (unsigned) number, 0, 1),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | (unsigned) error),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+    };
+    sock_fprog program{(unsigned short) (sizeof(filter) / sizeof(filter[0])), filter};
+    return prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) == 0 &&
+           prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &program) == 0;
 }
 
 // ---- SHA-256 ----
@@ -267,6 +284,56 @@ int main() {
     }
     struct stat st{};
     CHECK(stat((bundle + "/manifest.json").c_str(), &st) == 0 && stat((bundle + "/weights.bin").c_str(), &st) == 0, "bundle files exist");
+    for (int failure : {EINVAL, ENOSYS, EOPNOTSUPP, EACCES}) {
+        for (int collision = 0; collision < 3; ++collision) {
+            fflush(nullptr);
+            const pid_t child = fork();
+            CHECK(child >= 0, "fork publication test");
+            if (child == 0) {
+                g_failures = 0;
+                CHECK(reject_publish_syscall(SYS_renameat2, failure), "inject renameat2 errno");
+                if (collision == 2) {
+                    CHECK(reject_publish_syscall(SYS_linkat, EACCES), "inject hard-link failure");
+                }
+                const std::string target = dir + "/portable-cache";
+                const std::vector<uint8_t> foreign = {6, 7, 8};
+                {
+                    llama_kpack_sidecar_writer writer(true);
+                    CHECK(writer.bind_source(gguf_path, err) && writer.begin(target, err), "%s", err.c_str());
+                    CHECK(writer.add(dense.src, dense.data.data(), dense.planes, err), "%s", err.c_str());
+                    const std::string stage = target + ".partial." + std::to_string((long) getpid());
+                    struct stat before{}, after{};
+                    CHECK(stat((stage + "/weights.bin").c_str(), &before) == 0, "staged data exists");
+                    if (collision == 1) {
+                        CHECK(mkdir(target.c_str(), 0755) == 0, "another writer publishes first");
+                        write_file(target + "/weights.bin", foreign);
+                    }
+                    const bool expected = failure != EACCES && collision == 0;
+                    CHECK(writer.finish(gguf_path, gguf_path, err) == expected, "%s", err.c_str());
+                    if (expected) {
+                        CHECK(stat((target + "/weights.bin").c_str(), &after) == 0 &&
+                              before.st_dev == after.st_dev && before.st_ino == after.st_ino,
+                              "publication links data without copying it");
+                        llama_kpack_sidecar_reader reader;
+                        CHECK(reader.open(target, err) && reader.load_unchecked(gguf_path, {dense.src}, err), "%s", err.c_str());
+                    } else if (collision == 1) {
+                        CHECK(read_file(target + "/weights.bin") == foreign, "existing data remains unchanged");
+                    } else {
+                        CHECK(lstat(target.c_str(), &after) != 0, "failed publication leaves no claimed target");
+                    }
+                    CHECK(lstat(stage.c_str(), &after) != 0, "owned staging directory is cleaned");
+                }
+                rm_bundle(target);
+                fflush(nullptr);
+                _exit(g_failures ? 1 : 0);
+            }
+            if (child > 0) {
+                int status = 0;
+                CHECK(waitpid(child, &status, 0) == child && WIFEXITED(status) && WEXITSTATUS(status) == 0,
+                      "cache publication errno=%d collision=%d", failure, collision);
+            }
+        }
+    }
     {
         llama_kpack_sidecar_writer w2;
         CHECK(!w2.begin(bundle, err), "a second writer must refuse the existing bundle");
