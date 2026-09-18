@@ -95,6 +95,71 @@ int main(int argc, char **) {
                         '-I' + str(root / 'ggml/src'), '-I' + str(root / 'src'), '-I' + str(root / 'include'),
                         str(root / 'tests/test-quactlize-scheduler.cpp')], check=True)
 
+    def test_sdk_wrapper_is_local_but_available_to_needed_consumers(self):
+        root = Path(__file__).resolve().parents[1]
+        text = (root / 'ggml/src/ggml-cuda/quactlize-lib.cu').read_text()
+        body = 'static void qz_preload_sdk_wrapper(void) {' + text.split(
+            'static void qz_preload_sdk_wrapper(void) {', 1)[1].split('static void qz_load_one', 1)[0]
+        prefix = r'''
+#include <cstdio>
+#include <cstdlib>
+#include <string>
+#include <dlfcn.h>
+#define GGML_LOG_INFO(...) fprintf(stderr,__VA_ARGS__)
+'''
+        suffix = r'''
+int main(int argc,char ** argv) {
+    void * communication=dlopen(argv[1],RTLD_LAZY|RTLD_LOCAL);
+    if(!communication) return 2;
+    auto run=reinterpret_cast<int(*)()>(dlsym(communication,"communication_run"));
+    if(!run) return 3;
+    if(argc==4 && run()!=13) return 4;
+    qz_preload_sdk_wrapper();
+    void * consumer=dlopen(argv[2],RTLD_NOW|RTLD_LOCAL);
+    if(!consumer) return 5;
+    auto consume=reinterpret_cast<int(*)()>(dlsym(consumer,"consumer_run"));
+    if(!consume || consume()!=12) return 6;
+    int result=run();
+    printf("WRAPPER_SCOPE_RESULT communication=%d consumer=%d primed=%d\n",result,consume(),argc==4);
+    return result==13?0:86;
+}
+'''
+        with tempfile.TemporaryDirectory() as temp:
+            work = Path(temp)
+            lib = work / 'lib'
+            lib.mkdir()
+            sources = {
+                'runtime': 'int probe_launch(void) { return 13; }\n',
+                'hggc_wrapper': 'int probe_launch(void) { return 12; }\nint wrapper_only(void) { return 12; }\n',
+                'communication': 'extern int probe_launch(void); int communication_run(void) { return probe_launch(); }\n',
+                'consumer': 'extern int wrapper_only(void); int consumer_run(void) { return wrapper_only(); }\n',
+            }
+            for name, source in sources.items():
+                path = work / (name + '.c')
+                path.write_text(source)
+                command = ['cc', '-shared', '-fPIC', '-Wl,-z,lazy', '-Wl,-soname,lib' + name + '.so',
+                           str(path), '-L' + str(lib), '-Wl,-rpath,' + str(lib), '-o', str(lib / ('lib' + name + '.so'))]
+                if name == 'communication': command += ['-lruntime']
+                if name == 'consumer': command += ['-lhggc_wrapper']
+                subprocess.run(command, check=True)
+            needed = subprocess.check_output(['readelf', '-d', str(lib / 'libconsumer.so')], text=True)
+            self.assertIn('Shared library: [libhggc_wrapper.so]', needed)
+            for name, implementation, primed, expected in (
+                    ('local', body, False, 0),
+                    ('global-negative', body.replace('RTLD_NOW | RTLD_LOCAL', 'RTLD_NOW | RTLD_GLOBAL'), False, 86),
+                    ('global-primed', body.replace('RTLD_NOW | RTLD_LOCAL', 'RTLD_NOW | RTLD_GLOBAL'), True, 0)):
+                with self.subTest(arm=name):
+                    cpp, binary = work / (name + '.cpp'), work / name
+                    cpp.write_text(prefix + implementation + suffix)
+                    subprocess.run(['c++', '-std=c++17', str(cpp), '-ldl', '-o', str(binary)], check=True)
+                    command = [str(binary), str(lib / 'libcommunication.so'), str(lib / 'libconsumer.so')]
+                    if primed: command += ['primed']
+                    result = subprocess.run(command, env=dict(os.environ, PPU_SDK=str(work)),
+                                            text=True, capture_output=True)
+                    self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
+                    self.assertIn('consumer=12', result.stdout)
+                    self.assertIn('communication=' + ('12' if expected else '13'), result.stdout)
+
     def test_tp2_cache_source_does_not_read_resident_buffer(self):
         root = Path(__file__).resolve().parents[1]
         source = (root / 'tests/test-quactlize-scheduler.cpp').read_text()

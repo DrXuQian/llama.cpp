@@ -442,7 +442,7 @@ if (GGML_NCP_QUACTLIZE)
             target_include_directories(test-quactlize-scheduler PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src
                 ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/vendor)
             find_package(Threads REQUIRED)
-            target_link_libraries(test-quactlize-scheduler PRIVATE ggml-base ggml-cuda ggml-cpu Threads::Threads)
+            target_link_libraries(test-quactlize-scheduler PRIVATE ggml-base ggml-cuda ggml-cpu Threads::Threads ${CMAKE_DL_LIBS})
             add_dependencies(test-quactlize-scheduler ${QUACTLIZE_STUB_TARGETS})
             add_test(NAME test-quactlize-scheduler COMMAND $<TARGET_FILE:test-quactlize-scheduler>)
             set_tests_properties(test-quactlize-scheduler PROPERTIES

@@ -19,6 +19,9 @@
 #include <string>
 #include <fstream>
 #include <set>
+#ifndef QUACTLIZE_TP2_HOST_TEST
+#include <dlfcn.h>
+#endif
 
 #define CHECK(expr) do { \
     if (!(expr)) { fprintf(stderr, "scheduler check failed: %s\n", #expr); exit(1); } \
@@ -316,6 +319,16 @@ static void tp_comm_libraries() {
 #endif
 }
 
+static void tp_comm_symbols(const char * phase) {
+    for (const char * name : {"hggcLaunchKernel", "hggcGetFuncBySymbol", "__hggcRegisterFatBinary"}) {
+        Dl_info info{};
+        void * address=dlsym(RTLD_DEFAULT,name);
+        const char * library=address && dladdr(address,&info) && info.dli_fname?info.dli_fname:"NOT_GLOBAL";
+        printf("KPACK_TP2_COMM_SYMBOL phase=%s name=%s library=%s\n",phase,name,library);
+    }
+    fflush(stdout);
+}
+
 static double tp_comm_error(const std::vector<float> & got, const std::vector<float> & want) {
     CHECK(got.size()==want.size());
     double error=0, norm=0;
@@ -328,10 +341,11 @@ static double tp_comm_error(const std::vector<float> & got, const std::vector<fl
 }
 
 // Use the caller's unchanged communication entry, with synchronized local oracles.
-static int run_tp2_comm(const char * arm, int count) {
+static int run_tp2_comm(const char * arm, int count, const char * scope="none") {
     const bool copy=!strcmp(arm,"copy"), packed=!strcmp(arm,"kpack");
     CHECK(copy || packed || !strcmp(arm,"raw"));
     CHECK(count==512 || (copy && (count==3072 || count==32768)));
+    CHECK(!strcmp(scope,"none") || !strcmp(scope,"local") || !strcmp(scope,"global"));
     CHECK(ggml_backend_cuda_get_device_count()==2);
     printf("KPACK_TP2_COMM_BEGIN arm=%s count=%d bytes=%zu\n",arm,count,size_t(count)*sizeof(float));
     for (const char * name : {"CUDA_VISIBLE_DEVICES", "GGML_CUDA_ALLREDUCE", "PCCL_ENABLE_EXT_KERNEL", "PCCL_EXT_KERNEL_PLUGIN", "PCCL_ALGO", "PCCL_PROTO"}) {
@@ -347,6 +361,16 @@ static int run_tp2_comm(const char * arm, int count) {
     auto release=(ggml_backend_comm_free_t)ggml_backend_reg_get_proc_address(reg,"ggml_backend_comm_free");
     CHECK(init && reduce && release);
     auto * comm=init(backends,2); CHECK(comm);
+    tp_comm_symbols("before-wrapper");
+    if (strcmp(scope,"none")) {
+        const char * sdk=std::getenv("PPU_SDK"); CHECK(sdk && *sdk);
+        const std::string path=std::string(sdk)+"/lib/libhggc_wrapper.so";
+        void * wrapper=dlopen(path.c_str(),RTLD_NOW|(!strcmp(scope,"global")?RTLD_GLOBAL:RTLD_LOCAL));
+        if (!wrapper) fprintf(stderr,"KPACK_TP2_COMM_WRAPPER load failed: %s\n",dlerror());
+        CHECK(wrapper);
+        printf("KPACK_TP2_COMM_WRAPPER scope=%s path=%s\n",scope,path.c_str());
+    }
+    tp_comm_symbols("after-wrapper");
     tp_comm_libraries();
 
     constexpr int global_k=1024, local_k=512;
@@ -426,6 +450,7 @@ static int run_tp2_comm(const char * arm, int count) {
         }
         for (int col=0;col<count;++col) sum[col]=expected[0][col]+expected[1][col];
         tp_comm_libraries();
+        tp_comm_symbols("before-reduce");
         printf("KPACK_TP2_COMM_REDUCE_BEGIN arm=%s count=%d replay=%d\n",arm,count,replay); fflush(stdout);
         CHECK(reduce(comm,output));
         for (int rank=0;rank<2;++rank) {
@@ -527,7 +552,8 @@ static void run_case(ggml_backend_t gpu, ggml_backend_t cpu, ggml_backend_buffer
 }
 
 int main(int argc, char ** argv) {
-    if (argc==4 && !strcmp(argv[1],"--tp2-comm")) return run_tp2_comm(argv[2],std::stoi(argv[3]));
+    if ((argc==4 || argc==5) && !strcmp(argv[1],"--tp2-comm"))
+        return run_tp2_comm(argv[2],std::stoi(argv[3]),argc==5?argv[4]:"none");
     if (argc == 2 && !strcmp(argv[1], "--tp2")) return run_tp2();
     if (argc == 3 && (!strcmp(argv[1], "--tp2-cache-write") || !strcmp(argv[1], "--tp2-cache-read"))) {
         tp_cache_root = argv[2];
