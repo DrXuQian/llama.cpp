@@ -111,18 +111,23 @@ int main(int argc, char **) {
                 source.mkdir()
                 lib = sdk / location
                 lib.mkdir(parents=True)
+                include = sdk / location.replace('lib', 'include')
+                include.mkdir(parents=True)
+                for header in ('hggc_runtime_api.h', 'hggc.h', 'hgrtc.h'):
+                    (include / header).write_text('#pragma once\n#define NCP_TEST_SDK 42\n')
                 wrapper = lib / 'libhggc_wrapper.so'
                 (source / 'wrapper.c').write_text('int hggcGetDeviceProperties_v2(void) { return 42; }\n')
                 subprocess.run(['cc', '-shared', '-fPIC', '-Wl,-soname,libhggc_wrapper.so',
                                 str(source / 'wrapper.c'), '-o', str(wrapper)], check=True)
-                (source / 'moe.c').write_text('extern int hggcGetDeviceProperties_v2(void);\n'
-                                             'int moe(void) { return hggcGetDeviceProperties_v2(); }\n')
+                moe = ('extern "C" int hggcGetDeviceProperties_v2(void);\n'
+                       'extern "C" int moe(void) { return hggcGetDeviceProperties_v2(); }\n')
+                (source / 'moe.cpp').write_text(moe)
                 (source / 'main.c').write_text('extern int moe(void);\nint main(void) { return moe() != 42; }\n')
                 (source / 'fa.c').write_text('int fa(void) { return 0; }\n')
                 (source / 'CMakeLists.txt').write_text('''cmake_minimum_required(VERSION 3.19)
-project(ncp_link_fixture C)
+project(ncp_link_fixture C CXX)
 set(NCP_BUILD_MOE ON)
-add_library(ncp_moe SHARED moe.c)
+add_library(ncp_moe SHARED moe.cpp)
 target_link_libraries(ncp_moe m)
 add_library(ncp_fa SHARED fa.c)
 add_executable(warm_cache main.c)
@@ -140,7 +145,17 @@ target_link_libraries(test_moe PRIVATE ncp_moe)
                 self.assertGreaterEqual(len(objects), 3)
                 subprocess.run(configure + ['-DCMAKE_PROJECT_INCLUDE=' + str(hook)], check=True, capture_output=True)
                 subprocess.run(['cmake', '--build', str(build), '-j2'], check=True, capture_output=True)
-                self.assertEqual(objects, {p: p.stat().st_mtime_ns for p in objects})
+                # Only the MoE host target gets new compile flags; keep other objects.
+                untouched = {p: stamp for p, stamp in objects.items() if 'ncp_moe.dir' not in p.parts}
+                self.assertEqual(untouched, {p: p.stat().st_mtime_ns for p in untouched})
+                include_text = '#include <hggc_runtime_api.h>\n#include <hggc.h>\n#include <hgrtc.h>\n'
+                include_text += 'static_assert(NCP_TEST_SDK == 42, "wrong SDK include");\n'
+                (source / 'moe.cpp').write_text(include_text + moe)
+                subprocess.run(['cmake', '--build', str(build), '-j2'], check=True, capture_output=True)
+                moe_flags = (build / 'CMakeFiles/ncp_moe.dir/flags.make').read_text()
+                fa_flags = (build / 'CMakeFiles/ncp_fa.dir/flags.make').read_text()
+                self.assertIn(str(include), moe_flags)
+                self.assertNotIn(str(include), fa_flags)
                 for target in ('warm_cache', 'test_moe'):
                     subprocess.run([str(build / target)], check=True)
                 needed = lambda name: subprocess.check_output(['readelf', '-d', str(build / name)], text=True)
@@ -150,6 +165,11 @@ target_link_libraries(test_moe PRIVATE ncp_moe)
                                          capture_output=True, text=True)
                 self.assertNotEqual(missing.returncode, 0)
                 self.assertIn('has no libhggc_wrapper.so', missing.stderr)
+                (include / 'hggc_runtime_api.h').rename(include / 'header.saved')
+                missing = subprocess.run(configure + ['-DCMAKE_PROJECT_INCLUDE=' + str(hook)],
+                                         capture_output=True, text=True)
+                self.assertNotEqual(missing.returncode, 0)
+                self.assertIn('has no native host runtime headers', missing.stderr)
 
     def test_dense_only_inventory_does_not_require_a_grouped_kernel(self):
         text = "[quactlize-plan] tensor=w op=dense route=gemv-q4-s1 q=12 split=1"
