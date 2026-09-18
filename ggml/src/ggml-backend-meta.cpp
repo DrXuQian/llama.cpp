@@ -150,18 +150,18 @@ static ggml_backend_t ggml_backend_meta_device_init_backend(ggml_backend_dev_t d
 static ggml_backend_buffer_type_t ggml_backend_meta_device_get_buffer_type(ggml_backend_dev_t dev);
 
 static ggml_backend_buffer_type_t ggml_backend_meta_device_get_host_buffer_type(ggml_backend_dev_t dev);
+static bool ggml_backend_meta_device_supports_op_impl(ggml_backend_dev_t dev, const ggml_tensor * op);
+static ggml_backend_buffer_type_t ggml_backend_meta_buft_simple_buft(ggml_backend_buffer_type_t meta_buft, size_t index);
 
 static bool ggml_backend_meta_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
     GGML_ASSERT(ggml_backend_dev_is_meta(dev));
-    const ggml_backend_meta_device_context * meta_dev_ctx = (const ggml_backend_meta_device_context *) dev->context;
-    return std::all_of(meta_dev_ctx->simple_devs.begin(), meta_dev_ctx->simple_devs.end(),
-        [op](ggml_backend_dev_t simple_dev) { return ggml_backend_dev_supports_op(simple_dev, op); });
+    return ggml_backend_meta_device_supports_op_impl(dev, op);
 }
 
 static bool ggml_backend_meta_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
     GGML_ASSERT(ggml_backend_dev_is_meta(dev));
     ggml_backend_dev_t dev_buft = ggml_backend_buft_get_device(buft);
-    if (!ggml_backend_dev_is_meta(dev_buft)) {
+    if (!ggml_backend_buft_is_meta(buft) || !ggml_backend_dev_is_meta(dev_buft)) {
         return false;
     }
     const ggml_backend_meta_device_context * meta_dev_ctx      = (const ggml_backend_meta_device_context *) dev->context;
@@ -171,6 +171,9 @@ static bool ggml_backend_meta_device_supports_buft(ggml_backend_dev_t dev, ggml_
     }
     for (size_t i = 0; i < meta_dev_ctx->simple_devs.size(); i++) {
         if (meta_dev_ctx->simple_devs[i] != meta_buft_dev_ctx->simple_devs[i]) {
+            return false;
+        }
+        if (!ggml_backend_dev_supports_buft(meta_dev_ctx->simple_devs[i], ggml_backend_meta_buft_simple_buft(buft, i))) {
             return false;
         }
     }
@@ -255,11 +258,11 @@ struct ggml_backend_meta_buffer_type_context {
 
     ggml_backend_meta_buffer_type_context(std::vector<ggml_backend_buffer_type_t> simple_bufts) : simple_bufts(std::move(simple_bufts)) {
         name = "Meta(";
-        for (size_t i = 0; i < simple_bufts.size(); i++) {
+        for (size_t i = 0; i < this->simple_bufts.size(); i++) {
             if (i > 0) {
                 name += ",";
             }
-            name += ggml_backend_buft_name(simple_bufts[i]);
+            name += ggml_backend_buft_name(this->simple_bufts[i]);
         }
         name += ")";
     }
@@ -391,6 +394,55 @@ static ggml_backend_buffer_type_t ggml_backend_meta_device_get_host_buffer_type(
     return host_buft;
 }
 
+ggml_backend_buffer_type_t ggml_backend_meta_buffer_type(ggml_backend_dev_t dev, ggml_backend_buffer_type_t prototype) {
+    if (!ggml_backend_dev_is_meta(dev) || !prototype) { return nullptr; }
+    if (ggml_backend_buft_is_meta(prototype)) {
+        return ggml_backend_meta_device_supports_buft(dev, prototype) ? prototype : nullptr;
+    }
+    auto * source_dev = ggml_backend_buft_get_device(prototype);
+    auto * registry = source_dev ? ggml_backend_dev_backend_reg(source_dev) : nullptr;
+    auto * context = (ggml_backend_meta_device_context *) dev->context;
+    if (!registry || std::find(context->simple_devs.begin(), context->simple_devs.end(), source_dev) == context->simple_devs.end()) {
+        return nullptr;
+    }
+    if (prototype == ggml_backend_dev_buffer_type(source_dev)) {
+        return ggml_backend_meta_device_get_buffer_type(dev);
+    }
+    auto extras = (ggml_backend_dev_get_extra_bufts_t) ggml_backend_reg_get_proc_address(registry, "ggml_backend_dev_get_extra_bufts");
+    if (!extras) { return nullptr; }
+    auto * candidates = extras(source_dev);
+    size_t slot = 0;
+    while (candidates && candidates[slot] && candidates[slot] != prototype) { ++slot; }
+    if (!candidates || !candidates[slot]) { return nullptr; }
+    std::vector<ggml_backend_buffer_type_t> types;
+    for (auto * simple_dev : context->simple_devs) {
+        if (ggml_backend_dev_backend_reg(simple_dev) != registry) { return nullptr; }
+        auto * local = extras(simple_dev);
+        if (!local) { return nullptr; }
+        for (size_t i = 0; i <= slot; ++i) { if (!local[i]) { return nullptr; } }
+        if (ggml_backend_buft_get_device(local[slot]) != simple_dev || !ggml_backend_dev_supports_buft(simple_dev, local[slot])) {
+            return nullptr;
+        }
+        types.push_back(local[slot]);
+    }
+    using key = std::pair<ggml_backend_dev_t, std::vector<ggml_backend_buffer_type_t>>;
+    static std::map<key, ggml_backend_buffer_type> buffers;
+    const key identity{dev, types};
+    auto found = buffers.find(identity);
+    if (found != buffers.end()) { return &found->second; }
+    auto * buft_ctx = new ggml_backend_meta_buffer_type_context(std::move(types));
+    auto result = buffers.emplace(identity, ggml_backend_buffer_type{ggml_backend_meta_buffer_type_iface, dev, buft_ctx});
+    return &result.first->second;
+}
+
+size_t ggml_backend_meta_buffer_type_count(ggml_backend_buffer_type_t buft) {
+    return ggml_backend_buft_is_meta(buft) ? ggml_backend_meta_buft_n_bufts(buft) : 0;
+}
+
+ggml_backend_buffer_type_t ggml_backend_meta_buffer_type_at(ggml_backend_buffer_type_t buft, size_t index) {
+    return index < ggml_backend_meta_buffer_type_count(buft) ? ggml_backend_meta_buft_simple_buft(buft, index) : nullptr;
+}
+
 //
 // meta backend buffer
 //
@@ -483,6 +535,44 @@ static struct ggml_tensor * ggml_backend_meta_buffer_simple_tensor(const struct 
         return nullptr;
     }
     return it->second[index];
+}
+
+static bool ggml_backend_meta_device_supports_op_impl(ggml_backend_dev_t dev, const ggml_tensor * op) {
+    auto * ctx = (ggml_backend_meta_device_context *) dev->context;
+    bool custom = false;
+    for (const auto * src : op->src) {
+        if (src && src->buffer && ggml_backend_buft_is_meta(src->buffer->buft)) {
+            auto * buft = ggml_backend_buffer_get_type(src->buffer);
+            custom |= buft != ggml_backend_meta_device_get_buffer_type(ggml_backend_buft_get_device(buft));
+        }
+    }
+    if (!custom) {
+        return std::all_of(ctx->simple_devs.begin(), ctx->simple_devs.end(),
+            [op](ggml_backend_dev_t simple_dev) { return ggml_backend_dev_supports_op(simple_dev, op); });
+    }
+    for (size_t device = 0; device < ctx->simple_devs.size(); ++device) {
+        ggml_tensor node = *op;
+        ggml_tensor sources[GGML_MAX_SRC];
+        ggml_backend_buffer probes[GGML_MAX_SRC]{};
+        for (size_t i = 0; i < GGML_MAX_SRC; ++i) {
+            const auto * src = op->src[i];
+            if (!src || !src->buffer || !ggml_backend_buft_is_meta(src->buffer->buft)) { continue; }
+            if (!ggml_backend_meta_device_supports_buft(dev, src->buffer->buft)) { return false; }
+            auto * local = ggml_backend_buffer_is_meta(src->buffer) ? ggml_backend_meta_buffer_simple_tensor(src, device) : nullptr;
+            if (local) {
+                node.src[i] = local;
+            } else {
+                // Admission probes attach a zero-byte buffer before shard metadata exists.
+                if (src->buffer->size != 0) { return false; }
+                sources[i] = *src;
+                probes[i].buft = ggml_backend_meta_buft_simple_buft(src->buffer->buft, device);
+                sources[i].buffer = &probes[i];
+                node.src[i] = &sources[i];
+            }
+        }
+        if (!ggml_backend_dev_supports_op(ctx->simple_devs[device], &node)) { return false; }
+    }
+    return true;
 }
 
 static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(const struct ggml_tensor * tensor, bool assume_sync);
@@ -1535,6 +1625,54 @@ static void ggml_backend_meta_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
     }
 }
 
+static void ggml_backend_meta_buffer_set_tensor_2d(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data,
+        size_t offset, size_t width, size_t rows, size_t dst_pitch, size_t src_pitch) {
+    const size_t devices = ggml_backend_meta_buffer_n_bufs(buffer);
+    const auto split = ggml_backend_meta_get_split_state(tensor, false);
+    if (split.axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
+        for (size_t device = 0; device < devices; ++device) {
+            ggml_backend_tensor_set_2d(ggml_backend_meta_buffer_simple_tensor(tensor, device),
+                data, offset, width, rows, dst_pitch, src_pitch);
+        }
+        return;
+    }
+    if (split.axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL) {
+        for (size_t row = 0; row < rows; ++row) {
+            ggml_backend_meta_buffer_set_tensor(buffer, tensor, (const char *) data + row*src_pitch,
+                offset + row*dst_pitch, width);
+        }
+        return;
+    }
+    GGML_ASSERT(ggml_is_contiguous(tensor) && split.axis >= 0 && split.axis < 3);
+    const size_t chunk = tensor->nb[split.axis + 1];
+    GGML_ASSERT(chunk && dst_pitch == chunk && width <= chunk - offset%chunk);
+    const size_t begin = offset%chunk, end = begin + width, first_row = offset/chunk;
+    size_t position = 0, covered = 0;
+    std::vector<size_t> local_offsets(devices, 0);
+    for (size_t segment = 0; segment < split.n_segments; ++segment) {
+        for (size_t repeat = 0; repeat < split.nr[segment]; ++repeat) {
+            for (size_t device = 0; device < devices; ++device) {
+                const int64_t length = split.ne[segment*devices + device];
+                const int64_t block = split.axis == 0 ? ggml_blck_size(tensor->type) : 1;
+                GGML_ASSERT(length >= 0 && length%block == 0);
+                const size_t bytes = length/block * tensor->nb[split.axis];
+                const size_t lo = std::max(begin, position), hi = std::min(end, position + bytes);
+                if (lo < hi) {
+                    auto * local = ggml_backend_meta_buffer_simple_tensor(tensor, device);
+                    const size_t pitch = local->nb[split.axis + 1];
+                    ggml_backend_tensor_set_2d(local, (const char *) data + lo - begin,
+                        first_row*pitch + local_offsets[device] + lo - position,
+                        hi - lo, rows, pitch, src_pitch);
+                    covered += hi - lo;
+                }
+                position += bytes;
+                local_offsets[device] += bytes;
+            }
+        }
+    }
+    GGML_ASSERT(position == chunk && covered == width);
+}
+
 static void ggml_backend_meta_buffer_get_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
     const size_t n_bufs = ggml_backend_meta_buffer_n_bufs(buffer);
     const ggml_backend_meta_split_state split_state = ggml_backend_meta_get_split_state(tensor, /*assume_sync =*/ false);
@@ -1657,7 +1795,7 @@ static const ggml_backend_buffer_i ggml_backend_meta_buffer_iface = {
     /* .memset_tensor   = */ ggml_backend_meta_buffer_memset_tensor,
     /* .set_tensor      = */ ggml_backend_meta_buffer_set_tensor,
     /* .get_tensor      = */ ggml_backend_meta_buffer_get_tensor,
-    /* .set_tensor_2d   = */ nullptr,
+    /* .set_tensor_2d   = */ ggml_backend_meta_buffer_set_tensor_2d,
     /* .get_tensor_2d   = */ nullptr,
     /* .cpy_tensor      = */ nullptr,
     /* .clear           = */ ggml_backend_meta_buffer_clear,

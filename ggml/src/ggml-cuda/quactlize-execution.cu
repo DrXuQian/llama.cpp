@@ -322,6 +322,14 @@ Plan & prepare(ggml_backend_cuda_context & ctx, const ggml_tensor * weight,
     }
     auto p = std::make_unique<Plan>();
     p->api = owner.api; p->art = art; p->rows = tokens * topk; p->tokens = tokens; p->topk = topk;
+    auto save_plan = [&]() -> Plan & {
+        GGML_LOG_INFO("[quactlize-device-plan] tensor=%s device=%d op=%s q=%d rows=%d n=%" PRId64
+            " k=%" PRId64 " experts=%" PRId64 " selected=%d\n", weight->name, ctx.device,
+            ids ? "grouped" : "dense", art.qtype, p->rows, art.n, art.k, art.experts, int(!p->legacy));
+        auto * result = p.get();
+        owner.plans.emplace(key, std::move(p));
+        return *result;
+    };
     p->compute = compute_type(ids);
     if (p->compute == QK_COMPUTE_BF16 && !owner.api->query_compute)
         GGML_ABORT("[quactlize] BF16 requested but the runtime has no explicit BF16 compute interface");
@@ -512,7 +520,7 @@ Plan & prepare(ggml_backend_cuda_context & ctx, const ggml_tensor * weight,
                 weight->name,ids ? "grouped":"dense",art.qtype,p->rows,art.n,art.k,art.experts,prefill.dequant_config,prefill.measured_tokens,prefill.predicted,bytes);
             GGML_LOG_INFO("[quactlize-prefill-image] tensor=%s rows=%d provider=%s image=\"%s\"\n",
                 weight->name,p->rows,ids ? "deepgemm":"cublas",image);
-            auto * result=p.get();owner.plans.emplace(key,std::move(p));return *result;
+            return save_plan();
         }
         if (prefill_choice==1 && owner.api->prefill_choice) p->sf_config=prefill.dequant_config;
         if (p->compute==QK_COMPUTE_BF16 && p->sf_config>=0 && p->sf_config!=4 && p->sf_config!=5) p->sf_config=0;
@@ -632,9 +640,7 @@ Plan & prepare(ggml_backend_cuda_context & ctx, const ggml_tensor * weight,
                 GGML_LOG_INFO("[quactlize-adapter] tensor=%s dense_io=FP32 standalone_adapters=0\n", weight->name);
         }
     }
-    auto * result = p.get();
-    owner.plans.emplace(key, std::move(p));
-    return *result;
+    return save_plan();
 }
 SharedPlan * prepare_shared(ggml_backend_cuda_context & ctx, const ggml_cgraph * graph, int start, bool create) {
     auto * owner=execution(ctx);

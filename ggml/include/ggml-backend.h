@@ -404,6 +404,13 @@ extern "C" {
     GGML_API ggml_backend_dev_t ggml_backend_meta_device(
         ggml_backend_dev_t * devs, size_t n_devs, ggml_backend_meta_get_split_state_t get_split_state, void * get_split_state_ud);
 
+    // Lift a physical device's default/extra buffer type to the same family on each TP device.
+    // Extra types must belong to the same registry and extra-buffer index. NULL means incompatible.
+    GGML_API ggml_backend_buffer_type_t ggml_backend_meta_buffer_type(
+        ggml_backend_dev_t meta_dev, ggml_backend_buffer_type_t prototype);
+    GGML_API size_t ggml_backend_meta_buffer_type_count(ggml_backend_buffer_type_t buft);
+    GGML_API ggml_backend_buffer_type_t ggml_backend_meta_buffer_type_at(ggml_backend_buffer_type_t buft, size_t index);
+
     //
     // Utils
     //

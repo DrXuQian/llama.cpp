@@ -27,6 +27,7 @@ cache_api api_for(const ggml_tensor * t) {
     auto * dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(t->buffer));
     if (!dev) { return api; }
     auto * reg = ggml_backend_dev_backend_reg(dev);
+    if (!reg) { return api; }
     api.is_kpack = (decltype(api.is_kpack)) ggml_backend_reg_get_proc_address(reg, "ggml_quactlize_tensor_is_kpack");
     api.layout = (decltype(api.layout)) ggml_backend_reg_get_proc_address(reg, "ggml_quactlize_plane_layout");
     api.set = (decltype(api.set)) ggml_backend_reg_get_proc_address(reg, "ggml_quactlize_set_planes");

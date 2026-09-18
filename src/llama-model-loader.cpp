@@ -1068,6 +1068,21 @@ static ggml_backend_buffer_type_t select_weight_buft(const llama_hparams & hpara
     return nullptr;
 }
 
+static bool kpack_pair_supported(ggml_backend_buffer_type_t buft, const ggml_tensor * tensor) {
+    const size_t devices = ggml_backend_meta_buffer_type_count(buft);
+    if (devices) {
+        for (size_t device = 0; device < devices; ++device) {
+            if (!kpack_pair_supported(ggml_backend_meta_buffer_type_at(buft, device), tensor)) { return false; }
+        }
+        return true;
+    }
+    auto * dev = buft ? ggml_backend_buft_get_device(buft) : nullptr;
+    auto * reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+    auto accepts = reg ? reinterpret_cast<decltype(&ggml_quactlize_pair_supported)>(
+        ggml_backend_reg_get_proc_address(reg, "ggml_quactlize_pair_supported")) : nullptr;
+    return accepts && ggml_backend_reg_get_proc_address(reg, "ggml_quactlize_set_gate_up") && accepts(buft, tensor);
+}
+
 struct ggml_tensor * llama_model_loader::create_tensor(
         const llama_hparams & hparams, const buft_list_t * buft_list_cpu, const buft_list_t * buft_list_input, const buft_list_t * buft_list_output,
         const buft_list_t * buft_list_layer, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
@@ -1210,6 +1225,16 @@ struct ggml_tensor * llama_model_loader::create_tensor(
                     ggml_backend_buft_name(buft));
         }
 
+        auto * target_dev = buft_list->front().first;
+        auto * override_dev = buft ? ggml_backend_buft_get_device(buft) : nullptr;
+        if (ggml_backend_dev_type(target_dev) == GGML_BACKEND_DEVICE_TYPE_META && override_dev &&
+                ggml_backend_dev_type(override_dev) != GGML_BACKEND_DEVICE_TYPE_META && !ggml_backend_buft_is_host(buft)) {
+            buft = ggml_backend_meta_buffer_type(target_dev, buft);
+            if (!buft || !weight_buft_supported(hparams, t_meta, op, buft, target_dev)) {
+                throw std::runtime_error(format("tensor-parallel buffer override is unsupported for %s", tn.str().c_str()));
+            }
+        }
+
         if (!buft) {
             buft = select_weight_buft(hparams, t_meta, op, buft_list);
             if (!buft) {
@@ -1312,13 +1337,12 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             auto inherited_buft = gate_rule && up_rule && gate_rule->buft == up_rule->buft
                 ? gate_rule->buft : nullptr;
             auto buft = plain ? buft_for_tensor(&meta, inherited_buft) : nullptr;
-            plain &= (!gate_rule || gate_rule->buft == buft) && (!up_rule || up_rule->buft == buft);
-            auto dev=buft ? ggml_backend_buft_get_device(buft) : nullptr;
-            auto reg=dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
-            auto accepts=reg ? reinterpret_cast<decltype(&ggml_quactlize_pair_supported)>(
-                ggml_backend_reg_get_proc_address(reg,"ggml_quactlize_pair_supported")) : nullptr;
-            auto setter=reg ? ggml_backend_reg_get_proc_address(reg,"ggml_quactlize_set_gate_up") : nullptr;
-            if (plain && accepts && setter && accepts(buft,&meta)) {
+            const auto same_assignment = [&](const llama_model_tensor_buft_override * rule) {
+                return !rule || rule->buft == buft || (buft &&
+                    ggml_backend_meta_buffer_type(ggml_backend_buft_get_device(buft), rule->buft) == buft);
+            };
+            plain &= same_assignment(gate_rule) && same_assignment(up_rule);
+            if (plain && kpack_pair_supported(buft,&meta)) {
                 auto * tensor=ggml_dup_tensor(ctx_for_buft(buft),&meta);
                 ggml_set_name(tensor,tn.str().c_str());
                 weights_map.emplace(tn.str(),llama_tensor_weight(tensor,gate_name,up_name));
@@ -1614,9 +1638,11 @@ bool llama_model_loader::load_all_data(
 
         if (!weight->paired_sources.empty()) {
             auto dev=ggml_backend_buft_get_device(ggml_backend_buffer_get_type(cur->buffer));
-            auto setter=reinterpret_cast<decltype(&ggml_quactlize_set_gate_up)>(
-                ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(dev),"ggml_quactlize_set_gate_up"));
-            if (!setter || weight->paired_sources.size()!=2) throw std::runtime_error("paired GPU loader is unavailable");
+            auto reg=ggml_backend_dev_backend_reg(dev);
+            const bool meta=ggml_backend_dev_type(dev)==GGML_BACKEND_DEVICE_TYPE_META;
+            auto setter=reg ? reinterpret_cast<decltype(&ggml_quactlize_set_gate_up)>(
+                ggml_backend_reg_get_proc_address(reg,"ggml_quactlize_set_gate_up")) : nullptr;
+            if ((!meta && !setter) || weight->paired_sources.size()!=2) throw std::runtime_error("paired GPU loader is unavailable");
             std::vector<uint8_t> buffers[2];
             const void * data[2]{};
             for (int j=0;j<2;++j) {
@@ -1635,7 +1661,14 @@ bool llama_model_loader::load_all_data(
             }
             // Setter waits only for H2D source consumption; final packing and
             // background D2H use their existing, independent stream lifetimes.
-            setter(cur,data[0],data[1],n_size/2);
+            if (meta) {
+                GGML_ASSERT(cur->ne[3]==1 && cur->ne[2]>0);
+                const size_t bytes=n_size/2/cur->ne[2];
+                ggml_backend_tensor_set_2d(cur,data[0],0,bytes,cur->ne[2],2*bytes,bytes);
+                ggml_backend_tensor_set_2d(cur,data[1],bytes,bytes,cur->ne[2],2*bytes,bytes);
+            } else {
+                setter(cur,data[0],data[1],n_size/2);
+            }
             if (kpack_cache) kpack_cache->capture(cur);
             size_done+=n_size;
             continue;

@@ -133,6 +133,16 @@ static cudaError_t test_attributes(cudaPointerAttributes * attr, const void * pt
     attr->type = pinned.count((void *) ptr) ? cudaMemoryTypeHost : cudaMemoryTypeUnregistered;
     return cudaSuccess;
 }
+static cudaError_t test_copy_2d(void * dst, size_t dp, const void * src, size_t sp,
+        size_t width, size_t rows, cudaMemcpyKind kind, cudaStream_t stream) {
+    require(dp >= width && sp >= width && kind == cudaMemcpyHostToDevice);
+    ts(stream)->work.push_back([=]() {
+        for (size_t r = 0; r < rows; ++r) {
+            memcpy((uint8_t *) dst + r*dp, (const uint8_t *) src + r*sp, width);
+        }
+    });
+    return cudaSuccess;
+}
 static cudaError_t test_memset(void * ptr, int value, size_t bytes) {
     memset(ptr, value, bytes);
     return cudaSuccess;
@@ -174,6 +184,7 @@ static int test_prepare(int qtype, const uint8_t * raw, uint8_t * low, uint8_t *
 #define cudaEventDestroy test_event_destroy
 #define cudaStreamWaitEvent test_wait
 #define cudaMemcpyAsync test_copy
+#define cudaMemcpy2DAsync test_copy_2d
 #define cudaPointerGetAttributes test_attributes
 #define cudaMemset test_memset
 #define cudaGetLastError test_last_error
@@ -325,11 +336,48 @@ static void run_upload_case(int qtype, int experts, bool teardown_pending) {
     ggml_free(gctx);
 }
 
+static void run_shard_case(int qtype) {
+    const ggml_init_params init = {1 << 20, nullptr, true};
+    auto * gctx = ggml_init(init);
+    auto * weight = ggml_new_tensor_3d(gctx, (ggml_type) qtype, 512, 256, 3);
+    const size_t bytes = ggml_nbytes(weight), pitch = weight->nb[2], half = pitch/2;
+    qz_buft_context buft_ctx = {0, "test-kpack-shard"};
+    ggml_backend_buffer_type buft = {qz_buft_interface, nullptr, &buft_ctx};
+    auto * buffer = qz_buft_alloc_buffer(&buft, bytes);
+    weight->buffer = buffer; weight->data = qz_buffer_get_base(buffer);
+    std::vector<uint8_t> raw(bytes), strided(bytes*2, 0xdf);
+    for (size_t i = 0; i < bytes; ++i) raw[i] = (i*23+i/17)%251;
+    const int before = pack_calls;
+    for (int part = 0; part < 2; ++part) {
+        for (int e = 0; e < 3; ++e) memcpy(strided.data()+e*pitch*2, raw.data()+e*pitch+part*half, half);
+        qz_buffer_set_tensor_2d(buffer, weight, strided.data(), part*half, half, 3, pitch, pitch*2);
+        memset(strided.data(), 0xff, strided.size());
+        ggml_quactlize_artifact art{};
+        require(ggml_quactlize_artifact_for(weight, &art) == (part == 1));
+        require(pack_calls == before + part);
+    }
+    ggml_quactlize_artifact art{};
+    require(ggml_quactlize_artifact_for(weight, &art));
+    require(te(art.ready)->stream->cursor < te(art.ready)->end);
+    CUDA_CHECK(cudaEventSynchronize(art.ready));
+    qz_plane_sizes sizes{};
+    require(qz_plane_sizes_for(weight, art.arrangement, &sizes));
+    for (int e = 0; e < 3; ++e) {
+        require(!memcmp(art.low+e*sizes.low/3, raw.data()+e*pitch, sizes.low/3));
+        if (sizes.high) require(!memcmp(art.high+e*sizes.high/3, raw.data()+e*pitch+sizes.low/3, sizes.high/3));
+        require(!memcmp(art.units+e*sizes.units/3, raw.data()+e*pitch+(sizes.low+sizes.high)/3, sizes.units/3));
+    }
+    ggml_backend_buffer_free(buffer);
+    require(allocations.empty());
+    ggml_free(gctx);
+}
+
 int main(int argc, char ** argv) {
     plant_copy_wait = argc == 2 && strcmp(argv[1], "--plant-copy-wait") == 0;
     plant_upload_wait = argc == 2 && strcmp(argv[1], "--plant-upload-wait") == 0;
     plant_upload_reuse = argc == 2 && strcmp(argv[1], "--plant-upload-reuse") == 0;
     for (int qtype = 10; qtype <= 14; ++qtype) run_case(qtype, 3);
+    for (int qtype = 10; qtype <= 14; ++qtype) run_shard_case(qtype);
     run_case(14, 1000);
     for (int qtype = 10; qtype <= 14; ++qtype) {
         run_upload_case(qtype, 1, false);
@@ -338,5 +386,6 @@ int main(int argc, char ** argv) {
     run_upload_case(12, 257, true);
     printf("KPACK_UPLOAD_HOST PASS formats=5 slots=2 slot_MiB=8 source_reuse=PASS tail_async=PASS teardown=PASS device_validation=0\n");
     printf("KPACK_BUFFER_HOST PASS formats=5 chunked_experts=1000 delayed_D2H_compute=PASS device_validation=0\n");
+    printf("KPACK_SHARD_UPLOAD_HOST PASS formats=5 partial_ready=PASS source_reuse=PASS tail_async=PASS device_validation=0\n");
     return 0;
 }
