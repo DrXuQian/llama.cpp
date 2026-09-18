@@ -95,6 +95,59 @@ int main(int argc, char **) {
                         '-I' + str(root / 'ggml/src'), '-I' + str(root / 'src'), '-I' + str(root / 'include'),
                         str(root / 'tests/test-quactlize-scheduler.cpp')], check=True)
 
+    def test_tp2_cache_source_does_not_read_resident_buffer(self):
+        root = Path(__file__).resolve().parents[1]
+        source = (root / 'tests/test-quactlize-scheduler.cpp').read_text()
+        fixture = source.split('static std::unique_ptr<llama_kpack_cache> weight_cache(', 1)[1]
+        body = fixture.split('    auto * meta = gguf_init_empty();', 1)[1].split('    if (!tp_cache_hot)', 1)[0]
+        prefix = r'''
+#include <cstdlib>
+#include <cstdint>
+#include <cstring>
+#include <vector>
+#include "ggml.h"
+#define CHECK(x) do { if (!(x)) std::exit(86); } while (0)
+struct gguf_context { ggml_tensor tensor{}; };
+static gguf_context * gguf_init_empty() { return new gguf_context; }
+static void gguf_add_tensor(gguf_context * c, const ggml_tensor * t) { c->tensor = *t; }
+static void gguf_set_tensor_data(gguf_context * c, const char *, const void * p) { c->tensor.data = const_cast<void *>(p); }
+static void fixture(const ggml_tensor * w, const std::vector<uint8_t> & raw) {
+    auto * meta = gguf_init_empty();
+'''
+        suffix = r'''
+    // A GGUF writer takes the backend path if this is non-null.
+    CHECK(meta->tensor.buffer == nullptr);
+    CHECK(meta->tensor.view_src == nullptr && meta->tensor.view_offs == 0 && meta->tensor.extra == nullptr);
+    CHECK(meta->tensor.data == raw.data());
+    CHECK(meta->tensor.type == w->type && !std::strcmp(meta->tensor.name, w->name));
+    CHECK(!std::memcmp(meta->tensor.ne, w->ne, sizeof(w->ne)));
+    CHECK(!std::memcmp(meta->tensor.nb, w->nb, sizeof(w->nb)));
+    delete meta;
+}
+int main() {
+    ggml_tensor w{};
+    w.buffer = reinterpret_cast<ggml_backend_buffer *>(1);
+    w.data = reinterpret_cast<void *>(2);
+    w.view_src = &w; w.view_offs = 128; w.extra = &w;
+    w.type = GGML_TYPE_Q8_0;
+    w.ne[0] = 1024; w.ne[1] = 512; w.ne[2] = w.ne[3] = 1;
+    w.nb[0] = 34; w.nb[1] = 1088; w.nb[2] = w.nb[3] = 557056;
+    std::strcpy(w.name, "tp-weight");
+    const auto original = w;
+    const std::vector<uint8_t> raw(557056, 0x5a);
+    fixture(&w, raw);
+    CHECK(!std::memcmp(&w, &original, sizeof(w)));
+}
+'''
+        with tempfile.TemporaryDirectory() as temp:
+            for name, text, expected in (('source', body, 0),
+                                         ('attached-buffer', body.replace('source.buffer = nullptr;', ''), 86)):
+                cpp, binary = Path(temp) / (name + '.cpp'), Path(temp) / name
+                cpp.write_text(prefix + text + suffix)
+                subprocess.run(['c++', '-std=c++17', '-I' + str(root / 'ggml/include'),
+                                str(cpp), '-o', str(binary)], check=True)
+                self.assertEqual(subprocess.run([str(binary)]).returncode, expected)
+
     def test_aoneci_build_enables_kpack_without_disabling_ci_hooks(self):
         root = Path(__file__).resolve().parents[1]
         script = root / '.aoneci/scripts/build.sh'
