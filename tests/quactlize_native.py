@@ -346,14 +346,18 @@ def provider_images(args, text, plans):
 class AsysSession:
     """Collect one completed request after the same process has warmed up."""
     def __init__(self, executable, output):
+        from quactlize_profile_env import tool_environment
         self.executable = executable
         self.session = "kpack-proof-" + secrets.token_hex(8)
         self.report = output / "proof.asysrep"
         self.log = output / "proof-control.log"
+        self.environment = tool_environment(executable, os.environ)
 
     def command(self, application, environment=None):
-        from quactlize_profile_env import select
-        settings = select(os.environ if environment is None else environment)
+        from quactlize_profile_env import select, tool_environment
+        application_env = os.environ if environment is None else environment
+        self.environment = tool_environment(self.executable, application_env)
+        settings = select(application_env)
         entry = Path(__file__).with_name("quactlize_profile_env.py")
         target = [sys.executable, "-I", str(entry), json.dumps(settings, sort_keys=True), *application]
         return [str(self.executable), "launch", "--trace", "hggc", "--hggc-trace-set", "kernel-activity",
@@ -363,7 +367,7 @@ class AsysSession:
     def control(self, action, *options, check=True):
         with self.log.open("a") as log:
             subprocess.run([str(self.executable), action, "--session", self.session, *options],
-                           stdout=log, stderr=subprocess.STDOUT, timeout=60, check=check)
+                           env=self.environment, stdout=log, stderr=subprocess.STDOUT, timeout=60, check=check)
 
     def start(self):
         self.control("start", "--output", str(self.report))
@@ -378,8 +382,10 @@ class AsysSession:
 
 def asys_preflight(executable, output, environment=None):
     """Start the service without loading a model; retry only session creation."""
+    from quactlize_profile_env import service_snapshot, tool_environment
     output.mkdir(parents=True, exist_ok=False)
-    env = dict(os.environ if environment is None else environment)
+    env = tool_environment(executable, os.environ if environment is None else environment)
+    save(output / "services-before.json", service_snapshot(executable, env))
     attempts = []
     for attempt in range(1, 3):
         folder = output / str(attempt)
@@ -410,9 +416,11 @@ def asys_preflight(executable, output, environment=None):
         save(output / "summary.json", dict(status="PASS" if ready else "FAIL", attempts=attempts,
                                            scope="SESSION_LAUNCH_ONLY_NOT_GPU_KERNEL_CAPTURE"))
         if ready:
+            save(output / "services-after.json", service_snapshot(executable, env))
             return
         if not creation_failure:
             break
+    save(output / "services-after.json", service_snapshot(executable, env))
     with (output / "environment.log").open("x") as log:
         try:
             subprocess.run([str(executable), "status", "--ppu-env"], env=env,
@@ -469,6 +477,7 @@ def run_arm(args, index, arm, tokens, profile=None):
     if profile:
         require(len(args.prompts) == 1 and args.repeats == 1, "trace needs one warmup and one captured request")
         command = profile.command(command, env)
+        env = profile.environment
     save(args.output / (label + ".command.json"), command[:-1] + ["<ephemeral-key>"])
     base = f"http://127.0.0.1:{port}"
     records = []
@@ -715,12 +724,14 @@ def proof(args):
     source_tokens = getattr(args, "proof_tokens", None)
     tokens = (validate_tokens(json.loads(source_tokens.read_text()), capture.prompts)
               if source_tokens else None)
-    proof_arm, tokens = run_arm(capture, 0, arm, tokens, profile=AsysSession(args.asys, args.output))
+    profile = AsysSession(args.asys, args.output)
+    proof_arm, tokens = run_arm(capture, 0, arm, tokens, profile=profile)
     with (args.output / "proof-export.log").open("x") as f:
         subprocess.run(
             [str(args.asys), "export", "--output", str(db), str(report)],
             stdout=f,
             stderr=subprocess.STDOUT,
+            env=profile.environment,
             check=True,
         )
     total, kernels = activity(db, None)
