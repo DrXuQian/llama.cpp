@@ -26,8 +26,10 @@ inline SharedGateUpGraph match_shared_gate_up(ggml_cgraph const * graph, int sta
     for (auto * node : {gate, up}) {
         auto * weight = node->src[0];
         auto * input = node->src[1];
-        if (!weight || !input || weight->type != GGML_TYPE_Q8_0 || weight->ne[0] != 2048 ||
-            weight->ne[1] != 512 || weight->ne[2] != 1 || weight->ne[3] != 1 ||
+        if (!weight || !input || weight->type != GGML_TYPE_Q8_0 ||
+            weight->ne[0] <= 0 || weight->ne[0] > INT32_MAX || weight->ne[0] % 256 ||
+            weight->ne[1] <= 0 || weight->ne[1] > INT32_MAX/2 || weight->ne[1] % 256 ||
+            weight->ne[2] != 1 || weight->ne[3] != 1 ||
             input->type != GGML_TYPE_F32 || input->ne[1] < 1 || input->ne[1] > 8 ||
             input->ne[2] != 1 || input->ne[3] != 1 || !ggml_is_contiguous(input) ||
             node->type != GGML_TYPE_F32 || !ggml_is_contiguous(node)) return {};

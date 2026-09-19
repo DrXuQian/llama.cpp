@@ -194,11 +194,11 @@ Execution * execution(ggml_backend_cuda_context & ctx) {
     return static_cast<Execution *>(ctx.quactlize_execution.get());
 }
 
-void paired_log(const char * tensor, const char * op, int q, int tokens, int experts,
+void paired_log(const char * tensor, const char * op, int q, int n, int k, int tokens, int experts,
                 int compute, const qkg_gate_up_config_v1 & config) {
-    GGML_LOG_INFO("[quactlize-paired-plan] tensor=%s op=%s q=%d tokens=%d n=512 k=2048 experts=%d"
+    GGML_LOG_INFO("[quactlize-paired-plan] tensor=%s op=%s q=%d tokens=%d n=%d k=%d experts=%d"
         " backend=%s split=%d tile_m=%d warps=%d activation=%s layout=0x%016" PRIx64 "\n",
-        tensor,op,q,tokens,experts,config.backend==QKG_GATE_UP_SIMT?"simt":"tc",
+        tensor,op,q,tokens,n,k,experts,config.backend==QKG_GATE_UP_SIMT?"simt":"tc",
         config.split,config.tile_m,config.warps,compute_name(compute),QKG_GATE_UP_N4_V1);
 }
 
@@ -242,12 +242,12 @@ PairedWeights * paired_weights(Execution & owner, const ggml_quactlize_artifact 
     return &owner.paired_weights.emplace(key,result).first->second;
 }
 
-qkg_gate_up_call_v1 paired_call(int q, int experts, int tokens, int compute, bool indexed) {
+qkg_gate_up_call_v1 paired_call(int q, int n, int k, int experts, int tokens, int compute, bool indexed) {
     qkg_gate_up_call_v1 d{};d.version=1;d.size=sizeof(d);
     d.input.version=2;d.input.size=sizeof(d.input);d.input.compute_type=compute;
     d.output_type=QKG_F32;d.round_projection=indexed;
     auto & c=d.input.call;c.version=1;c.size=sizeof(c);c.qtype=q;
-    c.n=512;c.k=2048;c.experts=experts;c.rows=tokens*(indexed?8:1);
+    c.n=n;c.k=k;c.experts=experts;c.rows=tokens*(indexed?8:1);
     c.mode=indexed?QKG_INDEXED:QKG_DENSE;c.input_type=QKG_F32;c.channels=1;c.topk=indexed?8:1;
     c.a_row_stride=c.k;c.a_token_stride=c.k;c.ids_stride=c.topk;c.out_row_stride=c.n;
     return d;
@@ -661,7 +661,7 @@ SharedPlan * prepare_shared(ggml_backend_cuda_context & ctx, const ggml_cgraph *
     int tokens=int(input->ne[1]);
     if (owner->api->paired_select(gate.qtype,gate.n,gate.k,gate.experts,tokens,QK_COMPUTE_F16,&result.config)!=QKG_OK)
         return nullptr;
-    result.call=paired_call(gate.qtype,gate.experts,tokens,QK_COMPUTE_F16,false);
+    result.call=paired_call(gate.qtype,gate.n,gate.k,gate.experts,tokens,QK_COMPUTE_F16,false);
     result.weights=paired_weights(*owner,gate,&up,stream,result.call,result.config);
     if (!result.weights) return nullptr;
     auto & c=result.call.input.call;
@@ -671,7 +671,7 @@ SharedPlan * prepare_shared(ggml_backend_cuda_context & ctx, const ggml_cgraph *
     if (owner->api->paired_query(&result.call,&result.config,&result.weights->layout,&sizes)!=QKG_OK)
         GGML_ABORT("[quactlize] shared paired query failed");
     if (sizes.workspace_bytes) { c.workspace=owner->private_storage(sizes.workspace_bytes);c.workspace_bytes=sizes.workspace_bytes; }
-    paired_log(match.gate->src[0]->name,"dense",gate.qtype,tokens,gate.experts,QK_COMPUTE_F16,result.config);
+    paired_log(match.gate->src[0]->name,"dense",gate.qtype,gate.n,gate.k,tokens,gate.experts,QK_COMPUTE_F16,result.config);
     return &owner->shared_plans.emplace(key,result).first->second;
 }
 
@@ -753,14 +753,17 @@ MoePlan * prepare_moe(ggml_backend_cuda_context & ctx, const ggml_cgraph * graph
         if (rc!=QKS_OK) GGML_ABORT("[quactlize] MoE finish binding: %s",owner->api->error());
     }
     auto & gate=plans[0]->art;
-    if (owner->api->paired_select && route_mode()==RouteMode::Auto && !match.up &&
-        plans[0]->compute==QK_COMPUTE_BF16 && gate.qtype==12 && gate.n==1024 && gate.k==2048 &&
-        gate.experts==256 && plans[0]->topk==8 && match.gate->src[1]->ne[1]==1) {
-        qks_moe_gate_up_v1 binding{};binding.version=1;binding.size=sizeof(binding);
-        if (owner->api->paired_select(gate.qtype,gate.n/2,gate.k,gate.experts,plans[0]->tokens,
-                plans[0]->compute,&binding.config)!=QKG_OK)
-            GGML_ABORT("[quactlize] measured routed paired selection failed");
-        auto call=paired_call(gate.qtype,gate.experts,plans[0]->tokens,plans[0]->compute,true);
+    qks_moe_gate_up_v1 binding{};binding.version=1;binding.size=sizeof(binding);
+    bool pairable=owner->api->paired_select && route_mode()==RouteMode::Auto && !match.up &&
+        plans[0]->compute==QK_COMPUTE_BF16 && gate.qtype==12 &&
+        gate.n>0 && gate.n==2*plans[2]->art.k && gate.experts==plans[2]->art.experts &&
+        gate.experts==256 && plans[0]->topk==8 && match.gate->src[1]->ne[1]==1;
+    int pair_rc=pairable ? owner->api->paired_select(gate.qtype,gate.n/2,gate.k,gate.experts,
+        plans[0]->tokens,plans[0]->compute,&binding.config) : QKG_SHAPE;
+    if (pair_rc!=QKG_OK && pair_rc!=QKG_SHAPE)
+        GGML_ABORT("[quactlize] routed paired selection failed rc=%d",pair_rc);
+    if (pair_rc==QKG_OK) {
+        auto call=paired_call(gate.qtype,gate.n/2,gate.k,gate.experts,plans[0]->tokens,plans[0]->compute,true);
         result->paired=paired_weights(*owner,gate,nullptr,ctx.stream(),call,binding.config);
         if (!result->paired) GGML_ABORT("[quactlize] routed paired arrangement differs");
         binding.low=result->paired->low;binding.units=result->paired->units;binding.layout=result->paired->layout;
@@ -771,7 +774,7 @@ MoePlan * prepare_moe(ggml_backend_cuda_context & ctx, const ggml_cgraph * graph
         const int paired_rc=owner->api->moe_bind_gate_up(owner->runtime,result->handle,&binding);
         if (paired_rc!=QKS_OK)
             GGML_ABORT("[quactlize] routed paired binding rc=%d: %s",paired_rc,owner->api->error());
-        paired_log(match.gate->src[0]->name,"grouped",gate.qtype,plans[0]->tokens,gate.experts,plans[0]->compute,binding.config);
+        paired_log(match.gate->src[0]->name,"grouped",gate.qtype,gate.n/2,gate.k,plans[0]->tokens,gate.experts,plans[0]->compute,binding.config);
     }
     GGML_LOG_INFO("[quactlize-moe] gate=%s down=%s merged=%d rows=%d simt_mask=%u shared_prepare=1 swiglu_to_down=1 reduce_scatter=%d weighted_sum_finish=%d activation=%s\n",
         match.gate->src[0]->name,match.down->src[0]->name,int(!match.up),plans[0]->rows,result->simt_mask,
