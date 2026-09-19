@@ -34,6 +34,157 @@ static std::vector<std::string> tp_cache_manifests;
 static std::string tp_chain_dump;
 static bool tp_chain_retain = false;
 
+static float tp_bf16_rne(float value) {
+    CHECK(std::isfinite(value));
+    uint32_t bits;
+    memcpy(&bits, &value, sizeof(bits));
+    bits = (bits + 0x7fff + ((bits >> 16) & 1)) & 0xffff0000u;
+    memcpy(&value, &bits, sizeof(value));
+    CHECK(std::isfinite(value));
+    return value;
+}
+
+static float tp_half_le(const uint8_t * p) {
+    const ggml_fp16_t value = uint16_t(p[0]) | uint16_t(p[1]) << 8;
+    return ggml_fp16_to_fp32(value);
+}
+
+// Decode raw GGUF, not the K-pack bytes or the device reader's address map.
+static std::vector<float> tp_bf16_tc_weights(ggml_type type, const std::vector<uint8_t> & raw) {
+    CHECK(type == GGML_TYPE_Q8_0 || type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K);
+    const size_t bytes = ggml_type_size(type);
+    const int block_size = ggml_blck_size(type);
+    CHECK(raw.size() % bytes == 0);
+    std::vector<float> result(raw.size() / bytes * block_size);
+    for (size_t block = 0; block < raw.size() / bytes; ++block) {
+        const auto * p = raw.data() + block * bytes;
+        const float d = tp_half_le(p);
+        auto * dst = result.data() + block * block_size;
+        if (type == GGML_TYPE_Q8_0) {
+            for (int i = 0; i < 32; ++i) {
+                const int code = (int(p[2+i]) ^ 128) - 128;
+                dst[i] = tp_bf16_rne(d * code);
+            }
+            continue;
+        }
+        const float dmin = tp_half_le(p + 2);
+        const auto * fields = p + 4;
+        const auto * low = p + (type == GGML_TYPE_Q4_K ? 16 : 48);
+        for (int group = 0; group < 8; ++group) {
+            const int sc = group < 4 ? fields[group] & 63 :
+                (fields[group+4] & 15) | ((fields[group-4] >> 6) << 4);
+            const int mn = group < 4 ? fields[group+4] & 63 :
+                (fields[group+4] >> 4) | ((fields[group] >> 6) << 4);
+            const float scale = tp_bf16_rne(d * sc);
+            const float zero = tp_bf16_rne(tp_bf16_rne(-dmin * mn) + tp_bf16_rne(8 * scale));
+            for (int i = 0; i < 32; ++i) {
+                int code = (low[(group/2)*32+i] >> (4*(group&1))) & 15;
+                if (type == GGML_TYPE_Q5_K) { code |= ((p[16+i] >> group) & 1) << 4; }
+                dst[group*32+i] = tp_bf16_rne(tp_bf16_rne((code-8) * scale) + zero);
+            }
+        }
+    }
+    return result;
+}
+
+// Operands are already BF16 values. Their products are exact in FP32;
+// the accumulator is FP32, not a double dot rounded once at the end.
+static float tp_dot_fp32(const float * a, const float * b, int size) {
+    float sum = 0;
+    for (int i = 0; i < size; ++i) { sum += a[i] * b[i]; }
+    return sum;
+}
+
+static float tp_bf16_swiglu(float gate, float up) {
+    gate = tp_bf16_rne(gate);
+    up = tp_bf16_rne(up);
+    // llama's unfused GLU is FP32; the next grouped TC intake rounds to BF16.
+    return tp_bf16_rne((gate / (1.f + std::exp(-gate))) * up);
+}
+
+static float tp_bf16_tp_square(float rank0, float rank1) {
+    // Each TC epilogue writes BF16, but PCCL adds the two F32 endpoints.
+    const float total = tp_bf16_rne(rank0) + tp_bf16_rne(rank1);
+    return total * total;
+}
+
+static std::vector<float> tp_bf16_chain_reference(const std::vector<float> & input,
+        const std::vector<int32_t> & ids, const std::vector<float> * weights,
+        int k, int hidden, int n, int topk) {
+    CHECK(hidden > 0 && hidden % 2 == 0 && k > 0 && n > 0 && topk > 0);
+    CHECK(ids.size() % topk == 0 && input.size() == ids.size() / topk * k);
+    const size_t experts = weights[0].size() / (2*hidden*k);
+    CHECK(weights[0].size() == experts * 2*hidden*k && weights[1].size() == experts*n*hidden);
+    auto rounded = input;
+    for (auto & value : rounded) { value = tp_bf16_rne(value); }
+    std::vector<float> mid(hidden), result(ids.size()*n);
+    for (size_t row = 0; row < ids.size(); ++row) {
+        CHECK(ids[row] >= 0 && size_t(ids[row]) < experts);
+        const auto * x = rounded.data() + (row/topk)*k;
+        const auto * pair = weights[0].data() + size_t(ids[row])*2*hidden*k;
+        for (int h = 0; h < hidden; ++h) {
+            mid[h] = tp_bf16_swiglu(tp_dot_fp32(x, pair+h*k, k), tp_dot_fp32(x, pair+(hidden+h)*k, k));
+        }
+        for (int col = 0; col < n; ++col) {
+            const auto * w = weights[1].data() + (size_t(ids[row])*n+col)*hidden;
+            result[row*n+col] = tp_bf16_tp_square(tp_dot_fp32(mid.data(), w, hidden/2),
+                tp_dot_fp32(mid.data()+hidden/2, w+hidden/2, hidden/2));
+        }
+    }
+    return result;
+}
+
+static void tp_bf16_reference_self_test() {
+    CHECK(tp_bf16_rne(1.f + 1.f/256) == 1.f);
+    CHECK(tp_bf16_rne(1.f + 3.f/256) == 1.f + 1.f/64);
+    CHECK(std::signbit(tp_bf16_rne(-0.f)));
+    const float a[] = {1, 1, 1}, b[] = {16777216, 1, -16777216};
+    CHECK(tp_dot_fp32(a, b, 3) == 0);
+    CHECK(tp_bf16_tp_square(1.f, -.5f) == .25f);
+    const float sum = 1.f + 1.f/256;
+    CHECK(tp_bf16_tp_square(1.f, 1.f/256) == sum * sum);
+    for (auto type : {GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K}) {
+        std::vector<uint8_t> raw(ggml_type_size(type), 0);
+        raw[1] = 0x3c;
+        if (type == GGML_TYPE_Q8_0) {
+            for (int i = 0; i < 32; ++i) { raw[2+i] = uint8_t(i-16); }
+        } else {
+            raw[3] = 0x3c;
+            for (int i = 0; i < 4; ++i) { raw[4+i] = 1; raw[8+i] = 2; raw[12+i] = 0x21; }
+            const int offset = type == GGML_TYPE_Q4_K ? 16 : 48;
+            if (type == GGML_TYPE_Q5_K) { for (int i = 16; i < 48; ++i) { raw[i] = 0xa5; } }
+            for (size_t i = offset; i < raw.size(); ++i) { raw[i] = 0xa3; }
+        }
+        const auto result = tp_bf16_tc_weights(type, raw);
+        std::vector<float> exact(result.size());
+        ggml_get_type_traits(type)->to_float(raw.data(), exact.data(), exact.size());
+        CHECK(result == exact);
+        if (type == GGML_TYPE_Q4_K) {
+            raw[14] &= 0xf0;
+            const auto negative = tp_bf16_tc_weights(type, raw);
+            int bad = 0;
+            for (size_t i = 0; i < result.size(); ++i) { bad += negative[i] != result[i]; }
+            CHECK(bad == 32);
+        }
+    }
+    std::vector<float> weights[2] = {std::vector<float>(2*8*4, 0), std::vector<float>(2*2*4, 1)};
+    for (int expert = 0; expert < 2; ++expert) {
+        for (int h = 0; h < 8; ++h) { weights[0][(expert*8+h)*4] = expert+1; }
+    }
+    const std::vector<float> input = {1, 0, 0, 0, 2, 0, 0, 0};
+    const std::vector<int32_t> ids = {0, 1, 1, 0};
+    const auto reference = tp_bf16_chain_reference(input, ids, weights, 4, 4, 2, 2);
+    const auto wrong_expert = tp_bf16_chain_reference(input, {1, 0, 0, 1}, weights, 4, 4, 2, 2);
+    for (int row = 0; row < 4; ++row) {
+        const float v = input[(row/2)*4] * (ids[row]+1);
+        const float part = 2 * tp_bf16_swiglu(v, v);
+        CHECK(reference[row*2] == tp_bf16_tp_square(part, part));
+        CHECK(reference[row*2] == reference[row*2+1] && reference[row*2] != wrong_expert[row*2]);
+        CHECK(reference[row*2] != tp_bf16_tp_square(part, 0));
+    }
+    puts("KPACK_TP2_BF16_REFERENCE PASS rne=EVEN accumulator=FP32 formats=Q8_0,Q4_K,Q5_K field_loss=EXPECTED_RED routing=EXPECTED_RED missing_rank=EXPECTED_RED");
+}
+
 static void tp_chain_write(const std::string & name, const void * data, size_t bytes) {
     if (tp_chain_dump.empty()) { return; }
     const std::string path = tp_chain_dump + "/" + name;
@@ -120,7 +271,14 @@ static void tp_chain(ggml_backend_t backend, ggml_backend_buffer_type_t packed, 
     ggml_set_name(gate,"tp-weight"); ggml_set_name(down,"tp-down");
     auto * wb=ggml_backend_alloc_ctx_tensors_from_buft(wc,packed); CHECK(wb);
     ggml_backend_buffer_set_usage(wb,GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
-    std::vector<float> gold[2];
+    bool bf16_tc = false;
+#ifndef QUACTLIZE_TP2_HOST_TEST
+    const char * compute = getenv("QUACTLIZE_KPACK_COMPUTE");
+    // This fixture's tokens32 route is TC; tokens1/8 use the SIMT contract.
+    bf16_tc = tokens == 32 && compute && !strcmp(compute, "bf16");
+#endif
+    const char * oracle = bf16_tc ? "BF16_TC_FP32_ACC" : "GGUF_FP64_DOT";
+    std::vector<float> gold[2], typed_gold[2];
     std::unique_ptr<llama_kpack_cache> caches[2];
     int index=0;
     for (auto * w : {gate,down}) {
@@ -130,6 +288,7 @@ static void tp_chain(ggml_backend_t backend, ggml_backend_buffer_type_t packed, 
         CHECK(ggml_quantize_chunk(w->type,source.data(),raw.data(),0,w->ne[1]*experts,w->ne[0],importance.data())==raw.size());
         if (w->type == GGML_TYPE_F32) memcpy(gold[index].data(),raw.data(),raw.size());
         else ggml_get_type_traits(w->type)->to_float(raw.data(),gold[index].data(),gold[index].size());
+        if (bf16_tc) { typed_gold[index] = tp_bf16_tc_weights(w->type, raw); }
         tp_chain_write("weight-" + std::to_string(index) + ".bin", raw.data(), raw.size());
         caches[index] = weight_cache(w, raw, "chain-" + std::to_string(q) + "-" +
             std::to_string(tokens) + "-" + std::to_string(index));
@@ -166,7 +325,7 @@ static void tp_chain(ggml_backend_t backend, ggml_backend_buffer_type_t packed, 
     check_tp_compute_split(result,GGML_BACKEND_SPLIT_AXIS_MIRRORED);
     std::vector<float> input(ggml_nelements(a)),output(ggml_nelements(result)),mid(hidden);
     std::vector<int32_t> router(topk*tokens);
-    double maximum=0;
+    double maximum=0, high_maximum=0;
     for (int replay=0;replay<3;++replay) {
         for (size_t i=0;i<input.size();++i) input[i]=float(int((i*13+i/31+replay*11)%61)-30)/128.f;
         for (size_t i=0;i<router.size();++i) router[i]=(i+replay)%experts;
@@ -186,7 +345,9 @@ static void tp_chain(ggml_backend_t backend, ggml_backend_buffer_type_t packed, 
                 tp_chain_write_shards("reduced", product, replay);
             }
         }
-        double err=0,norm=0;
+        const auto typed_reference = bf16_tc ? tp_bf16_chain_reference(input, router, typed_gold, k, hidden, n, topk) :
+            std::vector<float>{};
+        double err=0,norm=0, high_err=0, high_norm=0;
         for (int r=0;r<tokens*topk;++r) {
             const int e=router[r],t=r/topk;
             for (int h=0;h<hidden;++h) {
@@ -201,11 +362,18 @@ static void tp_chain(ggml_backend_t backend, ggml_backend_buffer_type_t packed, 
                 double want=0;
                 for (int h=0;h<hidden;++h) want+=double(mid[h])*gold[1][(size_t(e)*n+col)*hidden+h];
                 want*=want; const double got=output[size_t(r)*n+col]; CHECK(std::isfinite(got));
+                high_err+=(got-want)*(got-want); high_norm+=want*want;
+                if (bf16_tc) { want = typed_reference[size_t(r)*n+col]; }
                 err+=(got-want)*(got-want); norm+=want*want;
             }
         }
         const double relative = std::sqrt(err/std::max(norm,1.e-30));
+        const double high_relative = std::sqrt(high_err/std::max(high_norm,1.e-30));
         maximum=std::max(maximum,relative);
+        high_maximum=std::max(high_maximum,high_relative);
+        printf("KPACK_TP2_CHAIN_REFERENCE q=%d tokens=%d replay=%d oracle=%s relative=%.9g high_relative=%.9g threshold=0.02\n",
+               q, tokens, replay, oracle, relative, high_relative);
+        fflush(stdout);
         if (!tp_chain_dump.empty()) {
             printf("KPACK_TP2_CHAIN_CAPTURE replay=%d retain=%d relative=%.9g threshold=0.02 admitted=0\n",
                    replay, int(tp_chain_retain), relative);
@@ -217,7 +385,8 @@ static void tp_chain(ggml_backend_t backend, ggml_backend_buffer_type_t packed, 
         if (tp_chain_dump.empty()) { CHECK(maximum<.02); }
     }
     if (tp_chain_dump.empty()) {
-        printf("KPACK_TP2_CHAIN q=%d tokens=%d experts=4 topk=2 replays=3 error=%.8g status=PASS\n",q,tokens,maximum);
+        printf("KPACK_TP2_CHAIN q=%d tokens=%d experts=4 topk=2 replays=3 error=%.8g status=PASS oracle=%s high_error=%.8g\n",
+               q,tokens,maximum,oracle,high_maximum);
     } else {
         printf("KPACK_TP2_CHAIN_CAPTURE_COMPLETE q=%d tokens=%d replays=3 retain=%d maximum=%.9g gate=%s admitted=0\n",
                q, tokens, int(tp_chain_retain), maximum, maximum < .02 ? "PASS" : "FAIL");
@@ -335,6 +504,7 @@ static void tp_numerical(ggml_backend_t backend, ggml_backend_buffer_type_t pack
 
 #ifdef QUACTLIZE_TP2_HOST_TEST
 int main() {
+    tp_bf16_reference_self_test();
     auto * cpu = ggml_backend_cpu_init();
     CHECK(cpu);
     auto * dev = ggml_backend_get_device(cpu);
@@ -557,6 +727,7 @@ static int run_tp2_comm(const char * arm, int count, const char * scope="none", 
 }
 
 static int run_tp2(bool single=false) {
+    tp_bf16_reference_self_test();
     CHECK(ggml_backend_cuda_get_device_count() == 2);
     ggml_backend_dev_t devs[2];
     for (int i = 0; i < 2; ++i) devs[i] = ggml_backend_buft_get_device(ggml_backend_cuda_buffer_type(i));
