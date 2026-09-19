@@ -80,7 +80,38 @@ def timings(response, payload):
     )
 
 
+def measured_decode_recipe(name):
+    match = re.search(r"quactlize::execution::simt::measured_decode_kernel<\s*" +
+                      r",\s*".join([r"(\d+)"] * 14) + r",\s*(true|false|0|1),\s*(true|false|0|1)\s*>", name)
+    if not match:
+        return None
+    v = tuple(map(int, match.groups()[:14]))
+    q, mode, n, k, experts, topk, channels, compute, variant, columns, warps, values, split, changes = v
+    if (q not in (8, 10, 11, 12, 13, 14) or mode not in (0, 2) or min(n, k) <= 0 or
+            n % 256 or k % 256 or compute not in (0, 1) or changes not in (0, 1, 3) or
+            columns not in (4, 8) or warps not in (2, 4, 8) or values not in (2, 4, 8) or
+            split not in (1, 2, 4, 8) or not 0 <= variant <= (5 if q == 8 else 3) or
+            (mode == 0 and (experts, topk, channels) != (1, 1, 1)) or
+            (mode == 2 and (experts != 256 or topk != 8 or channels not in (1, 8)))):
+        return None
+    return v
+
+
+def measured_decode_matches_plan(recipe, plan):
+    if recipe is None:
+        return True
+    q, mode, n, k, experts, topk, channels, compute, variant, columns, warps, values, split, changes = recipe
+    return (plan.get('op') == ('dense' if mode == 0 else 'grouped') and
+            all(int(plan.get(field, -1)) == value for field, value in
+                (('q', q), ('n', n), ('k', k), ('rows', topk), ('split', split))) and
+            int(plan.get('activation') == 'BF16') == compute)
+
+
 def simt_symbol_recipe(name):
+    measured = measured_decode_recipe(name)
+    if measured:
+        q, mode, n, k, experts, topk, channels, compute, variant, columns, warps, values, split, changes = measured
+        return (q, 1, variant, columns, warps, values, compute)
     fixed = re.search(r"quactlize::execution::simt::q8_vector::kernel_model<\s*" +
                       r",\s*".join([r"(\d+)"] * 6) + r",\s*(true|false|0|1),\s*(\d+),\s*(\d+),\s*(\d+)\s*>", name)
     if fixed:
@@ -130,6 +161,8 @@ def q4_symbol_matches_plan(recipe, plan):
 
 
 def paired_symbol_recipe(name):
+    if re.search(r"quactlize::fusion::simt_gate_up_q8_tile16\(", name):
+        return dict(q=8, storage=1, compute=0, warps=8, tile_m=0, backend='simt', measured_tile16=True)
     simt=re.search(r"quactlize::fusion::simt_gate_up(?:_model)?<\s*(\d+),\s*(\d+),\s*(\d+),\s*(\d+)(?:,\s*(\d+),\s*(\d+))?\s*>",name)
     if simt:
         q,storage,compute,warps=map(int,simt.groups()[:4])
@@ -145,6 +178,9 @@ def paired_symbol_recipe(name):
 def paired_matches_plan(recipe,plan):
     if not recipe:return False
     recipe=dict(recipe)
+    if recipe.pop('measured_tile16', False):
+        if int(plan.get('tokens',0))!=1 or (int(plan['n']),int(plan['k'])) not in ((512,2048),(1024,3072)):
+            return False
     if 'physical_n' in recipe:
         if recipe.pop('physical_n')!=2*int(plan['n']) or recipe.pop('k')!=int(plan['k']):return False
     return recipe==dict(q=int(plan['q']),storage=1,compute=int(plan['activation']=='BF16'),
@@ -160,7 +196,10 @@ def paired_selection(text,manifest):
         require(receipt.get('layout_id')=='0x47554e3400000001' and r.get('layout')==receipt['layout_id'],
                 'unbound paired layout receipt')
         q,tokens,experts=map(lambda key:int(r.get(key,0)),('q','tokens','experts'))
-        require(r.get('n')=='512' and r.get('k')=='2048' and 1<=tokens<=8,'unmeasured paired shape')
+        old_shape=r.get('n')=='512' and r.get('k')=='2048' and 1<=tokens<=8
+        tp2_shared=(q==8 and r.get('n')=='1024' and r.get('k')=='3072' and tokens==1 and
+                    receipt.get('q8_shared')=='F16_N512_K2048_T1_8_N1024_K3072_T1')
+        require(old_shape or tp2_shared,'unmeasured paired shape')
         if q==8:
             require(r.get('op')=='dense' and experts==1 and r.get('activation')=='FP16','paired shared precision/scope differs')
             expected=('simt',1,0,8)
@@ -828,7 +867,8 @@ def proof(args):
                         for r in plans["plans"]
                         if (r["route"] == "gemv" and q and r["q"] == q[1]) or
                            q4_symbol_matches_plan(q4, r) or
-                           (reuse and r.get("reader") in ("simt-reuse", "simt-q8-vector") and reuse ==
+                           (reuse and measured_decode_matches_plan(measured_decode_recipe(demangled),r) and
+                            r.get("reader") in ("simt-reuse", "simt-q8-vector") and reuse ==
                             (int(r["q"]),1,*[int(r[k]) for k in ("variant","columns","warps","values")],
                              int(r.get("activation")=="BF16")))
                     }
