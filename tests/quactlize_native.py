@@ -103,8 +103,17 @@ def simt_symbol_recipe(name):
     if vector:
         storage, compute, variant, columns, warps, values = map(int, vector.groups())
         return (8, storage, variant + 4, columns, warps, values, compute)
-    match = re.search(r"quactlize::execution::simt::register_reuse(?:_model)?<\s*(\d+),\s*(\d+),\s*(\d+),\s*(\d+),\s*(\d+),\s*(\d+)(?:,\s*(\d+))?(?:,\s*(?:0|1|3))?(?:,\s*\d+,\s*\d+)?\s*>", name)
-    return tuple(int(x or 0) for x in match.groups()) if match else None
+    match = re.search(r"quactlize::execution::simt::register_reuse(_model)?<\s*(\d+(?:\s*,\s*\d+)*)\s*>", name)
+    if not match:
+        return None
+    values = tuple(map(int, match[2].split(',')))
+    if len(values) not in ((8, 10) if match[1] else (6, 7, 8)):
+        return None
+    if len(values) >= 8 and values[7] not in (0, 1, 3):
+        return None
+    if len(values) == 10 and min(values[8:]) <= 0:
+        return None
+    return (*values[:6], values[6] if len(values) > 6 else 0)
 
 
 def q4_symbol_recipe(name):
