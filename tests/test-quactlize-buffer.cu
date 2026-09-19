@@ -20,6 +20,7 @@ static std::set<const void *> uploads_pending;
 static bool allow_d2h = false;
 static bool plant_copy_wait = false;
 static bool plant_upload_wait = false, plant_upload_reuse = false, testing_upload = false;
+static bool plant_shard_duplicate = false;
 static int host_waits = 0, copies = 0, pack_calls = 0, stream_waits = 0;
 static int upload_submissions = 0;
 
@@ -336,11 +337,12 @@ static void run_upload_case(int qtype, int experts, bool teardown_pending) {
     ggml_free(gctx);
 }
 
-static void run_shard_case(int qtype) {
+static void run_shard_case(int qtype, int experts, bool reverse) {
     const ggml_init_params init = {1 << 20, nullptr, true};
     auto * gctx = ggml_init(init);
-    auto * weight = ggml_new_tensor_3d(gctx, (ggml_type) qtype, 512, 256, 3);
-    const size_t bytes = ggml_nbytes(weight), pitch = weight->nb[2], half = pitch/2;
+    auto * weight = ggml_new_tensor_3d(gctx, (ggml_type) qtype, 512, 256, experts);
+    const size_t bytes = ggml_nbytes(weight), pitch = weight->nb[2];
+    const size_t offsets[] = {0, pitch/4, pitch/2}, widths[] = {pitch/4, pitch/4, pitch/2};
     qz_buft_context buft_ctx = {0, "test-kpack-shard"};
     ggml_backend_buffer_type buft = {qz_buft_interface, nullptr, &buft_ctx};
     auto * buffer = qz_buft_alloc_buffer(&buft, bytes);
@@ -348,13 +350,17 @@ static void run_shard_case(int qtype) {
     std::vector<uint8_t> raw(bytes), strided(bytes*2, 0xdf);
     for (size_t i = 0; i < bytes; ++i) raw[i] = (i*23+i/17)%251;
     const int before = pack_calls;
-    for (int part = 0; part < 2; ++part) {
-        for (int e = 0; e < 3; ++e) memcpy(strided.data()+e*pitch*2, raw.data()+e*pitch+part*half, half);
-        qz_buffer_set_tensor_2d(buffer, weight, strided.data(), part*half, half, 3, pitch, pitch*2);
+    for (int step = 0; step < 3; ++step) {
+        const int part = plant_shard_duplicate && step == 1 ? (reverse ? 2 : 0) : reverse ? 2-step : step;
+        for (int e = 0; e < experts; ++e) {
+            memcpy(strided.data()+e*pitch*2, raw.data()+e*pitch+offsets[part], widths[part]);
+        }
+        // The public API sends one-row copies through set_tensor, not set_tensor_2d.
+        ggml_backend_tensor_set_2d(weight, strided.data(), offsets[part], widths[part], experts, pitch, pitch*2);
         memset(strided.data(), 0xff, strided.size());
         ggml_quactlize_artifact art{};
-        require(ggml_quactlize_artifact_for(weight, &art) == (part == 1));
-        require(pack_calls == before + part);
+        require(ggml_quactlize_artifact_for(weight, &art) == (step == 2));
+        require(pack_calls == before + (step == 2));
     }
     ggml_quactlize_artifact art{};
     require(ggml_quactlize_artifact_for(weight, &art));
@@ -362,10 +368,10 @@ static void run_shard_case(int qtype) {
     CUDA_CHECK(cudaEventSynchronize(art.ready));
     qz_plane_sizes sizes{};
     require(qz_plane_sizes_for(weight, art.arrangement, &sizes));
-    for (int e = 0; e < 3; ++e) {
-        require(!memcmp(art.low+e*sizes.low/3, raw.data()+e*pitch, sizes.low/3));
-        if (sizes.high) require(!memcmp(art.high+e*sizes.high/3, raw.data()+e*pitch+sizes.low/3, sizes.high/3));
-        require(!memcmp(art.units+e*sizes.units/3, raw.data()+e*pitch+(sizes.low+sizes.high)/3, sizes.units/3));
+    for (int e = 0; e < experts; ++e) {
+        require(!memcmp(art.low+e*sizes.low/experts, raw.data()+e*pitch, sizes.low/experts));
+        if (sizes.high) require(!memcmp(art.high+e*sizes.high/experts, raw.data()+e*pitch+sizes.low/experts, sizes.high/experts));
+        require(!memcmp(art.units+e*sizes.units/experts, raw.data()+e*pitch+(sizes.low+sizes.high)/experts, sizes.units/experts));
     }
     ggml_backend_buffer_free(buffer);
     require(allocations.empty());
@@ -376,8 +382,11 @@ int main(int argc, char ** argv) {
     plant_copy_wait = argc == 2 && strcmp(argv[1], "--plant-copy-wait") == 0;
     plant_upload_wait = argc == 2 && strcmp(argv[1], "--plant-upload-wait") == 0;
     plant_upload_reuse = argc == 2 && strcmp(argv[1], "--plant-upload-reuse") == 0;
+    plant_shard_duplicate = argc == 2 && strcmp(argv[1], "--plant-shard-duplicate") == 0;
     for (int qtype = 10; qtype <= 14; ++qtype) run_case(qtype, 3);
-    for (int qtype = 10; qtype <= 14; ++qtype) run_shard_case(qtype);
+    for (int qtype : {8,10,11,12,13,14}) for (int experts : {1,3}) for (bool reverse : {false,true}) {
+        run_shard_case(qtype, experts, reverse);
+    }
     run_case(14, 1000);
     for (int qtype = 10; qtype <= 14; ++qtype) {
         run_upload_case(qtype, 1, false);
@@ -386,6 +395,6 @@ int main(int argc, char ** argv) {
     run_upload_case(12, 257, true);
     printf("KPACK_UPLOAD_HOST PASS formats=5 slots=2 slot_MiB=8 source_reuse=PASS tail_async=PASS teardown=PASS device_validation=0\n");
     printf("KPACK_BUFFER_HOST PASS formats=5 chunked_experts=1000 delayed_D2H_compute=PASS device_validation=0\n");
-    printf("KPACK_SHARD_UPLOAD_HOST PASS formats=5 partial_ready=PASS source_reuse=PASS tail_async=PASS device_validation=0\n");
+    printf("KPACK_SHARD_UPLOAD_HOST PASS formats=6 cases=24 one_row=PASS strided=PASS reverse=PASS partial_ready=PASS source_reuse=PASS tail_async=PASS device_validation=0\n");
     return 0;
 }

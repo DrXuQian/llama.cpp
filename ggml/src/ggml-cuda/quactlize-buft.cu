@@ -242,9 +242,7 @@ static void qz_set_raw(
     qz_buffer_context * ctx = (qz_buffer_context *) buffer->context;
     GGML_ASSERT(ctx->pending_tensor == nullptr);
 
-    // Whole tensor in one call. A non-default buffer type is excluded from the loader's chunked async upload
-    // (llama-model-loader.cpp), which is what makes this hold -- and it must, because the K-pack address map is
-    // over the whole (n, k) plane and a chunk boundary would split a transport word.
+    // Complete contiguous intake. Partial Meta shards use the shared range tracker below.
     GGML_ASSERT(offset == 0);
     GGML_ASSERT(size == ggml_nbytes(tensor));
 
@@ -334,11 +332,6 @@ static void qz_set_raw(
         " experts=%" PRId64 " bytes=%zu producer=GPU\n", tensor->name, ctx->device, qtype, n, k, experts, size);
 }
 
-static void qz_buffer_set_tensor(ggml_backend_buffer_t buffer,ggml_tensor * tensor,
-    const void * data,size_t offset,size_t size) {
-    qz_set_raw(buffer,tensor,data,nullptr,offset,size);
-}
-
 static void qz_buffer_set_tensor_2d(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data,
         size_t offset, size_t width, size_t rows, size_t dst_pitch, size_t src_pitch) {
     auto * ctx = (qz_buffer_context *) buffer->context;
@@ -382,6 +375,17 @@ static void qz_buffer_set_tensor_2d(ggml_backend_buffer_t buffer, ggml_tensor * 
     // Consume the caller's host bytes, but do not wait for the final pack or D2H.
     CUDA_CHECK(cudaEventSynchronize(ctx->upload_done));
 }
+
+static void qz_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor,
+        const void * data, size_t offset, size_t size) {
+    // ggml routes one-row set_tensor_2d calls here, including partial TP segments.
+    if (offset || size != ggml_nbytes(tensor)) {
+        qz_buffer_set_tensor_2d(buffer, tensor, data, offset, size, 1, size, size);
+    } else {
+        qz_set_raw(buffer, tensor, data, nullptr, offset, size);
+    }
+}
+
 bool ggml_quactlize_pair_supported(ggml_backend_buffer_type_t buft,const ggml_tensor * merged) {
     return buft && merged && ggml_backend_buft_is_cuda_quactlize(buft) && merged->ne[1]%2==0 &&
         ggml_quactlize_device_pair_available(merged->type) && ggml_quactlize_can_serve(merged,GGML_OP_MUL_MAT_ID);

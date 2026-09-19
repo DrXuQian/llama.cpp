@@ -394,7 +394,7 @@ if (GGML_NCP_QUACTLIZE)
         add_dependencies(test-quactlize-buffer ${QUACTLIZE_STUB_TARGETS})
         add_test(NAME test-quactlize-buffer COMMAND $<TARGET_FILE:test-quactlize-buffer>)
         set_tests_properties(test-quactlize-buffer PROPERTIES
-            ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_CURRENT_BINARY_DIR}/quactlize-stub:$<TARGET_FILE_DIR:CUDA::cudart>:$ENV{LD_LIBRARY_PATH};QUACTLIZE_PPU_BUNDLE=${CMAKE_CURRENT_BINARY_DIR}/quactlize-stub;QUACTLIZE_PPU_PACK_LIBRARY=$<TARGET_FILE:quactlize-stub-pack>;PPU_SDK=")
+            ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_CURRENT_BINARY_DIR}/quactlize-stub:$<TARGET_FILE_DIR:CUDA::cudart>:$ENV{LD_LIBRARY_PATH};QUACTLIZE_PPU_BUNDLE=${CMAKE_CURRENT_BINARY_DIR}/quactlize-stub;QUACTLIZE_PPU_PACK_LIBRARY=$<TARGET_FILE:quactlize-stub-pack>;QUACTLIZE_KPACK_EXECUTION=${CMAKE_CURRENT_BINARY_DIR}/quactlize-stub;QUACTLIZE_KPACK_JIT_HELPER=/stub-helper;PPU_SDK=")
         add_executable(test-quactlize-ready test-quactlize-ready.cu)
         set_target_properties(test-quactlize-ready PROPERTIES CUDA_RUNTIME_LIBRARY None)
         target_compile_definitions(test-quactlize-ready PRIVATE GGML_NCP_QUACTLIZE)
