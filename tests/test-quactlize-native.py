@@ -15,6 +15,20 @@ from quactlize_native import timings, selection, summarize, PATTERN
 
 
 class NativeEvidence(unittest.TestCase):
+    def test_profiler_tool_environment_does_not_change_application_route(self):
+        from quactlize_profile_env import tool_environment
+        before = dict(PATH='/old/bin:/usr/bin', LD_LIBRARY_PATH='/app/lib',
+                      ASIGHT_HOME='/old/asight', ASIGHT_LD_LIBRARY_PATH='/old/asight/lib',
+                      QUACTLIZE_KPACK_EXECUTION='/runtime', CUDA_VISIBLE_DEVICES='0,1')
+        result = tool_environment(Path('/selected/asight/bin/asys'), before)
+        self.assertEqual(result['ASIGHT_HOME'], '/selected/asight')
+        self.assertEqual(result['ASIGHT_LD_LIBRARY_PATH'], '/selected/asight/bin:/selected/asight/lib')
+        self.assertEqual(result['PATH'], '/selected/asight/bin:/old/bin:/usr/bin')
+        self.assertEqual(result['LD_LIBRARY_PATH'], '/selected/asight/lib:/app/lib')
+        self.assertEqual(result['QUACTLIZE_KPACK_EXECUTION'], '/runtime')
+        self.assertEqual(result['CUDA_VISIBLE_DEVICES'], '0,1')
+        self.assertEqual(before['ASIGHT_HOME'], '/old/asight')
+
     def test_asys_preflight_retries_only_session_creation_and_never_loads_model(self):
         for failure in ('once', 'always', 'other', 'timeout'):
             with self.subTest(failure=failure), tempfile.TemporaryDirectory() as temp:
@@ -906,6 +920,7 @@ int main() {
                 profile.close()
             self.assertEqual([c.args[0][1] for c in run.call_args_list], ["start", "stop", "shutdown"])
             self.assertTrue(all(c.args[0][3] == profile.session for c in run.call_args_list))
+            self.assertTrue(all(c.kwargs['env']['ASIGHT_HOME'] == '/' for c in run.call_args_list))
 
     def test_profile_target_replaces_stale_route_environment_before_exec(self):
         from quactlize_profile_env import select
