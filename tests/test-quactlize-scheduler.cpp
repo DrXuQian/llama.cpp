@@ -398,16 +398,20 @@ static void tp_chain(ggml_backend_t backend, ggml_backend_buffer_type_t packed, 
 }
 
 static void tp_numerical(ggml_backend_t backend, ggml_backend_buffer_type_t packed,
-                         int qtype, int experts, int tokens, int axis, bool missing_reduce_negative = false) {
+                         int qtype, int experts, int tokens, int axis, bool missing_reduce_negative = false,
+                         bool segmented = false) {
     CHECK(!missing_reduce_negative || (axis == 0 && experts == 1 && tokens == 1));
-    printf("KPACK_TP2_BEGIN cell q=%d experts=%d tokens=%d split=%c cache=%s\n",
-           qtype, experts, tokens, axis == 0 ? 'K' : 'N',
+    CHECK(!segmented || (axis == 1 && experts == 1 && tokens == 1 && !missing_reduce_negative));
+    printf("KPACK_TP2_BEGIN %s q=%d experts=%d tokens=%d split=%c cache=%s\n",
+           segmented ? "segmented" : "cell", qtype, experts, tokens, axis == 0 ? 'K' : 'N',
            tp_cache_root.empty() ? "disabled" : tp_cache_hot ? "hot" : "cold");
     fflush(stdout);
-    constexpr int k = 1024, n = 512;
+    const int k = 1024, n = segmented ? 1024 : 512;
     const int topk = experts > 1 ? 2 : 1;
     tp_weight_split = {(ggml_backend_meta_split_axis) axis, {0}, {1}, 1};
     tp_weight_split.ne[0] = tp_weight_split.ne[1] = (axis == 0 ? k : n)/2;
+    // Q/K/V-style dense weights deliver three separate one-row writes per rank.
+    if (segmented) tp_weight_split = {GGML_BACKEND_SPLIT_AXIS_1, {128,128,256,256}, {2,1}, 2};
     auto * weights = ggml_init({2 << 20, nullptr, true});
     auto * ctx = ggml_init({2 << 20, nullptr, true});
     auto * inputs = ggml_init({2 << 20, nullptr, true});
@@ -423,7 +427,8 @@ static void tp_numerical(ggml_backend_t backend, ggml_backend_buffer_type_t pack
     CHECK(ggml_quantize_chunk(w->type, source.data(), raw.data(), 0, n*experts, k, importance.data()) == raw.size());
     ggml_get_type_traits(w->type)->to_float(raw.data(), dequant.data(), dequant.size());
     auto cache = weight_cache(w, raw, "cell-" + std::to_string(qtype) + "-" +
-        std::to_string(experts) + "-" + std::to_string(tokens) + "-" + std::to_string(axis));
+        std::to_string(experts) + "-" + std::to_string(tokens) + "-" + std::to_string(axis) +
+        (segmented ? "-segmented" : ""));
     if (!tp_cache_hot) { ggml_backend_tensor_set(w, raw.data(), 0, raw.size()); }
     if (cache) { cache->capture(w); cache->start(); }
     auto * a = experts > 1 ? ggml_new_tensor_3d(inputs, GGML_TYPE_F32, k, topk, tokens) :
@@ -463,12 +468,27 @@ static void tp_numerical(ggml_backend_t backend, ggml_backend_buffer_type_t pack
         if (ids) ggml_backend_tensor_set(ids, router.data(), 0, ggml_nbytes(ids));
         CHECK(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS);
         ggml_backend_synchronize(backend);
-        ggml_backend_tensor_get(out, output.data(), 0, ggml_nbytes(out));
+        if (segmented) {
+            // Check local GEMMs: Meta's bare output has rank-concatenated columns.
+            for (int rank = 0; rank < 2; ++rank) {
+                const auto * local = ggml_backend_meta_tensor_shard(out, rank, nullptr);
+                CHECK(local && local->ne[0] == n/2);
+                ggml_backend_tensor_get(local, output.data()+rank*n/2, 0, ggml_nbytes(local));
+            }
+        } else {
+            ggml_backend_tensor_get(out, output.data(), 0, ggml_nbytes(out));
+        }
         double err = 0, norm = 0, partial_err = 0, partial_norm = 0;
         for (int r = 0; r < tokens*topk; ++r) for (int col = 0; col < n; ++col) {
+            int source_col = col;
+            if (segmented) {
+                const int rank = col/512, local = col%512;
+                source_col = local < 128 ? rank*128+local : local < 256 ?
+                    256+rank*128+local-128 : 512+rank*256+local-256;
+            }
             double dot = 0, partial = 0;
             for (int c = 0; c < k; ++c) {
-                const double term = double(input[size_t(r)*k+c])*dequant[(size_t(router[r])*n+col)*k+c];
+                const double term = double(input[size_t(r)*k+c])*dequant[(size_t(router[r])*n+source_col)*k+c];
                 dot += term;
                 if (c < k/2) partial += term;
             }
@@ -492,8 +512,8 @@ static void tp_numerical(ggml_backend_t backend, ggml_backend_buffer_type_t pack
         if (!missing_reduce_negative) CHECK(relative < .02);
     }
     if (!missing_reduce_negative) {
-        printf("KPACK_TP2_CELL q=%d experts=%d tokens=%d split=%c replays=3 error=%.8g status=PASS\n",
-               qtype, experts, tokens, axis == 0 ? 'K' : 'N', max_error);
+        printf("KPACK_TP2_%s q=%d experts=%d tokens=%d split=%c replays=3 error=%.8g status=PASS\n",
+               segmented ? "SEGMENTED" : "CELL", qtype, experts, tokens, axis == 0 ? 'K' : 'N', max_error);
     }
     fflush(stdout);
     cache.reset();
@@ -517,6 +537,7 @@ int main() {
     for (int q : {8,10,11,12,13,14}) for (int e : {1,4}) for (int m : {1,8,32}) for (int axis : {0,1}) {
         tp_numerical(backend,buft,q,e,m,axis);
     }
+    for (int q : {8,10,11,12,13,14}) tp_numerical(backend,buft,q,1,1,1,false,true);
     // CPU quantized GEMM requantizes A; use F32 to isolate chain split semantics.
     for (int m : {1,8,32}) tp_chain(backend,buft,GGML_TYPE_F32,m);
     ggml_backend_free(backend); ggml_backend_free(cpu);
@@ -752,6 +773,8 @@ static int run_tp2(bool single=false) {
     for (int q : {8,10,11,12,13,14}) for (int e : {1,4}) for (int m : {1,8,32}) for (int axis : {0,1}) {
         tp_numerical(backend, packed, q, e, m, axis);
     }
+    for (int q : {8,10,11,12,13,14}) tp_numerical(backend,packed,q,1,1,1,false,true);
+    puts("KPACK_TP2_SEGMENTED_ALL PASS formats=6 cases=6 segments=3 replays=3");
     for (int q : {8,12}) for (int m : {1,8,32}) tp_chain(backend, packed, q, m);
     ggml_backend_free(backend);
     for (const auto & manifest : tp_cache_manifests) {
