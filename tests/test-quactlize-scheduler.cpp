@@ -341,13 +341,23 @@ static double tp_comm_error(const std::vector<float> & got, const std::vector<fl
 }
 
 // Use the caller's unchanged communication entry, with synchronized local oracles.
-static int run_tp2_comm(const char * arm, int count, const char * scope="none") {
+static uint64_t tp_bytes_hash(const void * data, size_t size) {
+    uint64_t hash=UINT64_C(14695981039346656037);
+    const auto * bytes=static_cast<const uint8_t *>(data);
+    for (size_t i=0;i<size;++i) hash=(hash^bytes[i])*UINT64_C(1099511628211);
+    return hash;
+}
+
+static int run_tp2_comm(const char * arm, int count, const char * scope="none", int qtype=8, int experts=1) {
     const bool copy=!strcmp(arm,"copy"), packed=!strcmp(arm,"kpack");
     CHECK(copy || packed || !strcmp(arm,"raw"));
+    CHECK((qtype==8 && experts==1) || (!copy && qtype==12 && experts==4));
     CHECK(count==512 || (copy && (count==3072 || count==32768)));
+    const int topk=experts>1?2:1, elements=count*topk;
     CHECK(!strcmp(scope,"none") || !strcmp(scope,"local") || !strcmp(scope,"global"));
     CHECK(ggml_backend_cuda_get_device_count()==2);
-    printf("KPACK_TP2_COMM_BEGIN arm=%s count=%d bytes=%zu\n",arm,count,size_t(count)*sizeof(float));
+    printf("KPACK_TP2_COMM_BEGIN arm=%s count=%d bytes=%zu\n",arm,elements,size_t(elements)*sizeof(float));
+    printf("KPACK_TP2_COMM_SHAPE q=%d n=%d global_k=1024 local_k=512 experts=%d tokens=1 topk=%d\n",qtype,count,experts,topk);
     for (const char * name : {"CUDA_VISIBLE_DEVICES", "GGML_CUDA_ALLREDUCE", "PCCL_ENABLE_EXT_KERNEL", "PCCL_EXT_KERNEL_PLUGIN", "PCCL_ALGO", "PCCL_PROTO"}) {
         const char * value=std::getenv(name);
         printf("KPACK_TP2_COMM_ENV %s=%s\n",name,value?value:"UNSET");
@@ -377,18 +387,18 @@ static int run_tp2_comm(const char * arm, int count, const char * scope="none") 
     std::vector<uint8_t> raw;
     std::vector<float> gold;
     if (!copy) {
-        std::vector<float> source(size_t(global_k)*count), importance(global_k,1.f);
-        raw.resize(ggml_row_size(GGML_TYPE_Q8_0,global_k)*count); gold.resize(source.size());
+        std::vector<float> source(size_t(global_k)*count*experts), importance(global_k,1.f);
+        raw.resize(ggml_row_size((ggml_type)qtype,global_k)*count*experts); gold.resize(source.size());
         for (size_t i=0;i<source.size();++i) source[i]=float(int((i*17+i/29)%97)-48)/128.f;
-        CHECK(ggml_quantize_chunk(GGML_TYPE_Q8_0,source.data(),raw.data(),0,count,global_k,importance.data())==raw.size());
-        ggml_get_type_traits(GGML_TYPE_Q8_0)->to_float(raw.data(),gold.data(),gold.size());
+        CHECK(ggml_quantize_chunk((ggml_type)qtype,source.data(),raw.data(),0,count*experts,global_k,importance.data())==raw.size());
+        ggml_get_type_traits((ggml_type)qtype)->to_float(raw.data(),gold.data(),gold.size());
     }
     ggml_context * weights[2]{}, * inputs[2]{}, * ctx[2]{};
     ggml_backend_buffer_t wb[2]{}, ib[2]{};
     ggml_gallocr_t ga[2]{};
-    ggml_tensor * a[2]{}, * output[2]{};
+    ggml_tensor * a[2]{}, * ids[2]{}, * output[2]{};
     ggml_cgraph * graph[2]{};
-    std::vector<float> expected[2]={std::vector<float>(count),std::vector<float>(count)};
+    std::vector<float> expected[2]={std::vector<float>(elements),std::vector<float>(elements)};
     for (int rank=0;rank<2;++rank) {
         inputs[rank]=ggml_init({2<<20,nullptr,true});
         ctx[rank]=ggml_init({2<<20,nullptr,true}); CHECK(inputs[rank] && ctx[rank]);
@@ -396,7 +406,7 @@ static int run_tp2_comm(const char * arm, int count, const char * scope="none") 
             output[rank]=ggml_new_tensor_1d(inputs[rank],GGML_TYPE_F32,count);
         } else {
             weights[rank]=ggml_init({2<<20,nullptr,true}); CHECK(weights[rank]);
-            auto * w=ggml_new_tensor_2d(weights[rank],GGML_TYPE_Q8_0,local_k,count);
+            auto * w=ggml_new_tensor_3d(weights[rank],(ggml_type)qtype,local_k,count,experts);
             ggml_set_name(w,"tp-weight");
             auto * buft=ggml_backend_get_default_buffer_type(backends[rank]);
             if (packed) {
@@ -408,11 +418,14 @@ static int run_tp2_comm(const char * arm, int count, const char * scope="none") 
             wb[rank]=ggml_backend_alloc_ctx_tensors_from_buft(weights[rank],buft); CHECK(wb[rank]);
             ggml_backend_buffer_set_usage(wb[rank],GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
             const size_t row=ggml_row_size(w->type,local_k);
-            std::vector<uint8_t> shard(row*count);
-            for (int col=0;col<count;++col) memcpy(shard.data()+col*row,raw.data()+(2*col+rank)*row,row);
+            std::vector<uint8_t> shard(row*count*experts);
+            for (int col=0;col<count*experts;++col) memcpy(shard.data()+col*row,raw.data()+(2*col+rank)*row,row);
+            printf("KPACK_TP2_COMM_WEIGHT rank=%d q=%d bytes=%zu hash=%016llx\n",rank,qtype,shard.size(),
+                   (unsigned long long)tp_bytes_hash(shard.data(),shard.size()));
             ggml_backend_tensor_set(w,shard.data(),0,shard.size());
-            a[rank]=ggml_new_tensor_2d(inputs[rank],GGML_TYPE_F32,local_k,1);
-            output[rank]=ggml_mul_mat(ctx[rank],w,a[rank]);
+            a[rank]=ggml_new_tensor_3d(inputs[rank],GGML_TYPE_F32,local_k,topk,1);
+            if (experts>1) ids[rank]=ggml_new_tensor_2d(inputs[rank],GGML_TYPE_I32,topk,1);
+            output[rank]=ids[rank]?ggml_mul_mat_id(ctx[rank],w,a[rank],ids[rank]):ggml_mul_mat(ctx[rank],w,a[rank]);
             ggml_set_output(output[rank]);
             graph[rank]=ggml_new_graph_custom(ctx[rank],16,false);
             ggml_build_forward_expand(graph[rank],output[rank]);
@@ -424,38 +437,53 @@ static int run_tp2_comm(const char * arm, int count, const char * scope="none") 
         }
         output[rank]->flags|=GGML_TENSOR_FLAG_COMPUTE;
     }
+    bool numerical_ok=true;
     for (int replay=0;replay<3;++replay) {
-        std::vector<float> input(global_k), got(count), sum(count);
+        std::vector<float> input(global_k*topk), got(elements), sum(elements);
+        std::vector<int32_t> router(topk);
         for (size_t i=0;i<input.size();++i) input[i]=float(int((i*13+i/37+replay*5)%61)-30)/128.f;
+        for (int r=0;r<topk;++r) router[r]=(r+replay)%experts;
         for (int rank=0;rank<2;++rank) {
             printf("KPACK_TP2_COMM_LOCAL_BEGIN arm=%s rank=%d replay=%d\n",arm,rank,replay); fflush(stdout);
-            for (int col=0;col<count;++col) {
+            for (int row=0;row<topk;++row) for (int col=0;col<count;++col) {
                 double dot=0;
                 if (copy) dot=float((col*7+rank*5+replay*3)%61-30)/8.f;
-                else for (int c=rank*local_k;c<(rank+1)*local_k;++c) dot+=double(input[c])*gold[size_t(col)*global_k+c];
-                expected[rank][col]=float(dot);
+                else for (int c=rank*local_k;c<(rank+1)*local_k;++c)
+                    dot+=double(input[row*global_k+c])*gold[(size_t(router[row])*count+col)*global_k+c];
+                expected[rank][row*count+col]=float(dot);
             }
+            printf("KPACK_TP2_COMM_ORACLE rank=%d replay=%d input_hash=%016llx ids_hash=%016llx golden_hash=%016llx\n",rank,replay,
+                   (unsigned long long)tp_bytes_hash(input.data(),input.size()*sizeof(float)),
+                   (unsigned long long)tp_bytes_hash(router.data(),router.size()*sizeof(int32_t)),
+                   (unsigned long long)tp_bytes_hash(expected[rank].data(),expected[rank].size()*sizeof(float)));
             if (copy) ggml_backend_tensor_set(output[rank],expected[rank].data(),0,count*sizeof(float));
             else {
-                ggml_backend_tensor_set(a[rank],input.data()+rank*local_k,0,local_k*sizeof(float));
+                for (int row=0;row<topk;++row)
+                    ggml_backend_tensor_set(a[rank],input.data()+row*global_k+rank*local_k,row*local_k*sizeof(float),local_k*sizeof(float));
+                if (ids[rank]) ggml_backend_tensor_set(ids[rank],router.data(),0,topk*sizeof(int32_t));
                 CHECK(ggml_backend_graph_compute(backends[rank],graph[rank])==GGML_STATUS_SUCCESS);
             }
             ggml_backend_synchronize(backends[rank]);
-            ggml_backend_tensor_get(output[rank],got.data(),0,count*sizeof(float));
+            ggml_backend_tensor_get(output[rank],got.data(),0,elements*sizeof(float));
             const double error=tp_comm_error(got,expected[rank]);
             const bool valid=copy?error==0:error<.02;
             printf("KPACK_TP2_COMM_LOCAL arm=%s rank=%d replay=%d error=%.9g synchronized=1 status=%s\n",
                    arm,rank,replay,error,valid?"PASS":"FAIL"); fflush(stdout);
-            CHECK(valid);
+            if (!valid) {
+                for (int i=0;i<elements && i<8;++i)
+                    printf("KPACK_TP2_COMM_VALUE rank=%d replay=%d index=%d want=%.9g got=%.9g\n",rank,replay,i,expected[rank][i],got[i]);
+                numerical_ok=false;
+            }
         }
-        for (int col=0;col<count;++col) sum[col]=expected[0][col]+expected[1][col];
+        if (!numerical_ok) break;
+        for (int col=0;col<elements;++col) sum[col]=expected[0][col]+expected[1][col];
         tp_comm_libraries();
         tp_comm_symbols("before-reduce");
-        printf("KPACK_TP2_COMM_REDUCE_BEGIN arm=%s count=%d replay=%d\n",arm,count,replay); fflush(stdout);
+        printf("KPACK_TP2_COMM_REDUCE_BEGIN arm=%s count=%d replay=%d\n",arm,elements,replay); fflush(stdout);
         CHECK(reduce(comm,output));
         for (int rank=0;rank<2;++rank) {
             ggml_backend_synchronize(backends[rank]);
-            ggml_backend_tensor_get(output[rank],got.data(),0,count*sizeof(float));
+            ggml_backend_tensor_get(output[rank],got.data(),0,elements*sizeof(float));
             const double error=tp_comm_error(got,sum);
             const bool valid=copy?error==0:error<.02;
             printf("KPACK_TP2_COMM_SUM arm=%s rank=%d replay=%d error=%.9g status=%s\n",
@@ -468,11 +496,15 @@ static int run_tp2_comm(const char * arm, int count, const char * scope="none") 
         ggml_gallocr_free(ga[rank]); ggml_backend_buffer_free(ib[rank]); ggml_backend_buffer_free(wb[rank]);
         ggml_free(inputs[rank]); ggml_free(ctx[rank]); ggml_free(weights[rank]); ggml_backend_free(backends[rank]);
     }
-    printf("KPACK_TP2_COMM PASS arm=%s count=%d replays=3\n",arm,count);
+    if (!numerical_ok) {
+        puts("KPACK_TP2_COMM_STOP reason=LOCAL_NUMERICAL_FAILURE collective_not_launched=1");
+        return 1;
+    }
+    printf("KPACK_TP2_COMM PASS arm=%s count=%d replays=3\n",arm,elements);
     return 0;
 }
 
-static int run_tp2() {
+static int run_tp2(bool single=false) {
     CHECK(ggml_backend_cuda_get_device_count() == 2);
     ggml_backend_dev_t devs[2];
     for (int i = 0; i < 2; ++i) devs[i] = ggml_backend_buft_get_device(ggml_backend_cuda_buffer_type(i));
@@ -483,6 +515,12 @@ static int run_tp2() {
     auto * packed = ggml_backend_meta_buffer_type(device, extras(devs[0])[0]);
     auto * backend = ggml_backend_dev_init(device, nullptr);
     CHECK(packed && backend);
+    if (single) {
+        tp_numerical(backend,packed,12,4,1,0);
+        ggml_backend_free(backend);
+        puts("KPACK_TP2_SINGLE PASS q=12 experts=4 tokens=1 split=K replays=3");
+        return 0;
+    }
     for (int q : {8,10,11,12,13,14}) for (int e : {1,4}) for (int m : {1,8,32}) for (int axis : {0,1}) {
         tp_numerical(backend, packed, q, e, m, axis);
     }
@@ -552,6 +590,8 @@ static void run_case(ggml_backend_t gpu, ggml_backend_t cpu, ggml_backend_buffer
 }
 
 int main(int argc, char ** argv) {
+    if (argc==3 && !strcmp(argv[1],"--tp2-q4-local")) return run_tp2_comm(argv[2],512,"none",12,4);
+    if (argc==2 && !strcmp(argv[1],"--tp2-q4-meta")) return run_tp2(true);
     if ((argc==4 || argc==5) && !strcmp(argv[1],"--tp2-comm"))
         return run_tp2_comm(argv[2],std::stoi(argv[3]),argc==5?argv[4]:"none");
     if (argc == 2 && !strcmp(argv[1], "--tp2")) return run_tp2();
