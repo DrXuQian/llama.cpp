@@ -31,6 +31,29 @@ static ggml_backend_meta_split_state tp_weight_split;
 static std::string tp_cache_root;
 static bool tp_cache_hot = false;
 static std::vector<std::string> tp_cache_manifests;
+static std::string tp_chain_dump;
+static bool tp_chain_retain = false;
+
+static void tp_chain_write(const std::string & name, const void * data, size_t bytes) {
+    if (tp_chain_dump.empty()) { return; }
+    const std::string path = tp_chain_dump + "/" + name;
+    CHECK(!std::ifstream(path).good());
+    std::ofstream out(path, std::ios::binary);
+    out.write(static_cast<const char *>(data), bytes);
+    out.close();
+    CHECK(out.good());
+}
+
+static void tp_chain_write_shards(const char * name, ggml_tensor * tensor, int replay) {
+    for (int rank = 0; rank < 2; ++rank) {
+        auto * local = ggml_backend_meta_tensor_shard(tensor, rank, nullptr);
+        CHECK(local && local->type == GGML_TYPE_F32 && ggml_is_contiguous(local));
+        std::vector<float> values(ggml_nelements(local));
+        ggml_backend_tensor_get(local, values.data(), 0, ggml_nbytes(local));
+        tp_chain_write(std::string(name) + "-r" + std::to_string(rank) + "-i" + std::to_string(replay) + ".f32",
+                       values.data(), values.size() * sizeof(float));
+    }
+}
 
 void llama_log_internal(ggml_log_level, const char * format, ...) {
     va_list args;
@@ -107,6 +130,7 @@ static void tp_chain(ggml_backend_t backend, ggml_backend_buffer_type_t packed, 
         CHECK(ggml_quantize_chunk(w->type,source.data(),raw.data(),0,w->ne[1]*experts,w->ne[0],importance.data())==raw.size());
         if (w->type == GGML_TYPE_F32) memcpy(gold[index].data(),raw.data(),raw.size());
         else ggml_get_type_traits(w->type)->to_float(raw.data(),gold[index].data(),gold[index].size());
+        tp_chain_write("weight-" + std::to_string(index) + ".bin", raw.data(), raw.size());
         caches[index] = weight_cache(w, raw, "chain-" + std::to_string(q) + "-" +
             std::to_string(tokens) + "-" + std::to_string(index));
         if (!tp_cache_hot && w==gate) {
@@ -128,6 +152,11 @@ static void tp_chain(ggml_backend_t backend, ggml_backend_buffer_type_t packed, 
     auto * product=ggml_mul_mat_id(ctx,down,activation,ids);
     auto * result=ggml_sqr(ctx,product);
     ggml_set_output(result);
+    if (tp_chain_retain) {
+        ggml_set_output(pair);
+        ggml_set_output(activation);
+        ggml_set_output(product);
+    }
     auto * graph=ggml_new_graph_custom(ctx,64,false); ggml_build_forward_expand(graph,result);
     auto * ga=ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
     CHECK(ga && ggml_gallocr_alloc_graph(ga,graph));
@@ -145,6 +174,18 @@ static void tp_chain(ggml_backend_t backend, ggml_backend_buffer_type_t packed, 
         ggml_backend_tensor_set(ids,router.data(),0,ggml_nbytes(ids));
         CHECK(ggml_backend_graph_compute(backend,graph)==GGML_STATUS_SUCCESS);
         ggml_backend_synchronize(backend); ggml_backend_tensor_get(result,output.data(),0,ggml_nbytes(result));
+        if (!tp_chain_dump.empty()) {
+            const std::string suffix = "-i" + std::to_string(replay);
+            tp_chain_write("input" + suffix + ".f32", input.data(), input.size() * sizeof(float));
+            tp_chain_write("ids" + suffix + ".i32", router.data(), router.size() * sizeof(int32_t));
+            tp_chain_write("result" + suffix + ".f32", output.data(), output.size() * sizeof(float));
+            if (tp_chain_retain) {
+                tp_chain_write_shards("pair", pair, replay);
+                tp_chain_write_shards("activation", activation, replay);
+                // Meta reduces product in place before its nonlinear consumer.
+                tp_chain_write_shards("reduced", product, replay);
+            }
+        }
         double err=0,norm=0;
         for (int r=0;r<tokens*topk;++r) {
             const int e=router[r],t=r/topk;
@@ -163,13 +204,24 @@ static void tp_chain(ggml_backend_t backend, ggml_backend_buffer_type_t packed, 
                 err+=(got-want)*(got-want); norm+=want*want;
             }
         }
-        maximum=std::max(maximum,std::sqrt(err/std::max(norm,1.e-30)));
+        const double relative = std::sqrt(err/std::max(norm,1.e-30));
+        maximum=std::max(maximum,relative);
+        if (!tp_chain_dump.empty()) {
+            printf("KPACK_TP2_CHAIN_CAPTURE replay=%d retain=%d relative=%.9g threshold=0.02 admitted=0\n",
+                   replay, int(tp_chain_retain), relative);
+            fflush(stdout);
+        }
         if (!(maximum < .02)) {
             fprintf(stderr, "KPACK_TP2_CHAIN_MISMATCH q=%d tokens=%d replay=%d relative=%.9g\n", q, tokens, replay, maximum);
         }
-        CHECK(maximum<.02);
+        if (tp_chain_dump.empty()) { CHECK(maximum<.02); }
     }
-    printf("KPACK_TP2_CHAIN q=%d tokens=%d experts=4 topk=2 replays=3 error=%.8g status=PASS\n",q,tokens,maximum);
+    if (tp_chain_dump.empty()) {
+        printf("KPACK_TP2_CHAIN q=%d tokens=%d experts=4 topk=2 replays=3 error=%.8g status=PASS\n",q,tokens,maximum);
+    } else {
+        printf("KPACK_TP2_CHAIN_CAPTURE_COMPLETE q=%d tokens=%d replays=3 retain=%d maximum=%.9g gate=%s admitted=0\n",
+               q, tokens, int(tp_chain_retain), maximum, maximum < .02 ? "PASS" : "FAIL");
+    }
     fflush(stdout);
     for (auto & cache : caches) { cache.reset(); }
     ggml_gallocr_free(ga); ggml_backend_buffer_free(ib); ggml_backend_buffer_free(wb);
@@ -515,6 +567,11 @@ static int run_tp2(bool single=false) {
     auto * packed = ggml_backend_meta_buffer_type(device, extras(devs[0])[0]);
     auto * backend = ggml_backend_dev_init(device, nullptr);
     CHECK(packed && backend);
+    if (!tp_chain_dump.empty()) {
+        tp_chain(backend, packed, 12, 32);
+        ggml_backend_free(backend);
+        return 0;
+    }
     if (single) {
         tp_numerical(backend,packed,12,4,1,0);
         ggml_backend_free(backend);
@@ -590,6 +647,13 @@ static void run_case(ggml_backend_t gpu, ggml_backend_t cpu, ggml_backend_buffer
 }
 
 int main(int argc, char ** argv) {
+    if (argc == 4 && !strcmp(argv[1], "--tp2-chain-dump")) {
+        CHECK(!strcmp(argv[3], "ordinary") || !strcmp(argv[3], "retained"));
+        tp_chain_dump = argv[2];
+        CHECK(!tp_chain_dump.empty());
+        tp_chain_retain = !strcmp(argv[3], "retained");
+        return run_tp2();
+    }
     if (argc==3 && !strcmp(argv[1],"--tp2-q4-local")) return run_tp2_comm(argv[2],512,"none",12,4);
     if (argc==2 && !strcmp(argv[1],"--tp2-q4-meta")) return run_tp2(true);
     if ((argc==4 || argc==5) && !strcmp(argv[1],"--tp2-comm"))
