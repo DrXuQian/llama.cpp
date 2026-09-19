@@ -103,7 +103,7 @@ def simt_symbol_recipe(name):
     if vector:
         storage, compute, variant, columns, warps, values = map(int, vector.groups())
         return (8, storage, variant + 4, columns, warps, values, compute)
-    match = re.search(r"quactlize::execution::simt::register_reuse(?:_model)?<\s*(\d+),\s*(\d+),\s*(\d+),\s*(\d+),\s*(\d+),\s*(\d+)(?:,\s*(\d+))?(?:,\s*(?:0|1|3))?\s*>", name)
+    match = re.search(r"quactlize::execution::simt::register_reuse(?:_model)?<\s*(\d+),\s*(\d+),\s*(\d+),\s*(\d+),\s*(\d+),\s*(\d+)(?:,\s*(\d+))?(?:,\s*(?:0|1|3))?(?:,\s*\d+,\s*\d+)?\s*>", name)
     return tuple(int(x or 0) for x in match.groups()) if match else None
 
 
@@ -121,10 +121,12 @@ def q4_symbol_matches_plan(recipe, plan):
 
 
 def paired_symbol_recipe(name):
-    simt=re.search(r"quactlize::fusion::simt_gate_up(?:_model)?<\s*(\d+),\s*(\d+),\s*(\d+),\s*(\d+)\s*>",name)
+    simt=re.search(r"quactlize::fusion::simt_gate_up(?:_model)?<\s*(\d+),\s*(\d+),\s*(\d+),\s*(\d+)(?:,\s*(\d+),\s*(\d+))?\s*>",name)
     if simt:
-        q,storage,compute,warps=map(int,simt.groups())
-        return dict(q=q,storage=storage,compute=compute,warps=warps,tile_m=0,backend='simt')
+        q,storage,compute,warps=map(int,simt.groups()[:4])
+        result=dict(q=q,storage=storage,compute=compute,warps=warps,tile_m=0,backend='simt')
+        if simt[5] is not None:result.update(physical_n=int(simt[5]),k=int(simt[6]))
+        return result
     tc=re.search(r"quactlize::fusion::tc_gate_up<quactlize::fusion::TcTypes<\s*(\d+),\s*(\d+),\s*cutlass::(half_t|bfloat16_t),\s*float\s*>",name)
     if tc:
         return dict(q=int(tc[1]),storage=1,compute=int(tc[3]=='bfloat16_t'),warps=0,tile_m=int(tc[2]),backend='tc')
@@ -132,7 +134,11 @@ def paired_symbol_recipe(name):
 
 
 def paired_matches_plan(recipe,plan):
-    return recipe and recipe==dict(q=int(plan['q']),storage=1,compute=int(plan['activation']=='BF16'),
+    if not recipe:return False
+    recipe=dict(recipe)
+    if 'physical_n' in recipe:
+        if recipe.pop('physical_n')!=2*int(plan['n']) or recipe.pop('k')!=int(plan['k']):return False
+    return recipe==dict(q=int(plan['q']),storage=1,compute=int(plan['activation']=='BF16'),
         warps=int(plan['warps']),tile_m=int(plan['tile_m']),backend=plan['backend'])
 
 

@@ -72,9 +72,15 @@ class NativeEvidence(unittest.TestCase):
         self.assertEqual(native.simt_symbol_recipe("quactlize::execution::simt::q8_vector::kernel_s1<1,0,1,4,8,4,false>"), (8,1,5,4,8,4,0))
         self.assertIsNone(native.simt_symbol_recipe("quactlize::execution::simt::q8_vector::kernel_s1<1,1,1,4,8,4,false>"))
         self.assertEqual(native.simt_symbol_recipe("quactlize::execution::simt::register_reuse_model<13,1,3,4,2,8,1,3>"), (13,1,3,4,2,8,1))
+        self.assertEqual(native.simt_symbol_recipe("quactlize::execution::simt::register_reuse_model<13,1,3,4,2,8,1,3,3072,512>"), (13,1,3,4,2,8,1))
         for q, compute in ((12,1),(8,0)):
             self.assertEqual(native.paired_symbol_recipe(f"quactlize::fusion::simt_gate_up_model<{q},1,{compute},8>"),
                              dict(q=q, storage=1, compute=compute, warps=8, tile_m=0, backend='simt'))
+            fixed=native.paired_symbol_recipe(f"quactlize::fusion::simt_gate_up_model<{q},1,{compute},8,1024,3072>")
+            plan=dict(q=q,activation='BF16' if compute else 'FP16',warps=8,tile_m=0,backend='simt',n=512,k=3072)
+            self.assertTrue(native.paired_matches_plan(fixed,plan))
+            self.assertFalse(native.paired_matches_plan(fixed,dict(plan,n=1024)))
+            self.assertFalse(native.paired_matches_plan(fixed,dict(plan,k=2048)))
 
     def test_bf16_compute_is_grouped_only(self):
         root = Path(__file__).resolve().parents[1]
