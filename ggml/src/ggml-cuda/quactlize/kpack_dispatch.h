@@ -69,6 +69,8 @@ int quactlize_kpack_dispatch_query_smallm_v2(void* runtime,qkg_simt_call_v2 cons
 // denotes a measured compromise exceeding 5%, not an optimality guarantee.
 // A bounded bucket is predicted; source_* name the donor. MISS means retain
 // the prior legal selector. This entry is decode-only and never runs a tuner.
+// Buckets inherit reviewed implementation upgrades of their same-family donor;
+// the upgrade does not turn the actual request into an exact measured result.
 typedef struct {
     uint32_t version,size;
     qks_smallm_choice_v1 base;
