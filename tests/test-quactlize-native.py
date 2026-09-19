@@ -15,6 +15,19 @@ from quactlize_native import timings, selection, summarize, PATTERN
 
 
 class NativeEvidence(unittest.TestCase):
+    def test_selected_decode_trace_keeps_shape_split_and_precision(self):
+        symbol='quactlize::execution::simt::measured_decode_kernel<8,0,6144,3072,1,1,1,0,5,8,4,4,8,0,false,false>(qkg_call_v1)'
+        recipe=native.measured_decode_recipe(symbol)
+        self.assertEqual(native.simt_symbol_recipe(symbol),(8,1,5,8,4,4,0))
+        plan=dict(q=8,op='dense',n=6144,k=3072,rows=1,split=8,activation='FP16')
+        self.assertTrue(native.measured_decode_matches_plan(recipe,plan))
+        for changed in (dict(n=4096),dict(k=2048),dict(split=1),dict(rows=8),dict(activation='BF16'),dict(op='grouped')):
+            self.assertFalse(native.measured_decode_matches_plan(recipe,dict(plan,**changed)))
+        paired=native.paired_symbol_recipe('quactlize::fusion::simt_gate_up_q8_tile16(quactlize::fusion::DeviceCall)')
+        p=dict(q=8,activation='FP16',warps=8,tile_m=0,backend='simt',tokens=1,n=1024,k=3072)
+        self.assertTrue(native.paired_matches_plan(paired,p))
+        self.assertFalse(native.paired_matches_plan(paired,dict(p,tokens=2)))
+
     def test_profiler_tool_environment_does_not_change_application_route(self):
         from quactlize_profile_env import tool_environment
         before = dict(PATH='/old/bin:/usr/bin', LD_LIBRARY_PATH='/app/lib',
