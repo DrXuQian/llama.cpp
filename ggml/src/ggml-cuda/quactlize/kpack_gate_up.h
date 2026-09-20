@@ -29,8 +29,9 @@ typedef struct {
 } qkg_gate_up_call_v1;
 
 enum { QKG_GATE_UP_SIMT=0, QKG_GATE_UP_TC=1 };
-// Explicit inventory, not a selector: SIMT C4/P8, W4 or W8; TC TM8/TM16,
-// TN64/WN16/S2; TK=64 for Q8/Q4, 128 for Q2/Q6, 256 for Q3/Q5.
+// Legacy geometry: generic SIMT C4/P8, W4/W8; TC TM8/TM16, TN64/WN16/S2.
+// TK=64 for Q8/Q4, 128 for Q2/Q6, 256 for Q3/Q5. Historical v1/v2 run
+// overrides are preserved. Use recipe_v2 below to identify the exact reader.
 typedef struct {
     uint32_t version, size;
     int32_t backend, split, tile_m, warps;
@@ -73,10 +74,39 @@ typedef struct {
 int quactlize_gate_up_repack_v1(qkg_gate_up_repack_v1 const*,
     qkg_gate_up_layout_v1 const*, void* stream);
 
-// Measured N512/K2048 cohort only. Returns QKG_SHAPE outside its exact
+// Frozen legacy cohorts. Returns QKG_SHAPE outside their exact
 // precision/operator/token scope. No timing or device work in selection.
 int quactlize_gate_up_select_v1(int qtype, int n, int k, int experts,
     int tokens, int compute_type, qkg_gate_up_config_v1*);
+
+enum { QKG_GATE_UP_ORIGINAL_ROWS=0, QKG_GATE_UP_COMPACT_ROWS=1 };
+enum { QKG_GATE_UP_STANDALONE=0, QKG_GATE_UP_SIMT_DOWN=1, QKG_GATE_UP_TC_DOWN=2 };
+// Selection uses local logical N, not the merged physical 2*N. No pointers,
+// device work or timing. Consumer fields describe the already-selected down.
+typedef struct {
+    uint32_t version, size;
+    uint64_t layout_id;
+    int32_t qtype, n, k, experts, tokens, mode, topk, channels;
+    int32_t input_type, compute_type, output_type, round_projection, row_order;
+    int32_t consumer, consumer_qtype, consumer_n;
+} qkg_gate_up_request_v2;
+
+// A recipe names both geometry and implementation. Fields are diagnostic;
+// callers forward the complete result unchanged, rather than editing knobs.
+typedef struct {
+    uint32_t version, size;
+    uint64_t recipe_id, catalog_id;
+    qkg_gate_up_config_v1 config;
+    int32_t reader, variant, columns, values, changes, hoist, fixed_n, fixed_k;
+} qkg_gate_up_recipe_v2;
+
+int quactlize_gate_up_select_v2(qkg_gate_up_request_v2 const*, qkg_gate_up_recipe_v2*);
+int quactlize_gate_up_query_v2(qkg_gate_up_call_v2 const*, qkg_gate_up_recipe_v2 const*,
+    qkg_gate_up_layout_v1 const*, qkg_sizes_v1*);
+// Explicit recipe execution; no shape-based implementation override. v2 run
+// keeps its existing ABI and behavior for old callers.
+int quactlize_gate_up_run_v3(qkg_gate_up_call_v2 const*, qkg_gate_up_recipe_v2 const*,
+    qkg_gate_up_layout_v1 const*);
 
 #ifdef __cplusplus
 }

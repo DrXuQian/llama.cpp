@@ -161,6 +161,11 @@ def q4_symbol_matches_plan(recipe, plan):
 
 
 def paired_symbol_recipe(name):
+    direct=re.search(r"quactlize::fusion::simt_gate_up_paired16<\s*(\d+),\s*(\d+),\s*(\d+),\s*(\d+),\s*(\d+)\s*>",name)
+    if direct:
+        warps,values,changes,n,k=map(int,direct.groups())
+        return dict(q=12,storage=1,compute=1,warps=warps,tile_m=0,backend='simt',
+                    physical_n=n,k=k,reader=3,values=values,changes=changes)
     if re.search(r"quactlize::fusion::simt_gate_up_q8_tile16\(", name):
         return dict(q=8, storage=1, compute=0, warps=8, tile_m=0, backend='simt', measured_tile16=True)
     simt=re.search(r"quactlize::fusion::simt_gate_up(?:_model)?<\s*(\d+),\s*(\d+),\s*(\d+),\s*(\d+)(?:,\s*(\d+),\s*(\d+))?\s*>",name)
@@ -178,6 +183,14 @@ def paired_symbol_recipe(name):
 def paired_matches_plan(recipe,plan):
     if not recipe:return False
     recipe=dict(recipe)
+    reader=recipe.pop('reader',1 if recipe.get('measured_tile16') else
+                      2 if recipe.get('q')==12 and 'physical_n' in recipe else 0)
+    values=recipe.pop('values',4 if reader==1 else 8)
+    changes=recipe.pop('changes',1 if reader==2 else 0)
+    if int(plan.get('recipe_version',0))==2:
+        if reader!=int(plan.get('reader',-1)):return False
+        if recipe['backend']=='simt' and (values!=int(plan.get('values',-1)) or changes!=int(plan.get('changes',-1))):
+            return False
     if recipe.pop('measured_tile16', False):
         if int(plan.get('tokens',0))!=1 or (int(plan['n']),int(plan['k'])) not in ((512,2048),(1024,3072)):
             return False
@@ -185,6 +198,33 @@ def paired_matches_plan(recipe,plan):
         if recipe.pop('physical_n')!=2*int(plan['n']) or recipe.pop('k')!=int(plan['k']):return False
     return recipe==dict(q=int(plan['q']),storage=1,compute=int(plan['activation']=='BF16'),
         warps=int(plan['warps']),tile_m=int(plan['tile_m']),backend=plan['backend'])
+
+
+def paired_catalog_selection(record,receipt):
+    catalog=receipt.get('selection',{})
+    require(catalog.get('schema')=='quactlize.gate-up-selection.v2','missing paired recipe catalog')
+    body={k:v for k,v in catalog.items() if k!='sha256'}
+    digest=hashlib.sha256(json.dumps(body,sort_keys=True,separators=(',',':')).encode()).hexdigest()
+    require(catalog.get('sha256')==digest and int(record.get('catalog','0'),16)==int(digest[:16],16),
+            'paired recipe catalog identity differs')
+    recipes={int(r['id'],16):r for r in catalog['recipes']}
+    recipe=recipes.get(int(record.get('recipe','0'),16))
+    require(recipe is not None,'unavailable paired recipe')
+    for field in ('split','tile_m','warps','reader','variant','columns','values','changes','hoist','fixed_n','fixed_k'):
+        require(int(record.get(field,-1))==recipe[field],'paired implementation differs: '+field)
+    require(record.get('backend')==('simt' if recipe['backend']==0 else 'tc'),'paired backend differs')
+    q=int(record['q']);consumer=int(record.get('consumer',-1))
+    require(record.get('op')==('dense' if q==8 else 'grouped') and record.get('activation')==('FP16' if q==8 else 'BF16'),
+            'paired precision/operator differs')
+    request=dict(qtype=q,n=int(record['n']),k=int(record['k']),experts=int(record['experts']),
+        tokens=int(record['tokens']),mode=0 if q==8 else 2,topk=1 if q==8 else 8,channels=1,
+        input_type=1,compute_type=int(q!=8),output_type=2 if consumer==2 else 1,
+        round_projection=int(q!=8),row_order=int(consumer==2),consumer=consumer,
+        consumer_qtype=int(record.get('consumer_qtype',0)),consumer_n=int(record.get('consumer_n',0)))
+    matches=[r for r in catalog['rows'] if r['recipe']==recipe['name'] and
+             all(v==request.get(k) or (k in ('consumer_qtype','consumer_n') and v==-1) for k,v in r['request'].items())]
+    require(len(matches)==1,'unmeasured or ambiguous paired semantic request')
+    return record
 
 
 def paired_selection(text,manifest):
@@ -195,6 +235,9 @@ def paired_selection(text,manifest):
         receipt=manifest.get('paired_gate_up',{})
         require(receipt.get('layout_id')=='0x47554e3400000001' and r.get('layout')==receipt['layout_id'],
                 'unbound paired layout receipt')
+        if int(r.get('recipe_version',0))==2:
+            records.append(paired_catalog_selection(r,receipt))
+            continue
         q,tokens,experts=map(lambda key:int(r.get(key,0)),('q','tokens','experts'))
         old_shape=r.get('n')=='512' and r.get('k')=='2048' and 1<=tokens<=8
         tp2_shared=(q==8 and r.get('n')=='1024' and r.get('k')=='3072' and tokens==1 and
@@ -851,7 +894,10 @@ def proof(args):
                 )
                 item["libraries"].append(label)
                 if paired:
-                    ops={r['op'] for r in plans.get('paired_plans',[]) if paired_matches_plan(paired,r)}
+                    matching=[r for r in plans.get('paired_plans',[]) if paired_matches_plan(paired,r)]
+                    ops={r['op'] for r in matching}
+                    item['paired_recipes']=sorted(set(item.get('paired_recipes',[])) |
+                        {r['recipe'] for r in matching if int(r.get('recipe_version',0))==2})
                 elif build in provider_ops:
                     ops = provider_ops[build] if is_provider else set()
                 elif build:
@@ -884,10 +930,13 @@ def proof(args):
     paired_ops={op for m in matched if 'paired-gate-up' in symbols[m['mangled']]['libraries']
                 for op in symbols[m['mangled']]['ops']}
     missing_paired={r['op'] for r in plans.get('paired_plans',[])}-paired_ops
+    observed_recipes={r for m in matched for r in symbols[m['mangled']].get('paired_recipes',[])}
+    missing_recipes={r['recipe'] for r in plans.get('paired_plans',[]) if int(r.get('recipe_version',0))==2}-observed_recipes
     result = dict(
-        kernel_execution="PASS_SHORT_REQUEST" if ops == expected_ops and not missing_providers and not missing_paired else "PARTIAL_SHORT_REQUEST",
+        kernel_execution="PASS_SHORT_REQUEST" if ops == expected_ops and not missing_providers and not missing_paired and not missing_recipes else "PARTIAL_SHORT_REQUEST",
         paired_observed_ops=sorted(paired_ops),
         paired_missing_ops=sorted(missing_paired),
+        paired_observed_recipes=sorted(observed_recipes),paired_missing_recipes=sorted(missing_recipes),
         gpu_kernel_calls=total,
         matched=matched,
         observed_ops=sorted(ops),

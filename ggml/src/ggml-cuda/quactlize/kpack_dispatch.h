@@ -228,6 +228,16 @@ typedef struct {
 } qks_moe_gate_up_v1;
 int quactlize_kpack_dispatch_moe_bind_gate_up_v1(void* runtime,void* chain,
     qks_moe_gate_up_v1 const*);
+// Pure host selection from the prepared chain's actual precision/row contract.
+// MISS preserves the existing chain. The complete recipe must be bound unchanged.
+int quactlize_kpack_dispatch_moe_select_gate_up_v2(void* chain,qkg_gate_up_recipe_v2*);
+typedef struct {
+    uint32_t version,size;
+    qks_moe_gate_up_v1 binding;
+    qkg_gate_up_recipe_v2 recipe;
+} qks_moe_gate_up_v2;
+int quactlize_kpack_dispatch_moe_bind_gate_up_v2(void* runtime,void* chain,
+    qks_moe_gate_up_v2 const*);
 // All chain versions use the same run/router/destroy entries. Mixed chains
 // retain SIMT F32 results and TC FP16 completion semantics through SwiGLU.
 int quactlize_kpack_dispatch_moe_run_v1(void* chain,void* stream);
