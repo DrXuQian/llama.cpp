@@ -143,6 +143,17 @@ const ggml_quactlize_execution_api * ggml_quactlize_execution_library() {
             QZ_BIND(paired_query, fusion, "quactlize_gate_up_query_v1");
             QZ_BIND(paired_run, fusion, "quactlize_gate_up_run_v1");
             QZ_BIND(moe_bind_gate_up, host, "quactlize_kpack_dispatch_moe_bind_gate_up_v1");
+#define QZ_OPTIONAL(field, lib, name) result.field = reinterpret_cast<decltype(result.field)>(dlsym(lib, name))
+            QZ_OPTIONAL(paired_select_recipe, fusion, "quactlize_gate_up_select_v2");
+            QZ_OPTIONAL(paired_query_recipe, fusion, "quactlize_gate_up_query_v2");
+            QZ_OPTIONAL(paired_run_recipe, fusion, "quactlize_gate_up_run_v3");
+            QZ_OPTIONAL(moe_select_gate_up_recipe, host, "quactlize_kpack_dispatch_moe_select_gate_up_v2");
+            QZ_OPTIONAL(moe_bind_gate_up_recipe, host, "quactlize_kpack_dispatch_moe_bind_gate_up_v2");
+#undef QZ_OPTIONAL
+            int recipe_entries = int(result.paired_select_recipe != nullptr) + int(result.paired_query_recipe != nullptr) +
+                int(result.paired_run_recipe != nullptr) + int(result.moe_select_gate_up_recipe != nullptr) + int(result.moe_bind_gate_up_recipe != nullptr);
+            if (recipe_entries != 0 && recipe_entries != 5)
+                GGML_ABORT("[quactlize] incomplete paired recipe API; install a matching dispatcher and fusion library");
         }
 #undef QZ_BIND
         GGML_LOG_INFO("[quactlize] native execution package: %s\n", root);
