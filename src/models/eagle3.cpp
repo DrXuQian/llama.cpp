@@ -1,3 +1,4 @@
+#include "llama-kv-cache.h"
 #include "models.h"
 
 void llama_model_eagle3::load_arch_hparams(llama_model_loader & ml) {
@@ -184,16 +185,41 @@ llama_model_eagle3::graph<false>::graph(const llama_model & model, const llm_gra
 
     auto inp = std::make_unique<llm_graph_input_embd>(n_embd);
 
-    inp->tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
-    ggml_set_input(inp->tokens);
-
-    inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd, n_tokens);
-    ggml_set_input(inp->embd);
+    // nextn_tokens/nextn_hidden come from decode_nextn, which chains all draft steps into one graph
+    // when set, the inputs are tensors of the previous step, so no host set_input is needed
+    inp->from_graph = params.nextn_tokens != nullptr;
+    inp->tokens     = inp->from_graph ? params.nextn_tokens : ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
+    inp->embd       = inp->from_graph ? params.nextn_hidden : ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd, n_tokens);
+    const bool has_catchup_features = !params.nextn_features.layers.empty();
+    if (has_catchup_features) {
+        inp->embd = nullptr;
+    }
+    if (!inp->from_graph) {
+        ggml_set_input(inp->tokens);
+        if (inp->embd) {
+            ggml_set_input(inp->embd);
+        }
+    }
 
     ggml_tensor * inp_embd = ggml_get_rows(ctx0, tok_embd, inp->tokens);
     cb(inp_embd, "inp_embd", -1);
 
     ggml_tensor * inp_g = inp->embd;
+    if (has_catchup_features) {
+        const auto &  layers   = params.nextn_features.layers;
+        ggml_tensor * features = layers[0];
+        for (size_t i = 1; i < layers.size(); ++i) {
+            features = ggml_concat(ctx0, features, layers[i], 0);
+        }
+        if (hparams.norm_before_fc) {
+            features = build_norm(features, model.output_norm_enc, nullptr, LLM_NORM_RMS, -1);
+        }
+        auto * encoded = build_lora_mm(model.fc, features);
+        ggml_set_output(encoded);
+        res->t_g_catchup = encoded;
+        ggml_build_forward_expand(gf, encoded);
+        inp_g = ggml_view_2d(ctx0, encoded, n_embd, n_tokens, encoded->nb[1], 0);
+    }
     cb(inp_g, "inp_g_embeddings", -1);
 
     res->add_input(std::move(inp));
@@ -204,6 +230,19 @@ llama_model_eagle3::graph<false>::graph(const llama_model & model, const llm_gra
     ggml_tensor * inp_pos = build_inp_pos();
 
     auto * inp_attn = build_attn_inp_kv();
+    if (params.nextn_positions) {
+        const auto * kv        = static_cast<const llama_kv_cache_context *>(mctx);
+        auto *       position  = ggml_cast(ctx0, inp_pos, GGML_TYPE_F32);
+        inp_attn->from_graph   = true;
+        inp_attn->self_k_idxs  = inp_pos;
+        inp_attn->self_v_idxs  = inp_pos;
+        auto * distance        = ggml_sub(ctx0, ggml_arange(ctx0, 0, kv->get_n_kv(), 1), position);
+        inp_attn->self_kq_mask = ggml_cast(ctx0, ggml_scale(ctx0, ggml_step(ctx0, distance), -1e30f), GGML_TYPE_F16);
+        inp_attn->self_kq_mask_cnv = inp_attn->self_kq_mask;
+        if (inp_attn->self_kv_used) {
+            inp_attn->self_kv_used = ggml_cast(ctx0, ggml_scale_bias(ctx0, position, 1.0f, 1.0f), GGML_TYPE_I32);
+        }
+    }
 
     const float kq_scale = 1.0f/sqrtf(float(n_embd_head));
 

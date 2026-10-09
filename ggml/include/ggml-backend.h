@@ -315,6 +315,10 @@ extern "C" {
     //
     typedef bool (*ggml_backend_sched_eval_callback)(struct ggml_tensor * t, bool ask, void * user_data);
 
+    // Called after split inputs are copied and before the split graph is submitted.
+    // Return false to cancel the graph compute.
+    typedef bool (*ggml_backend_sched_before_compute_callback)(ggml_backend_t backend, void * user_data);
+
     // Initialize a backend scheduler, backends with low index are given priority over backends with high index
     GGML_API ggml_backend_sched_t ggml_backend_sched_new(ggml_backend_t * backends, ggml_backend_buffer_type_t * bufts, int n_backends, size_t graph_size, bool parallel, bool op_offload);
     GGML_API void                 ggml_backend_sched_free(ggml_backend_sched_t sched);
@@ -352,6 +356,10 @@ extern "C" {
 
     // Set a callback to be called for each resulting node during graph compute
     GGML_API void                 ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backend_sched_eval_callback callback, void * user_data);
+
+    GGML_API void ggml_backend_sched_set_before_compute_callback(ggml_backend_sched_t                       sched,
+                                                                 ggml_backend_sched_before_compute_callback callback,
+                                                                 void *                                     user_data);
 
     //
     // Meta backend

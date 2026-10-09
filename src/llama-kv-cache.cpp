@@ -1734,7 +1734,7 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
     }
 }
 
-void llama_kv_cache::set_input_kv_used(ggml_tensor * dst, const slot_info & sinfo) const {
+void llama_kv_cache::set_input_kv_used(ggml_tensor * dst, const slot_info & sinfo, uint32_t n_used) const {
     GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
     GGML_ASSERT(dst->type == GGML_TYPE_I32);
 
@@ -1750,7 +1750,7 @@ void llama_kv_cache::set_input_kv_used(ggml_tensor * dst, const slot_info & sinf
     int32_t * data = (int32_t *) dst->data;
 
     for (uint32_t s = 0; s < ns; ++s) {
-        data[s] = (int32_t) v_cells[sinfo.strm[s]].used_max_p1();
+        data[s] = (int32_t) (n_used ? n_used : v_cells[sinfo.strm[s]].used_max_p1());
     }
 }
 
@@ -2619,6 +2619,26 @@ bool llama_kv_cache_context::is_kv_prefix_ordered() const {
     return kv->is_kv_prefix_ordered(sinfos[i_cur]);
 }
 
+void llama_kv_cache_context::seek_chain_row(uint32_t i, uint32_t n_embd) {
+    GGML_ASSERT(!ubatches.empty());
+    if (!nextn_src_saved) {
+        nextn_src_sinfo  = sinfos[i_cur];
+        nextn_src_ubatch = ubatches[i_cur];
+        nextn_src_saved  = true;
+    }
+    GGML_ASSERT(nextn_src_ubatch.n_seqs_unq == 1);
+    GGML_ASSERT(nextn_src_sinfo.idxs.size() == 1);
+    GGML_ASSERT(i < nextn_src_sinfo.idxs[0].size());
+    auto sinfo      = nextn_src_sinfo;
+    sinfo.idxs[0]   = { nextn_src_sinfo.idxs[0][i] };
+    // point the cursor slot at token i's single KV row
+    sinfos[i_cur]   = std::move(sinfo);
+    // re-slice the current ubatch to a single-token view of token i
+    ubatches[i_cur] = llama_ubatch_row(nextn_src_ubatch, i, n_embd);
+    // rows after this one are applied but hold no K/V yet, so they are not history for this step
+    nextn_kv_used   = nextn_src_sinfo.idxs[0][i] + 1;
+}
+
 ggml_type llama_kv_cache_context::type_k() const {
     return kv->type_k();
 }
@@ -2676,7 +2696,7 @@ void llama_kv_cache_context::set_input_kq_mask(ggml_tensor * dst, const llama_ub
 }
 
 void llama_kv_cache_context::set_input_kv_used(ggml_tensor * dst) const {
-    kv->set_input_kv_used(dst, sinfos[i_cur]);
+    kv->set_input_kv_used(dst, sinfos[i_cur], nextn_kv_used);
 }
 
 void llama_kv_cache_context::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const {

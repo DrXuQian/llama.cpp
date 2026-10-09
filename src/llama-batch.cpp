@@ -843,6 +843,26 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
     return res;
 }
 
+llama_ubatch llama_ubatch_row(const llama_ubatch & src, uint32_t i, uint32_t n_embd) {
+    GGML_ASSERT(i < src.n_tokens);
+    llama_ubatch ubatch = src;
+    // n_pos > 1 only with M-RoPE (multi-position per token, used by multimodal models)
+    // TODO: slice the M-RoPE pos layout [n_pos][n_tokens]; only single-position tokens for now
+    GGML_ASSERT(ubatch.n_pos == 1);
+    ubatch.pos += i;
+    ubatch.n_tokens = ubatch.n_seq_tokens = ubatch.n_seqs = 1;
+    if (ubatch.token) {
+        ubatch.token += i;
+    }
+    if (ubatch.embd) {
+        ubatch.embd += (size_t) i * n_embd;
+    }
+    ubatch.n_seq_id += i;
+    ubatch.seq_id += i;
+    ubatch.output += i;
+    return ubatch;
+}
+
 void llama_batch_allocr::ubatch_print(const llama_ubatch & ubatch, int debug) {
     if (debug > 0) {
         LLAMA_LOG_DEBUG("%s:   equal_seqs   = %d\n", __func__, ubatch.equal_seqs());

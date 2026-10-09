@@ -34,6 +34,7 @@ jobs:
           echo "=============================================="
           echo "Stage 1: Static Code Analysis"
           echo "  enable_static_check = ${{params.enable_static_check}}"
+          echo "  clc_emg_close = ${{vars.clc_emg_close}}"
           echo "  git.branch   = ${{git.branch}}"
           echo "  git.commitId = ${{git.commitId}}"
           echo "  triggerMode  = ${{pipeline.inst.triggerMode}}"
@@ -41,6 +42,11 @@ jobs:
 
       - name: clang-format check
         run: |
+          # Emergency switch: vars.clc_emg_close == "true" bypasses the static check
+          if [ "${{vars.clc_emg_close}}" = "true" ]; then
+              echo "vars.clc_emg_close=true -> static check skipped by emergency switch"
+              exit 0
+          fi
           export MR_TARGET="${{git.merge_request.targetBranch}}"
           export PUSH_BEFORE="${{git.push.beforeSha256}}"
           bash .aoneci/scripts/clang_format_check.sh

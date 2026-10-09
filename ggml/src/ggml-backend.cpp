@@ -815,6 +815,9 @@ struct ggml_backend_sched {
     ggml_backend_sched_eval_callback callback_eval;
     void * callback_eval_user_data;
 
+    ggml_backend_sched_before_compute_callback callback_before_compute;
+    void *                                     callback_before_compute_user_data;
+
     char * context_buffer;
     size_t context_buffer_size;
 
@@ -1739,6 +1742,11 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
         }
 
+        if (sched->callback_before_compute &&
+            !sched->callback_before_compute(split_backend, sched->callback_before_compute_user_data)) {
+            return GGML_STATUS_FAILED;
+        }
+
         if (!sched->callback_eval) {
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
             if (ec != GGML_STATUS_SUCCESS) {
@@ -1990,6 +1998,14 @@ void ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backe
     GGML_ASSERT(sched);
     sched->callback_eval = callback;
     sched->callback_eval_user_data = user_data;
+}
+
+void ggml_backend_sched_set_before_compute_callback(ggml_backend_sched_t                       sched,
+                                                    ggml_backend_sched_before_compute_callback callback,
+                                                    void *                                     user_data) {
+    GGML_ASSERT(sched);
+    sched->callback_before_compute           = callback;
+    sched->callback_before_compute_user_data = user_data;
 }
 
 int ggml_backend_sched_get_n_splits(ggml_backend_sched_t sched) {

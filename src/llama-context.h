@@ -39,6 +39,45 @@ struct llama_memory_buffer {
 
 using llama_memory_buffers = std::map<ggml_backend_buffer_type_t, llama_memory_buffer>;
 
+struct llama_nextn_graph {
+    ggml_backend_sched_ptr        sched;
+    llm_graph_result_ptr          res;
+    std::vector<llm_graph_params> params;
+    std::vector<ggml_tensor *>    candidates;
+    std::vector<ggml_tensor *>    logits;
+    bool                          prefetched = false;
+};
+
+struct llama_catchup_handoff {
+    ggml_context_ptr           ctx;
+    ggml_backend_buffer_ptr    device;
+    ggml_backend_buffer_ptr    host;
+    ggml_backend_event_ptr     ready;
+    std::vector<ggml_tensor *> features;
+    ggml_tensor *              output_g = nullptr;
+};
+
+struct llama_nextn_lookahead {
+    ggml_context_ptr           ctx;
+    ggml_backend_buffer_ptr    device;
+    ggml_tensor *              sampled       = nullptr;
+    ggml_tensor *              inp_draft     = nullptr;
+    ggml_tensor *              inp_weights   = nullptr;
+    ggml_tensor *              inp_positions = nullptr;
+    std::vector<ggml_tensor *> rows;
+    std::vector<llama_token>   draft;
+    std::vector<float>         positions;
+    llama_seq_id               seq = -1;
+};
+
+struct llama_catchup_copy {
+    ggml_backend_t             src_backend = nullptr;
+    ggml_backend_t             dst_backend = nullptr;
+    std::vector<ggml_tensor *> src;
+    std::vector<ggml_tensor *> dst;
+    bool                       submitted = false;
+};
+
 struct llama_context {
     // init scheduler and compute buffers, reserve worst-case graphs
     llama_context(
@@ -253,7 +292,17 @@ public:
 
     bool set_sampler(llama_seq_id seq_id, llama_sampler * sampler);
 
+    bool decode_nextn_async(llama_context & source, const llama_batch & batch);
+    bool commit_nextn(llama_pos seed_pos);
+
+    bool decode_catchup_async(llama_context & source, const llama_batch & batch, const float ** g_out);
+    void synchronize_catchup();
+
 private:
+    bool             prepare_nextn_input(llama_context &     source,
+                                         const llama_batch & batch,
+                                         ggml_backend_t      src_backend,
+                                         ggml_backend_t      dst_backend);
     llm_graph_params graph_params(
                         llm_graph_result * res,
                       const llama_ubatch & ubatch,
@@ -261,6 +310,9 @@ private:
                           llm_graph_type   gtype) const;
 
     llm_graph_cb graph_get_cb() const;
+
+    // build or reuse the nextn draft chain graph; false on failure (caller runs cleanup)
+    bool build_nextn_chain(llama_kv_cache_context * kv_ctx, int32_t n_draft, int64_t dim);
 
     // disable auto fused ops (Flash Attention, Gated Delta Net) whose op lands on a device
     // that differs from the layer it belongs to (usually due to missing backend support)
@@ -342,6 +394,12 @@ private:
     std::vector<swap_info> output_swaps;
 
     ggml_backend_sched_ptr sched;
+
+    std::unique_ptr<llama_nextn_graph> nextn_graph;
+    std::unique_ptr<llama_nextn_lookahead> nextn_lookahead;
+    // draft-side landing buffer for the D2D feature copy (one buffer per row count)
+    std::unique_ptr<llama_catchup_handoff> catchup_handoff;
+    llama_catchup_copy                     catchup_copy;
 
     bool sched_need_reserve = true;
 

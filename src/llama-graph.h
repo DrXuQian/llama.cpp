@@ -1,16 +1,17 @@
 #pragma once
 
+#include "llama-adapter.h"
 #include "llama-arch.h"
 #include "llama-batch.h"
 #include "llama-hparams.h"
-#include "llama-adapter.h"
 
+#include <array>
 #include <cstdint>
-#include <vector>
-#include <memory>
-#include <set>
 #include <functional>
 #include <map>
+#include <memory>
+#include <set>
+#include <vector>
 
 struct ggml_cgraph;
 struct ggml_context;
@@ -134,6 +135,8 @@ public:
 
     ggml_tensor * tokens = nullptr; // I32 [n_batch]
     ggml_tensor * embd   = nullptr; // F32 [n_embd, n_batch]
+
+    bool from_graph = false;
 
     const int64_t n_embd = 0;
 };
@@ -350,6 +353,8 @@ public:
     // live K/V length per stream, i.e. how much of the padded n_kv actually holds tokens
     ggml_tensor * self_kv_used = nullptr; // I32 [n_stream]
     // clang-format on
+
+    bool from_graph = false;
 
     // note: assumes v_rot^2 == I
     ggml_tensor * self_k_rot = nullptr;
@@ -787,6 +792,16 @@ using llm_graph_cb = std::function<void(const llama_ubatch & ubatch, ggml_tensor
 
 class llm_graph_result;
 
+// target hidden states copied draft-side for the EAGLE3 catch-up encoder input
+// TODO: only eagle3 fills this; MTP needs its own feature source
+struct llm_nextn_features {
+    std::vector<ggml_tensor *> layers;
+
+    bool operator==(const llm_nextn_features & other) const { return layers == other.layers; }
+
+    bool operator!=(const llm_nextn_features & other) const { return !(*this == other); }
+};
+
 struct llm_graph_params {
     llm_arch arch = LLM_ARCH_UNKNOWN;
 
@@ -827,6 +842,11 @@ struct llm_graph_params {
     llm_graph_cb cb;
 
     llm_graph_result * res;
+
+    ggml_tensor * nextn_tokens = nullptr;
+    ggml_tensor * nextn_hidden = nullptr;
+    ggml_tensor *      nextn_positions = nullptr;
+    llm_nextn_features nextn_features;
 
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
@@ -884,6 +904,13 @@ struct llm_graph_params {
             }
         }
 
+        // all null outside the nextn chain and the catch-up, so this only fires for those paths
+        // they change the graph input wiring - no other check covers that
+        if (nextn_tokens != other.nextn_tokens || nextn_hidden != other.nextn_hidden ||
+            nextn_positions != other.nextn_positions || nextn_features != other.nextn_features) {
+            return false;
+        }
+
         // TODO: https://github.com/ggml-org/llama.cpp/pull/24340#discussion_r3448035248
         if (cparams.nextn_layer_offset != other.cparams.nextn_layer_offset) {
             return false;
@@ -920,6 +947,8 @@ public:
     ggml_tensor * get_embd_pooled() const { return t_embd_pooled; }
     ggml_tensor * get_h_nextn()     const { return t_h_nextn; }
 
+    ggml_tensor * get_g_catchup() const { return t_g_catchup; }
+
     ggml_tensor * get_layer_inp(int il) const { return t_layer_inp[il]; }
 
     ggml_cgraph  * get_gf()  const { return gf; }
@@ -954,6 +983,7 @@ public:
     ggml_tensor * t_embd        = nullptr;
     ggml_tensor * t_embd_pooled = nullptr;
     ggml_tensor * t_h_nextn     = nullptr; // [n_embd, n_outputs] hidden state before final output norm
+    ggml_tensor * t_g_catchup   = nullptr;  // [n_embd_out, n+1] fused encoder g, read back to host in decode_catchup
 
     std::vector<ggml_tensor *> t_layer_inp;
 
@@ -1048,6 +1078,8 @@ struct llm_graph_context {
     std::map<llama_seq_id, llama_sampler *> samplers;
 
     const llm_graph_cb & cb_func;
+
+    ggml_tensor * nextn_positions;
 
     llm_graph_result * res;
 

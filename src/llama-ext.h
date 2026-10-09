@@ -95,6 +95,26 @@ LLAMA_API llama_memory_breakdown llama_get_memory_breakdown(const struct llama_c
 // If masked == false, output the embeddings for all tokens in the batch regardless of batch.logits
 LLAMA_API void llama_set_embeddings_nextn(struct llama_context * ctx, bool value, bool masked);
 
+// Schedule an async NextN draft chain with GPU-side acceptance from the source
+// context's sampled tokens and catch-up output. Returns false when unsupported or on failure.
+LLAMA_API bool llama_decode_nextn_async(struct llama_context * ctx,
+                                        struct llama_context * source,
+                                        struct llama_batch     batch);
+
+// Commit host-side KV metadata for a previously submitted NextN chain.
+// Returns false when no submission is pending or metadata setup fails.
+LLAMA_API bool llama_commit_nextn(struct llama_context * ctx, llama_pos seed_pos);
+
+// Prepare an async single-sequence EAGLE3 catch-up directly from the target context.
+// The returned pointer becomes readable after llama_synchronize_catchup completes.
+LLAMA_API bool llama_decode_catchup_async(struct llama_context * ctx,
+                                          struct llama_context * source,
+                                          struct llama_batch     batch,
+                                          const float **         g_out);
+
+// Block until the pending catch-up output reaches host pinned memory.
+LLAMA_API void llama_synchronize_catchup(struct llama_context * ctx);
+
 // Select which appended NextN block the DECODER_MTP graph runs (offset past
 // the trunk: il = n_layer() + offset). Used by the speculative NextN driver to
 // chain multiple trained NextN heads. Default 0 (first head).

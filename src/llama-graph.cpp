@@ -129,6 +129,9 @@ static bool can_reuse_kq_mask(
 // impl
 
 void llm_graph_input_embd::set_input(const llama_ubatch * ubatch) {
+    if (from_graph) {
+        return;
+    }
     if (ubatch->token) {
         const int64_t n_tokens = ubatch->n_tokens;
 
@@ -530,6 +533,9 @@ void llm_graph_input_attn_no_cache::set_input(const llama_ubatch * ubatch) {
 }
 
 void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
+    if (from_graph) {
+        return;
+    }
     mctx->set_input_k_idxs(self_k_idxs, ubatch);
     mctx->set_input_v_idxs(self_v_idxs, ubatch);
 
@@ -1427,6 +1433,7 @@ void llm_graph_result::reset() {
     t_embd        = nullptr;
     t_embd_pooled = nullptr;
     t_h_nextn     = nullptr;
+    t_g_catchup   = nullptr;
 
     t_layer_inp.resize(LLAMA_MAX_LAYERS + 1);
     std::fill(t_layer_inp.begin(), t_layer_inp.end(), nullptr);
@@ -1553,6 +1560,7 @@ void llm_graph_result::set_params(const llm_graph_params & params) {
 // llm_graph_context
 //
 
+// clang-format off
 llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     arch             (params.arch),
     hparams          (params.hparams),
@@ -1592,11 +1600,14 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     cross            (params.cross),
     samplers         (params.samplers),
     cb_func          (params.cb),
+    nextn_positions  (params.nextn_positions),
     res              (params.res),
     ctx0             (res->get_ctx()),
     gf               (res->get_gf()) {
         res->set_params(params);
     }
+
+// clang-format on
 
 void llm_graph_context::cb(ggml_tensor * cur, const char * name, int il) const {
     if (cb_func) {
@@ -2499,6 +2510,10 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd) const {
 }
 
 ggml_tensor * llm_graph_context::build_inp_pos() const {
+    if (nextn_positions) {
+        return nextn_positions;
+    }
+
     auto inp = std::make_unique<llm_graph_input_pos>(hparams.n_pos_per_embd());
 
     auto & cur = inp->pos;

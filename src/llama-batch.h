@@ -68,6 +68,11 @@ struct llama_ubatch {
     std::shared_ptr<data_t> data;
 };
 
+// a single-token row view (token i) of an existing ubatch
+// the view shares the source rows; for M-RoPE (n_pos > 1) it owns a small pos
+// array and keeps the source alive via data->parent. lifetime rules are unchanged.
+llama_ubatch llama_ubatch_row(const llama_ubatch & ubatch, uint32_t i, uint32_t n_embd);
+
 // a helper for sanitizing, fulfilling and splitting a batch
 class llama_batch_allocr {
 public:

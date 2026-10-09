@@ -220,7 +220,8 @@ public:
 
     void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
     // clang-format off
-    void set_input_kv_used   (ggml_tensor * dst, const slot_info & sinfo) const;
+    // n_used replaces the live length for a caller that applied more rows than this graph attends to. 0 to use the cache
+    void set_input_kv_used   (ggml_tensor * dst, const slot_info & sinfo, uint32_t n_used = 0) const;
     // clang-format on
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
@@ -376,6 +377,10 @@ public:
 
     bool is_kv_prefix_ordered() const;
 
+    // Re-position an already-applied single-sequence batch context onto chain row i,
+    // presenting a single-token view. Re-seekable: the source batch is saved once.
+    void seek_chain_row(uint32_t i, uint32_t n_embd);
+
     ggml_type type_k() const;
     ggml_type type_v() const;
 
@@ -446,4 +451,13 @@ private:
     // a heuristic, to avoid attending the full cache if it is not yet utilized
     // as the cache gets filled, the benefit from this heuristic disappears
     int32_t n_kv;
+
+    // saved source batch for seek_chain_row(): the applied multi-token batch is kept
+    // so repeated seeks re-slice a single-token view instead of destroying it
+    bool                      nextn_src_saved = false;
+    llama_kv_cache::slot_info nextn_src_sinfo;
+    llama_ubatch              nextn_src_ubatch;
+    // a chain applies every row up front, so the cache length is already the final one. this is how many rows the
+    // current step may attend to -- the later ones hold no K/V yet. 0 outside a chain
+    uint32_t                  nextn_kv_used = 0;
 };
