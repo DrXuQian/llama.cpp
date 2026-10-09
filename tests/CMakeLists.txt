@@ -289,6 +289,15 @@ if (NOT LLAMA_SANITIZE_ADDRESS AND NOT GGML_SCHED_NO_REALLOC)
   llama_build_and_test(test-opt.cpp)
 endif()
 llama_build_and_test(test-backend-ops.cpp)
+if (GGML_NCP_QUACTLIZE)
+    target_compile_definitions(test-backend-ops PRIVATE GGML_NCP_QUACTLIZE)
+    target_include_directories(test-backend-ops PRIVATE "${GGML_NCP_ROOT}/build/include")
+    find_package(Python3 REQUIRED COMPONENTS Interpreter)
+    add_test(NAME test-kpack-load
+        COMMAND "${Python3_EXECUTABLE}" "${PROJECT_SOURCE_DIR}/.aoneci/scripts/test_kpack_load.py"
+            --reference "${GGML_NCP_ROOT}/third_party/quactlize/reference/gguf_kpack.py" --binary $<TARGET_FILE:test-backend-ops>)
+    set_tests_properties(test-kpack-load PROPERTIES LABELS "ppu;kpack" TIMEOUT 600 RUN_SERIAL TRUE)
+endif()
 
 # NCP external kernel .so vs ggml's inline kernels. Needs at least one hook compiled in to have anything to compare;
 # the test itself skips cleanly when the .so is absent or the GPU backend exposes no route control, so the OR is only

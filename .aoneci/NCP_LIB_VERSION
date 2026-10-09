@@ -1,2 +1,2 @@
-# ncp_flash_lib commit build.sh checks out. Keep it on a master commit: a branch sha can be rebased away.
-9bfb44383588cbf4eed98e3d51de90e8f82d1779
+# Pinned ncp_flash_lib commit, including the Quactlize and actlize gitlinks.
+9fb3cc549ffdfc8e6efeabc6c5e466cc9ceca5e8

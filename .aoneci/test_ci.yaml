@@ -109,17 +109,63 @@ jobs:
           ref: ${{steps.ncp_version.outputs.ncp_ref}}
           path: /workspace/ncp_flash_lib
           lfs: true
-          submodules: true
+          submodules: false
           ssh-key: ${{secrets.bot_ssh_key}}
- 
-      - name: build llama cpp
+
+      - name: read Quactlize gitlink from ncp_flash_lib
+        id: quactlize_version
+        run: |
+          set -eu
+          QUACTLIZE_REF=$(git -C /workspace/ncp_flash_lib ls-tree HEAD -- third_party/quactlize | awk '$1 == "160000" && $2 == "commit" {print $3}')
+          if [ "${#QUACTLIZE_REF}" -ne 40 ] || ! printf '%s\n' "$QUACTLIZE_REF" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "ERROR: ncp_flash_lib has no valid third_party/quactlize gitlink" >&2
+            exit 1
+          fi
+          printf '%s\n' "$QUACTLIZE_REF" > ${{outputs.quactlize_ref.path}}
+        outputs:
+          quactlize_ref: string
+
+      - name: checkout Quactlize packing dependency
+        uses: checkout
+        inputs:
+          repository-url: 'git@gitlab.alibaba-inc.com:T-Head-EEC/quactlize.git'
+          ref: ${{steps.quactlize_version.outputs.quactlize_ref}}
+          path: /workspace/ncp_flash_lib/third_party/quactlize
+          lfs: false
+          submodules: false
+          ssh-key: ${{secrets.bot_ssh_key}}
+
+      - name: read actlize gitlink from Quactlize
+        id: actlize_version
+        run: |
+          set -eu
+          ACTLIZE_REF=$(git -C /workspace/ncp_flash_lib/third_party/quactlize ls-tree HEAD -- third_party/actlize | awk '$1 == "160000" && $2 == "commit" {print $3}')
+          if [ "${#ACTLIZE_REF}" -ne 40 ] || ! printf '%s\n' "$ACTLIZE_REF" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "ERROR: Quactlize has no valid third_party/actlize gitlink" >&2
+            exit 1
+          fi
+          printf '%s\n' "$ACTLIZE_REF" > ${{outputs.actlize_ref.path}}
+        outputs:
+          actlize_ref: string
+
+      - name: checkout actlize packing dependency
+        uses: checkout
+        inputs:
+          repository-url: 'git@gitlab.alibaba-inc.com:T-Head-EEC/actlize.git'
+          ref: ${{steps.actlize_version.outputs.actlize_ref}}
+          path: /workspace/ncp_flash_lib/third_party/quactlize/third_party/actlize
+          lfs: false
+          submodules: false
+          ssh-key: ${{secrets.bot_ssh_key}}
+
+      - name: build llama cpp and dependencies
         image: ${{vars.run_image}}
         timeout: 4h
         run: |
+          set -eu
           export LLAMA_CI_DIR=/workspace/llama_cpp
           export NCP_LIB_DIR=/workspace/ncp_flash_lib
-          cd /workspace/llama_cpp/.aoneci/scripts
-          bash ./build.sh
+          bash "$LLAMA_CI_DIR/.aoneci/scripts/build.sh"
 
       - name: package
         run: |
@@ -162,16 +208,33 @@ jobs:
           run_image: ${{vars.run_image}}
           image_url: ${{jobs.build.outputs.oss_url}}
           cmd: |
+            set -eu
             echo "========== ctest Started =========="
-            rm -rf /workspace/llama_cpp /workspace/ncp_flash_lib
             mkdir -p /workspace
-            ln -sfn "$(pwd)/llama_cpp" /workspace/llama_cpp
-            ln -sfn "$(pwd)/ncp_flash_lib" /workspace/ncp_flash_lib
+            for entry in llama_cpp ncp_flash_lib; do
+              source_dir=$(realpath -e "$entry")
+              if [ -e "/workspace/$entry" ] || [ -L "/workspace/$entry" ]; then
+                if [ "$(realpath -e "/workspace/$entry")" != "$source_dir" ]; then
+                  echo "ERROR: /workspace/$entry already points elsewhere (expected $source_dir)" >&2
+                  exit 1
+                fi
+              else
+                ln -s "$source_dir" "/workspace/$entry"
+              fi
+            done
 
             export LLAMA_CI_DIR="/workspace/llama_cpp"
             export NCP_LIB_DIR="/workspace/ncp_flash_lib"
-            bash llama_cpp/.aoneci/scripts/run_tests.sh
-            TEST_EXIT=$?
+            export PPU_SDK="${PPU_SDK:-/usr/local/PPU_SDK}"
+            export LD_LIBRARY_PATH="$PPU_SDK/lib:$PPU_SDK/CUDA_SDK/targets/x86_64-linux/lib:${LD_LIBRARY_PATH:-}"
+            # NCP tests use the same library that build.sh moved beside the llama binaries.
+            if [ ! -e "$NCP_LIB_DIR/build/libquactlize_ppu_pack.so" ]; then
+              ln -s "$LLAMA_CI_DIR/build-ci/bin/libquactlize_ppu_pack.so" "$NCP_LIB_DIR/build/libquactlize_ppu_pack.so"
+            fi
+            bash "${NCP_LIB_DIR}/run_tests.sh" -R '^test-quactlize-(build|accuracy)$'
+            ctest --test-dir "$LLAMA_CI_DIR/build-ci" -N -R '^test-kpack-load$' | grep -q 'Total Tests: 1'
+            TEST_EXIT=0
+            bash llama_cpp/.aoneci/scripts/run_tests.sh || TEST_EXIT=$?
             echo "========== ctest Done =========="
             exit $TEST_EXIT
           timeout: 14400

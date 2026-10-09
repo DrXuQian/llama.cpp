@@ -212,6 +212,8 @@ option(GGML_CUDA_FA_ALL_QUANTS              "ggml: compile all quants for FlashA
 option(GGML_NCP_FA                          "ggml: dlopen libncp_fa.so  (external FA-3; needs GGML_USE_PPU)"    OFF)
 option(GGML_NCP_MOE                         "ggml: dlopen libncp_moe.so (external DeepGemm; needs GGML_USE_PPU)" OFF)
 option(GGML_NCP_GDN                         "ggml: dlopen libncp_gdn.so (external FLA GDN; needs GGML_USE_PPU)" OFF)
+option(GGML_NCP_QUACTLIZE                   "ggml: K-pack loading only (no inference; needs GGML_USE_PPU)" OFF)
+set(GGML_NCP_ROOT "$ENV{NCP_LIB_DIR}" CACHE PATH "ncp_flash_lib directory with build/include and test dependencies")
 option(GGML_CUDA_GRAPHS                     "ggml: use CUDA graphs (llama.cpp only)"          ${GGML_CUDA_GRAPHS_DEFAULT})
 option(GGML_CUDA_NCCL                       "ggml: use NVIDIA Collective Comm. Library"       ON)
 set   (GGML_CUDA_COMPRESSION_MODE "size" CACHE STRING

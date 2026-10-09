@@ -37,6 +37,9 @@
 #endif
 #include "ggml-cuda/mmvq.cuh"
 #include "ggml-cuda/ncp-lib.h"
+#ifdef GGML_NCP_QUACTLIZE
+#    include "ggml-cuda/quactlize-buft.cuh"
+#endif
 #include "ggml-cuda/norm.cuh"
 #include "ggml-cuda/opt-step-adamw.cuh"
 #include "ggml-cuda/opt-step-sgd.cuh"
@@ -4380,6 +4383,11 @@ static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, co
 static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
 
+#ifdef GGML_NCP_QUACTLIZE
+    // Check before graph fusion or capture can bypass individual operator entries.
+    ggml_quactlize_assert_no_compute(cgraph);
+#endif
+
     ggml_cuda_set_device(cuda_ctx->device);
 
     bool use_cuda_graph             = false;
@@ -5000,6 +5008,16 @@ static ggml_backend_buffer_type_t ggml_backend_cuda_device_get_host_buffer_type(
 static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
     ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *) dev->context;
 
+#ifdef GGML_NCP_QUACTLIZE
+    for (const ggml_tensor * src : op->src) {
+        if (src && src->buffer && ggml_cuda_buft_is_quactlize(src->buffer->buft)) {
+            // Load-time placement only. graph_compute rejects all packed-weight execution.
+            return src == op->src[0] && src->buffer->buft->device == dev &&
+                   (op->op == GGML_OP_MUL_MAT || op->op == GGML_OP_MUL_MAT_ID) && ggml_quactlize_can_load(src, nullptr);
+        }
+    }
+#endif
+
     // check if all the sources are allocated on this device
     for (int i = 0; i < GGML_MAX_SRC; i++) {
         if (op->src[i] && op->src[i]->buffer && ggml_backend_buft_is_cuda(op->src[i]->buffer->buft)) {
@@ -5452,6 +5470,11 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
 
 static bool ggml_backend_cuda_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
     ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *) dev->context;
+#ifdef GGML_NCP_QUACTLIZE
+    if (ggml_cuda_buft_is_quactlize(buft)) {
+        return buft->device == dev;
+    }
+#endif
     const bool integrated = ggml_cuda_info().devices[dev_ctx->device].integrated;
     return (ggml_backend_buft_is_cuda(buft) && buft->device == dev) || (integrated && ggml_backend_buft_is_cuda_host(buft));
 }
@@ -5617,6 +5640,21 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t 
 
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
+#ifdef GGML_NCP_QUACTLIZE
+    // Explicit selection only; do not expose load-only buffers to automatic placement.
+    if (strcmp(name, "ggml_backend_dev_get_override_bufts") == 0) {
+        return (void *) ggml_cuda_quactlize_extra_bufts;
+    }
+    if (strcmp(name, "ggml_quactlize_can_load") == 0) {
+        return (void *) ggml_quactlize_can_load;
+    }
+    if (strcmp(name, "ggml_quactlize_read_packed") == 0) {
+        return (void *) ggml_quactlize_read_packed;
+    }
+    if (strcmp(name, "ggml_quactlize_set_packed") == 0) {
+        return (void *) ggml_quactlize_set_packed;
+    }
+#endif
     if (strcmp(name, "ggml_backend_comm_init") == 0) {
         return (void *)ggml_backend_cuda_comm_init;
     }
