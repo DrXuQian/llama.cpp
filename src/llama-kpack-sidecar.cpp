@@ -1,5 +1,6 @@
 // Runtime K-pack cache. Payload bytes are trusted; only metadata is validated.
 #include "llama-kpack-sidecar.h"
+#include "llama-mmap.h"
 
 #include "ggml.h"
 
@@ -16,18 +17,26 @@ extern "C" void ggml_log_internal(enum ggml_log_level level, const char * format
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <dirent.h>
-#include <fcntl.h>
+#include <filesystem>
 #include <set>
-#include <sys/mman.h>
-#include <sys/stat.h>
-#include <sys/syscall.h>
-#include <sys/types.h>
+#include <stdexcept>
 #include <thread>
-#include <unistd.h>
+
+#ifdef _WIN32
+#    define WIN32_LEAN_AND_MEAN
+#    ifndef NOMINMAX
+#        define NOMINMAX
+#    endif
+#    include <windows.h>
+#    include <io.h>
+#else
+#    include <sys/stat.h>
+#    include <unistd.h>
+#endif
 
 using json  = nlohmann::json;
 using ojson = nlohmann::ordered_json;
+namespace fs = std::filesystem;
 
 namespace {
 
@@ -67,78 +76,120 @@ int32_t layout_id_for(int32_t t) {
     return t == GGML_TYPE_Q8_0 ? 4 : t == GGML_TYPE_Q4_K ? 1 : 2;
 }
 
-// One mapping of a regular file opened without following a symlink, with the stability check the schema asks for.
+struct file_status {
+    uint64_t size = 0;
+    json     identity;
+
+    bool operator==(const file_status & other) const { return size == other.size && identity == other.identity; }
+};
+
+// Bind metadata to the opened file, including replacements with the same size and mtime.
+file_status status_for(int fd) {
+#ifdef _WIN32
+    const HANDLE               handle = reinterpret_cast<HANDLE>(_get_osfhandle(fd));
+    BY_HANDLE_FILE_INFORMATION info{};
+    FILE_BASIC_INFO            basic{};
+    if (handle == INVALID_HANDLE_VALUE || !GetFileInformationByHandle(handle, &info) ||
+        !GetFileInformationByHandleEx(handle, FileBasicInfo, &basic, sizeof(basic)) ||
+        (info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
+        throw std::runtime_error("cannot query cache file identity");
+    }
+    const uint64_t size  = (uint64_t(info.nFileSizeHigh) << 32) | info.nFileSizeLow;
+    const uint64_t inode = (uint64_t(info.nFileIndexHigh) << 32) | info.nFileIndexLow;
+    return {size,
+            {{"device", info.dwVolumeSerialNumber},
+             {"inode", inode},
+             {"mtime_sec", basic.LastWriteTime.QuadPart / 10000000},
+             {"mtime_nsec", (basic.LastWriteTime.QuadPart % 10000000) * 100},
+             {"ctime_sec", basic.ChangeTime.QuadPart / 10000000},
+             {"ctime_nsec", (basic.ChangeTime.QuadPart % 10000000) * 100}}};
+#else
+    struct stat st {};
+
+    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size < 0) {
+        throw std::runtime_error("cannot query cache file identity");
+    }
+#    ifdef __APPLE__
+    const auto mtime = st.st_mtimespec, ctime = st.st_ctimespec;
+#    else
+    const auto mtime = st.st_mtim, ctime = st.st_ctim;
+#    endif
+    return {uint64_t(st.st_size),
+            {{"device", st.st_dev},
+             {"inode", st.st_ino},
+             {"mtime_sec", mtime.tv_sec},
+             {"mtime_nsec", mtime.tv_nsec},
+             {"ctime_sec", ctime.tv_sec},
+             {"ctime_nsec", ctime.tv_nsec}}};
+#endif
+}
+
+// Cache-specific validation; file I/O and mapping use the model loader's implementation.
 struct mapped_file {
-    int       fd   = -1;
-    uint8_t * ptr  = nullptr;
-    size_t    size = 0;
+    std::unique_ptr<llama_file> file;
+    std::unique_ptr<llama_mmap> mapping;
+    std::vector<uint8_t>        bytes;
+    const uint8_t *             ptr  = nullptr;
+    size_t                      size = 0;
+    file_status                 before;
 
-    struct stat st_before {};
-
-    bool open(const std::string & path, bool nofollow, std::string & error, bool map_data = true) {
-        fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC | (nofollow ? O_NOFOLLOW : 0));
-        if (fd < 0) {
-            error = path + ": " + strerror(errno);
-            return false;
+    bool open(const std::string & path, bool nofollow, std::string & error, bool map_data = true) try {
+        close();
+        const fs::path name = fs::u8path(path);
+        if (!fs::is_regular_file(nofollow ? fs::symlink_status(name) : fs::status(name))) {
+            throw std::runtime_error(path + ": not a regular file");
         }
-        if (fstat(fd, &st_before) != 0 || !S_ISREG(st_before.st_mode)) {
-            error = path + ": not a regular file";
-            ::close(fd);
-            fd = -1;
-            return false;
+        file   = std::make_unique<llama_file>(path.c_str(), "rb");
+        before = status_for(file->file_id());
+        size   = file->size();
+        if (size != before.size || (nofollow && fs::is_symlink(fs::symlink_status(name)))) {
+            throw std::runtime_error(path + ": file changed during open");
         }
-        size = (size_t) st_before.st_size;
         if (size && map_data) {
-            void * m = mmap(nullptr, size, PROT_READ, MAP_PRIVATE, fd, 0);
-            if (m == MAP_FAILED) {
-                error = path + ": mmap: " + strerror(errno);
-                ::close(fd);
-                fd = -1;
-                return false;
+            if (llama_mmap::SUPPORTED) {
+                mapping = std::make_unique<llama_mmap>(file.get(), 0);
+                ptr     = static_cast<const uint8_t *>(mapping->addr());
+            } else {
+                bytes.resize(size);
+                file->read_raw(bytes.data(), size);
+                ptr = bytes.data();
             }
-            ptr = (uint8_t *) m;
         }
-        return true;
+        return still_same(error);
+    } catch (const std::exception & e) {
+        error = e.what();
+        close();
+        return false;
     }
 
-    bool still_same(std::string & error) const {
-        struct stat st {};
-
-        if (fstat(fd, &st) != 0) {
-            error = "fstat failed";
-            return false;
-        }
-        if (st.st_dev != st_before.st_dev || st.st_ino != st_before.st_ino || st.st_size != st_before.st_size ||
-            st.st_mtim.tv_sec != st_before.st_mtim.tv_sec || st.st_mtim.tv_nsec != st_before.st_mtim.tv_nsec ||
-            st.st_ctim.tv_sec != st_before.st_ctim.tv_sec || st.st_ctim.tv_nsec != st_before.st_ctim.tv_nsec) {
-            error = "file changed while it was being read";
-            return false;
+    bool still_same(std::string & error) const try {
+        if (!file || !(status_for(file->file_id()) == before)) {
+            throw std::runtime_error("file changed while it was being read");
         }
         return true;
+    } catch (const std::exception & e) {
+        error = e.what();
+        return false;
+    }
+
+    bool matches(int fd, std::string & error) const try {
+        if (!(status_for(fd) == before)) {
+            throw std::runtime_error("source path is not the loader's file");
+        }
+        return true;
+    } catch (const std::exception & e) {
+        error = e.what();
+        return false;
     }
 
     void close() {
-        if (ptr) {
-            munmap(ptr, size);
-            ptr = nullptr;
-        }
-        if (fd >= 0) {
-            ::close(fd);
-            fd = -1;
-        }
+        mapping.reset();
+        file.reset();
+        bytes.clear();
+        ptr  = nullptr;
+        size = 0;
     }
-
-    ~mapped_file() { close(); }
 };
-
-json source_identity(const struct stat & st) {
-    return {{"device", st.st_dev},
-            {"inode", st.st_ino},
-            {"mtime_sec", st.st_mtim.tv_sec},
-            {"mtime_nsec", st.st_mtim.tv_nsec},
-            {"ctime_sec", st.st_ctim.tv_sec},
-            {"ctime_nsec", st.st_ctim.tv_nsec}};
-}
 
 // Strict JSON: the schema forbids duplicate keys, which nlohmann silently collapses. Track keys per open object.
 bool parse_strict(const std::string & text, json & out, std::string & error) {
@@ -311,49 +362,50 @@ int64_t shape_product(const std::vector<int64_t> & s) {
 
 }  // namespace
 
-std::string llama_kpack_cache_directory(const std::string & source, std::string & error) {
+std::string llama_kpack_cache_directory(const std::string & source, std::string & error) try {
     error.clear();
-
-    struct stat st {};
-
-    if (stat(source.c_str(), &st) != 0) {
-        error = source + ": " + strerror(errno);
+    mapped_file input;
+    if (!input.open(source, false, error, false)) {
         return {};
     }
-    if (!S_ISREG(st.st_mode) || st.st_size <= 0) {
+    if (input.size == 0) {
         error = source + ": not a nonempty regular file";
         return {};
     }
     const char * configured = getenv("LLAMA_KPACK_CACHE_DIR");
-    const char * tmp        = getenv("TMPDIR");
-    std::string  root       = configured && *configured ?
-                                  configured :
-                                  std::string(tmp && *tmp ? tmp : "/tmp") + "/llama-kpack-" + std::to_string(geteuid());
-    while (root.size() > 1 && root.back() == '/') {
-        root.pop_back();
+    std::string  name       = "llama-kpack";
+#ifndef _WIN32
+    name += "-" + std::to_string(geteuid());
+#endif
+    fs::path root = configured && *configured ? fs::u8path(configured) : fs::temp_directory_path() / name;
+    while (root.has_relative_path() && root.filename().empty()) {
+        root = root.parent_path();
     }
-    if (mkdir(root.c_str(), 0700) != 0 && errno != EEXIST) {
-        error = root + ": " + strerror(errno);
-        return {};
+    if (fs::create_directory(root)) {
+        fs::permissions(root, fs::perms::owner_all);
     }
-
+    if (!fs::is_directory(fs::symlink_status(root))) {
+        throw std::runtime_error(root.u8string() + ": cache root must be a real directory");
+    }
+#ifndef _WIN32
     struct stat cache {};
-
-    if (lstat(root.c_str(), &cache) != 0) {
-        error = root + ": " + strerror(errno);
-        return {};
-    }
     // Cached bytes are trusted. Do not accept a shared or substituted directory.
-    if (!S_ISDIR(cache.st_mode) || cache.st_uid != geteuid() || (cache.st_mode & 0022)) {
-        error = root + ": cache root must be an owned directory, not writable by other users";
-        return {};
+    if (lstat(root.c_str(), &cache) != 0 || !S_ISDIR(cache.st_mode) || cache.st_uid != geteuid() ||
+        (cache.st_mode & 0022)) {
+        throw std::runtime_error(root.u8string() + ": cache root must be owned and not writable by other users");
     }
+#endif
+    const auto & identity = input.before.identity;
     std::string key = "v1";
-    for (uint64_t value : {uint64_t(st.st_dev), uint64_t(st.st_ino), uint64_t(st.st_size), uint64_t(st.st_mtim.tv_sec),
-                           uint64_t(st.st_mtim.tv_nsec), uint64_t(st.st_ctim.tv_sec), uint64_t(st.st_ctim.tv_nsec)}) {
+    for (uint64_t value : {identity["device"].get<uint64_t>(), identity["inode"].get<uint64_t>(), input.before.size,
+                           identity["mtime_sec"].get<uint64_t>(), identity["mtime_nsec"].get<uint64_t>(),
+                           identity["ctime_sec"].get<uint64_t>(), identity["ctime_nsec"].get<uint64_t>()}) {
         key += "-" + std::to_string(value);
     }
-    return root + "/" + key;
+    return (root / key).u8string();
+} catch (const std::exception & e) {
+    error = e.what();
+    return {};
 }
 
 struct llama_kpack_sidecar_reader::impl {
@@ -378,27 +430,16 @@ bool llama_kpack_sidecar_reader::open(const std::string & dir, std::string & err
     by_name.clear();
     root = dir;
 
-    struct stat st {};
-
-    if (lstat(dir.c_str(), &st) != 0 || !S_ISDIR(st.st_mode)) {
+    if (!fs::is_directory(fs::symlink_status(fs::u8path(dir)))) {
         error = "K-pack sidecar root must be a real directory: " + dir;
         return false;
     }
     // Exactly two entries, nothing else -- an unlisted file is a bundle that did not finish or was tampered with.
     {
         std::set<std::string> entries;
-        DIR *                 d = opendir(dir.c_str());
-        if (!d) {
-            error = "cannot list " + dir;
-            return false;
+        for (const auto & entry : fs::directory_iterator(fs::u8path(dir))) {
+            entries.insert(entry.path().filename().u8string());
         }
-        while (dirent * e = readdir(d)) {
-            const std::string nm = e->d_name;
-            if (nm != "." && nm != "..") {
-                entries.insert(nm);
-            }
-        }
-        closedir(d);
         if (entries != std::set<std::string>{"manifest.json", "weights.bin"}) {
             error = "K-pack sidecar root entries disagree with the schema (want exactly manifest.json and weights.bin)";
             return false;
@@ -862,7 +903,8 @@ bool llama_kpack_sidecar_reader::check_source_metadata(const std::vector<llama_k
 
 bool llama_kpack_sidecar_reader::load_unchecked(const std::string &                            gguf_path,
                                                 const std::vector<llama_kpack_source_tensor> & inventory,
-                                                std::string &                                  error) {
+                                                std::string &                                  error,
+                                                int                                            loader_fd) {
     if (!check_source_metadata(inventory, error)) {
         return false;
     }
@@ -870,12 +912,11 @@ bool llama_kpack_sidecar_reader::load_unchecked(const std::string &             
     if (!source.open(gguf_path, false, error, false)) {
         return false;
     }
-    if (source.size != pimpl->source_size ||
-        source_identity(source.st_before) != pimpl->manifest["source"]["identity"]) {
+    if (source.size != pimpl->source_size || source.before.identity != pimpl->manifest["source"]["identity"]) {
         error = "source GGUF identity differs from the local cache";
         return false;
     }
-    if (!pimpl->weights.still_same(error)) {
+    if ((loader_fd >= 0 && !source.matches(loader_fd, error)) || !pimpl->weights.still_same(error)) {
         return false;
     }
     resolve_planes();
@@ -894,7 +935,8 @@ void llama_kpack_sidecar_reader::resolve_planes() {
 
 struct llama_kpack_sidecar_writer::impl {
     std::string           final_dir, staging;
-    int                   fd         = -1;
+    std::unique_ptr<FILE, decltype(&std::fclose)> output{nullptr, &std::fclose};
+    std::unique_ptr<llama_file>                   file;
     uint64_t              pos        = 0;
     ojson                 tensors    = ojson::array();
     ojson                 skipped    = ojson::array();
@@ -904,20 +946,20 @@ struct llama_kpack_sidecar_writer::impl {
     mapped_file           source;
     std::string           source_path;
 
-    bool write_all(const void * data, size_t size, std::string & error) {
-        const uint8_t * p = (const uint8_t *) data;
-        while (size) {
-            const ssize_t n = ::write(fd, p, size);
-            if (n <= 0) {
-                if (n < 0 && errno == EINTR) {
-                    continue;
-                }
-                error = std::string("weights.bin: write: ") + (n == 0 ? "no progress" : strerror(errno));
-                return false;
-            }
-            p += n;
-            size -= (size_t) n;
-            pos += (uint64_t) n;
+    bool write_all(const void * data, size_t size, std::string & error) try {
+        file->write_raw(data, size);
+        pos += size;
+        return true;
+    } catch (const std::exception & e) {
+        error = e.what();
+        return false;
+    }
+
+    bool close_output(std::string & error) {
+        file.reset();
+        if (output && std::fclose(output.release()) != 0) {
+            error = std::string("weights.bin: close: ") + strerror(errno);
+            return false;
         }
         return true;
     }
@@ -933,16 +975,28 @@ struct llama_kpack_sidecar_writer::impl {
     }
 
     void remove_staging() {
+        file.reset();
+        output.reset();
         if (staging.empty()) {
             return;
         }
-        if (fd >= 0) {
-            ::close(fd);
-            fd = -1;
+        std::error_code ec;
+        const auto      dir = fs::u8path(staging);
+        // Only these two files in our private staging directory; never follow a substituted directory.
+        if (fs::is_directory(fs::symlink_status(dir, ec))) {
+            for (const char * name : {"weights.bin", "manifest.json"}) {
+                if (ec) {
+                    break;
+                }
+                fs::remove(dir / name, ec);
+            }
+            if (!ec) {
+                fs::remove(dir, ec);
+            }
         }
-        ::unlink((staging + "/weights.bin").c_str());
-        ::unlink((staging + "/manifest.json").c_str());
-        ::rmdir(staging.c_str());
+        if (ec) {
+            GGML_LOG_INFO("[kpack-cache] staging cleanup failed: %s: %s\n", staging.c_str(), ec.message().c_str());
+        }
         staging.clear();
     }
 };
@@ -963,61 +1017,53 @@ void llama_kpack_sidecar_writer::abort() {
 }
 
 bool llama_kpack_sidecar_writer::bind_source(const std::string & path, std::string & error, int loader_fd) {
-    if (pimpl->source.fd >= 0) {
+    if (pimpl->source.file) {
         error = "source is already bound";
         return false;
     }
     if (!pimpl->source.open(path, false, error, false)) {
         return false;
     }
-    if (loader_fd >= 0) {
-        struct stat st {};
-
-        const auto & bound = pimpl->source.st_before;
-        if (fstat(loader_fd, &st) != 0 || st.st_dev != bound.st_dev || st.st_ino != bound.st_ino ||
-            st.st_size != bound.st_size || st.st_mtim.tv_sec != bound.st_mtim.tv_sec ||
-            st.st_mtim.tv_nsec != bound.st_mtim.tv_nsec || st.st_ctim.tv_sec != bound.st_ctim.tv_sec ||
-            st.st_ctim.tv_nsec != bound.st_ctim.tv_nsec) {
-            error = "source path is not the loader's file";
-            pimpl->source.close();
-            return false;
-        }
+    if (loader_fd >= 0 && !pimpl->source.matches(loader_fd, error)) {
+        pimpl->source.close();
+        return false;
     }
     pimpl->source_path = path;
     return true;
 }
 
-bool llama_kpack_sidecar_writer::begin(const std::string & dir, std::string & error) {
-    if (pimpl->fd >= 0 || !pimpl->staging.empty()) {
+bool llama_kpack_sidecar_writer::begin(const std::string & dir, std::string & error) try {
+    if (pimpl->file || !pimpl->staging.empty()) {
         error = "writer is already open";
         return false;
     }
 
-    struct stat st {};
-
-    if (lstat(dir.c_str(), &st) == 0) {
+    if (fs::exists(fs::symlink_status(fs::u8path(dir)))) {
         error = "refusing to overwrite existing output " + dir;
         return false;
     }
-    if (errno != ENOENT) {
-        error = dir + ": lstat: " + strerror(errno);
-        return false;
-    }
-    const std::string staging = dir + ".partial." + std::to_string((long) getpid());
-    if (mkdir(staging.c_str(), 0755) != 0) {
-        error = staging + ": mkdir: " + strerror(errno);
+    static std::atomic<uint64_t> sequence{0};
+    const std::string            staging = dir + ".partial." +
+                                std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) + "." +
+                                std::to_string(sequence.fetch_add(1));
+    if (!fs::create_directory(fs::u8path(staging))) {
+        error = staging + ": staging directory already exists";
         return false;
     }
     // Cleanup may only own a directory this writer created successfully.
     pimpl->final_dir = dir;
     pimpl->staging   = staging;
-    pimpl->fd        = ::open((pimpl->staging + "/weights.bin").c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0644);
-    if (pimpl->fd < 0) {
-        error = std::string("weights.bin: ") + strerror(errno);
-        pimpl->remove_staging();
-        return false;
+    fs::permissions(fs::u8path(staging), fs::perms::owner_all);
+    pimpl->output.reset(ggml_fopen((staging + "/weights.bin").c_str(), "wbx"));
+    if (!pimpl->output) {
+        throw std::runtime_error(std::string("weights.bin: ") + strerror(errno));
     }
+    pimpl->file = std::make_unique<llama_file>(pimpl->output.get());
     return true;
+} catch (const std::exception & e) {
+    error = e.what();
+    abort();
+    return false;
 }
 
 void llama_kpack_sidecar_writer::skip(const std::string & name,
@@ -1033,7 +1079,7 @@ bool llama_kpack_sidecar_writer::add_stream(const llama_kpack_source_tensor & sr
                                             const cancelled &                 cancel,
                                             std::string &                     error) {
     const auto & source = pimpl->source;
-    if (source.fd < 0 || src.data_offset > source.size || src.size_bytes > source.size - src.data_offset) {
+    if (!source.file || src.data_offset > source.size || src.size_bytes > source.size - src.data_offset) {
         error = "source range is outside the bound file";
         return false;
     }
@@ -1048,7 +1094,7 @@ bool llama_kpack_sidecar_writer::add_record(const llama_kpack_source_tensor & sr
                                             std::string &                     error) {
     auto &            I   = *pimpl;
     const std::string pre = src.name + ": ";
-    if (I.fd < 0) {
+    if (!I.file) {
         error = "writer is not open";
         return false;
     }
@@ -1177,83 +1223,28 @@ bool llama_kpack_sidecar_writer::add_record(const llama_kpack_source_tensor & sr
     return true;
 }
 
-static bool fsync_path(const std::string & path, std::string & error) {
-    const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
-    if (fd < 0) {
-        error = path + ": " + strerror(errno);
+static bool publish_cache_files(const std::string & staging, const std::string & target, std::string & error) try {
+    const auto from = fs::u8path(staging), to = fs::u8path(target);
+    if (!fs::create_directory(to)) {
+        error = "refusing to overwrite existing output " + target;
         return false;
     }
-    const bool ok = fsync(fd) == 0;
-    if (!ok) {
-        error = path + ": fsync: " + strerror(errno);
-    }
-    ::close(fd);
-    return ok;
-}
-
-static bool publish_cache_files(const std::string & staging, const std::string & target, std::string & error) {
-    const int source_fd = open(staging.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
-    if (source_fd < 0) {
-        error = staging + ": open: " + strerror(errno);
-        return false;
-    }
-    if (mkdir(target.c_str(), 0755) != 0) {
-        error = target + ": exclusive mkdir: " + strerror(errno);
-        close(source_fd);
-        return false;
-    }
-    const int target_fd = open(target.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
-    if (target_fd < 0) {
-        error = target + ": open: " + strerror(errno);
-        close(source_fd);
-        return false;
-    }
-    bool weights_linked = false;
-    bool published      = false;
-    bool ok             = false;
-    // Readers require the manifest. Publish it only after the data link is durable.
-    if (linkat(source_fd, "weights.bin", target_fd, "weights.bin", 0) != 0) {
-        error = target + ": link weights.bin: " + strerror(errno);
-    } else {
-        weights_linked = true;
-        if (fsync(target_fd) != 0) {
-            error = target + ": sync data link: " + strerror(errno);
-        } else if (linkat(source_fd, "manifest.json", target_fd, "manifest.json", 0) != 0) {
-            error = target + ": publish manifest.json: " + strerror(errno);
-        } else {
-            published = true;
-            ok        = fsync(target_fd) == 0;
-            if (!ok) {
-                error = target + ": sync published manifest: " + strerror(errno);
-            }
-        }
-    }
-    if (!published) {
-        // Remove only this writer's link, never a replacement made by another writer.
-        struct stat source {
-        }, linked{}, owned{}, current{};
-
-        if (weights_linked && fstatat(source_fd, "weights.bin", &source, AT_SYMLINK_NOFOLLOW) == 0 &&
-            fstatat(target_fd, "weights.bin", &linked, AT_SYMLINK_NOFOLLOW) == 0 && source.st_dev == linked.st_dev &&
-            source.st_ino == linked.st_ino) {
-            unlinkat(target_fd, "weights.bin", 0);
-        }
-        if (fstat(target_fd, &owned) == 0 && lstat(target.c_str(), &current) == 0 && owned.st_dev == current.st_dev &&
-            owned.st_ino == current.st_ino) {
-            rmdir(target.c_str());
-        }
-    }
-    close(target_fd);
-    close(source_fd);
-    return ok;
+    // Links cannot overwrite another file. Readers admit the cache only after the manifest is published.
+    fs::create_hard_link(from / "weights.bin", to / "weights.bin");
+    fs::create_hard_link(from / "manifest.json", to / "manifest.json");
+    return true;
+} catch (const std::exception & e) {
+    // A partial destination remains a cache miss; never remove an existing or concurrently replaced output.
+    error = e.what();
+    return false;
 }
 
 bool llama_kpack_sidecar_writer::finish(const std::string & model_label,
                                         const std::string & gguf_path,
                                         std::string &       error,
-                                        const cancelled &   cancel) {
+                                        const cancelled &   cancel) try {
     auto & I = *pimpl;
-    if (I.fd < 0) {
+    if (!I.file) {
         error = "writer is not open";
         return false;
     }
@@ -1262,34 +1253,27 @@ bool llama_kpack_sidecar_writer::finish(const std::string & model_label,
         abort();
         return false;
     }
-    if (fsync(I.fd) != 0) {
-        error = std::string("weights.bin: fsync: ") + strerror(errno);
+    if (!I.close_output(error)) {
         abort();
         return false;
     }
-    ::close(I.fd);
-    I.fd = -1;
 
     uint64_t src_size = 0;
     json     identity;
     {
         mapped_file temporary;
-        if (I.source.fd < 0 && !temporary.open(gguf_path, false, error, false)) {
+        if (!temporary.open(gguf_path, false, error, false)) {
             abort();
             return false;
         }
-        const mapped_file & mf = I.source.fd >= 0 ? I.source : temporary;
-
-        struct stat current {};
-
-        if (stat(gguf_path.c_str(), &current) != 0 || current.st_dev != mf.st_before.st_dev ||
-            current.st_ino != mf.st_before.st_ino || (I.source.fd >= 0 && gguf_path != I.source_path)) {
+        const mapped_file & mf = I.source.file ? I.source : temporary;
+        if (!(temporary.before == mf.before) || (I.source.file && gguf_path != I.source_path)) {
             error = "source path changed since load";
             abort();
             return false;
         }
         src_size = mf.size;
-        identity = source_identity(mf.st_before);
+        identity = mf.before.identity;
         if (!mf.still_same(error)) {
             abort();
             return false;
@@ -1325,40 +1309,19 @@ bool llama_kpack_sidecar_writer::finish(const std::string & model_label,
         {"skipped", I.skipped},
     };
     const std::string text = manifest.dump(2) + "\n";
-    const int mfd = ::open((I.staging + "/manifest.json").c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0644);
-    if (mfd < 0) {
-        error = std::string("manifest.json: ") + strerror(errno);
-        abort();
-        return false;
-    }
     {
-        const char * p    = text.data();
-        size_t       left = text.size();
-        while (left) {
-            const ssize_t n = ::write(mfd, p, left);
-            if (n <= 0) {
-                if (n < 0 && errno == EINTR) {
-                    continue;
-                }
-                error = std::string("manifest.json: write: ") + strerror(errno);
-                ::close(mfd);
-                abort();
-                return false;
-            }
-            p += n;
-            left -= (size_t) n;
+        std::unique_ptr<FILE, decltype(&std::fclose)> fp(ggml_fopen((I.staging + "/manifest.json").c_str(), "wbx"),
+                                                         &std::fclose);
+        if (!fp) {
+            throw std::runtime_error(std::string("manifest.json: ") + strerror(errno));
         }
-        if (fsync(mfd) != 0) {
-            error = "manifest.json: fsync failed";
-            ::close(mfd);
-            abort();
-            return false;
+        {
+            llama_file file(fp.get());
+            file.write_raw(text.data(), text.size());
         }
-        ::close(mfd);
-    }
-    if (!fsync_path(I.staging, error)) {
-        abort();
-        return false;
+        if (std::fclose(fp.release()) != 0) {
+            throw std::runtime_error(std::string("manifest.json: close: ") + strerror(errno));
+        }
     }
     if (cancel && cancel()) {
         error = "cache write cancelled";
@@ -1366,37 +1329,19 @@ bool llama_kpack_sidecar_writer::finish(const std::string & model_label,
         return false;
     }
 
-    // Keep no-replace semantics on filesystems without renameat2 flags.
-#ifndef RENAME_NOREPLACE
-#    define RENAME_NOREPLACE (1 << 0)
-#endif
-    if (syscall(SYS_renameat2, AT_FDCWD, I.staging.c_str(), AT_FDCWD, I.final_dir.c_str(), RENAME_NOREPLACE) != 0) {
-        const int saved_errno = errno;
-        if (saved_errno != EINVAL && saved_errno != ENOSYS && saved_errno != EOPNOTSUPP) {
-            error = I.final_dir + ": renameat2(RENAME_NOREPLACE): " + strerror(saved_errno);
-            abort();
-            return false;
-        }
-        if (!publish_cache_files(I.staging, I.final_dir, error)) {
-            abort();
-            return false;
-        }
-        I.remove_staging();
-        GGML_LOG_INFO("[kpack-cache] published with manifest-last links: %s\n", I.final_dir.c_str());
-    } else {
-        I.staging.clear();
-    }
-    I.source.close();
-
-    std::string  parent = I.final_dir;
-    const size_t slash  = parent.find_last_of('/');
-    parent              = slash == std::string::npos ? "." : (slash == 0 ? "/" : parent.substr(0, slash));
-    if (!fsync_path(parent, error)) {
+    if (!publish_cache_files(I.staging, I.final_dir, error)) {
+        abort();
         return false;
     }
+    I.remove_staging();
+    I.source.close();
     error.clear();
     GGML_LOG_INFO("[kpack] wrote %zu artifact(s) to %s\n", I.tensors.size(), I.final_dir.c_str());
     return true;
+} catch (const std::exception & e) {
+    error = e.what();
+    abort();
+    return false;
 }
 
 struct llama_kpack_background_writer::impl {
@@ -1481,14 +1426,14 @@ bool llama_kpack_background_writer::start(std::vector<llama_kpack_write_job>    
                         last = now;
                     }
                 }
-                const auto flushing = std::chrono::steady_clock::now();
-                GGML_LOG_INFO("[kpack-cache] flushing cache to disk\n");
+                const auto publishing = std::chrono::steady_clock::now();
+                GGML_LOG_INFO("[kpack-cache] publishing cache\n");
                 I.success = I.writer.finish(I.source_path, I.source_path, I.error, cancel);
                 if (I.success) {
                     const auto now = std::chrono::steady_clock::now();
-                    GGML_LOG_INFO("[kpack-cache] published: total_seconds=%.2f flush_seconds=%.2f\n",
+                    GGML_LOG_INFO("[kpack-cache] published: total_seconds=%.2f publish_seconds=%.2f\n",
                                   std::chrono::duration<double>(now - began).count(),
-                                  std::chrono::duration<double>(now - flushing).count());
+                                  std::chrono::duration<double>(now - publishing).count());
                 }
             } catch (const std::exception & e) {
                 I.error = e.what();

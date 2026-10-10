@@ -10,7 +10,7 @@
 #include <string>
 #include <vector>
 
-// LLAMA_KPACK_CACHE_DIR overrides ${TMPDIR:-/tmp}/llama-kpack-<uid>.
+// LLAMA_KPACK_CACHE_DIR overrides llama-kpack[-<uid>] under the system temporary directory.
 // Each source stat identity has its own subdirectory. Empty means unavailable.
 std::string llama_kpack_cache_directory(const std::string & source, std::string & error);
 
@@ -58,7 +58,8 @@ public:
     bool                               open(const std::string & dir, std::string & error);
     bool                               load_unchecked(const std::string &                            source,
                                                       const std::vector<llama_kpack_source_tensor> & inventory,
-                                                      std::string &                                  error);
+                                                      std::string &                                  error,
+                                                      int                                            loader_fd = -1);
     const llama_kpack_sidecar_record * find(const std::string & name) const;
 
     size_t size() const { return records.size(); }

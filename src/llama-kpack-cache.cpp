@@ -5,11 +5,9 @@
 
 #include <algorithm>
 #include <array>
-#include <cerrno>
 #include <cinttypes>
-#include <cstring>
+#include <filesystem>
 #include <set>
-#include <sys/stat.h>
 
 namespace {
 
@@ -224,38 +222,21 @@ llama_kpack_cache::llama_kpack_cache(const std::string &                        
         I.sources.emplace(src.name, src);
     }
     std::string error;
-    const auto  same_source = [&]() {
-        if (loader_fd < 0) {
-            return true;
-        }
-        struct stat loaded {
-        }, named{};
-        return fstat(loader_fd, &loaded) == 0 && stat(source.c_str(), &named) == 0 && loaded.st_dev == named.st_dev &&
-               loaded.st_ino == named.st_ino && loaded.st_size == named.st_size &&
-               loaded.st_mtim.tv_sec == named.st_mtim.tv_sec && loaded.st_mtim.tv_nsec == named.st_mtim.tv_nsec &&
-               loaded.st_ctim.tv_sec == named.st_ctim.tv_sec && loaded.st_ctim.tv_nsec == named.st_ctim.tv_nsec;
-    };
-    if (!same_source()) {
-        LLAMA_LOG_WARN("[kpack-cache] source path differs from the loader's file; cache disabled\n");
+    std::error_code ec;
+    const auto      status = std::filesystem::symlink_status(std::filesystem::u8path(dir), ec);
+    if (ec && ec != std::errc::no_such_file_or_directory) {
+        LLAMA_LOG_WARN("[kpack-cache] cannot inspect %s: %s\n", dir.c_str(), ec.message().c_str());
         return;
     }
-
-    struct stat st {};
-
-    if (lstat(dir.c_str(), &st) == 0) {
+    if (std::filesystem::exists(status)) {
         auto reader = std::make_unique<llama_kpack_sidecar_reader>();
-        if (reader->open(dir, error) && reader->load_unchecked(source, inventory, error) && same_source()) {
+        if (reader->open(dir, error) && reader->load_unchecked(source, inventory, error, loader_fd)) {
             LLAMA_LOG_INFO("[kpack-cache] ready: tensors=%zu content_checks=disabled path=%s\n", reader->size(),
                            dir.c_str());
             I.reader = std::move(reader);
         } else {
-            LLAMA_LOG_WARN("[kpack-cache] ignored invalid cache: %s; using GPU pack\n",
-                           error.empty() ? "source changed during cache admission" : error.c_str());
+            LLAMA_LOG_WARN("[kpack-cache] ignored invalid cache: %s; using GPU pack\n", error.c_str());
         }
-        return;
-    }
-    if (errno != ENOENT) {
-        LLAMA_LOG_WARN("[kpack-cache] cannot inspect %s: %s\n", dir.c_str(), strerror(errno));
         return;
     }
     I.writable = I.writer.prepare(dir, source, error, loader_fd);

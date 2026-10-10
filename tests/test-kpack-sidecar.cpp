@@ -1,46 +1,23 @@
 #include "../src/llama-kpack-cache.h"
+#include "../src/llama-mmap.h"
 #include "../ggml/src/ggml-cuda/ncp-quactlize-lib.h"
 
 #include <nlohmann/json.hpp>
 #include <atomic>
-#include <cerrno>
-#include <cstdarg>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <stdexcept>
 #include <thread>
-#include <sys/stat.h>
-#include <sys/syscall.h>
-#include <unistd.h>
+#ifndef _WIN32
+#    include <sys/stat.h>
+#    include <unistd.h>
+#endif
 
 namespace fs = std::filesystem;
 using json   = nlohmann::json;
-
-static bool     manifest_last = false;
-extern "C" long __real_syscall(long number, ...);
-extern "C" long __wrap_syscall(long number, ...);
-
-extern "C" long __wrap_syscall(long number, ...) {
-    if (number != SYS_renameat2) {
-        errno = ENOSYS;
-        return -1;
-    }
-    if (manifest_last) {
-        errno = EINVAL;
-        return -1;
-    }
-    va_list args;
-    va_start(args, number);
-    int          a = va_arg(args, int);
-    const char * b = va_arg(args, const char *);
-    int          c = va_arg(args, int);
-    const char * d = va_arg(args, const char *);
-    int          e = va_arg(args, int);
-    va_end(args);
-    return __real_syscall(number, a, b, c, d, e);
-}
 
 static void check(bool ok, const std::string & message) {
     if (!ok) {
@@ -55,10 +32,9 @@ struct fixture {
     std::vector<std::shared_ptr<std::vector<uint8_t>>> payloads;
 
     fixture() {
-        char         path[] = "kpack-sidecar.XXXXXX";
-        const char * made   = mkdtemp(path);
-        check(made != nullptr, "mkdtemp");
-        root            = fs::absolute(made);
+        root = fs::current_path() /
+               ("kpack-sidecar." + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+        check(fs::create_directory(root), "create test directory");
         source          = root / "source.gguf";
         uint64_t offset = 128;
         for (int q : {8, 10, 11, 12, 13, 14}) {
@@ -108,7 +84,7 @@ struct fixture {
     }
 
     ~fixture() {
-        // Only this test's mkdtemp directory; remove_all does not follow symlinks.
+        // Only this test's newly created directory; remove_all does not follow symlinks.
         std::error_code error;
         fs::remove_all(root, error);
     }
@@ -116,7 +92,7 @@ struct fixture {
     void write(const fs::path & dir) {
         std::string                   error;
         llama_kpack_background_writer writer;
-        check(writer.prepare(dir, source, error), error);
+        check(writer.prepare(dir.u8string(), source.u8string(), error), error);
         check(writer.start(jobs, inventory, 4096, error), error);
         check(writer.wait(error), error);
     }
@@ -124,8 +100,8 @@ struct fixture {
     void verify(const fs::path & dir) {
         std::string                error;
         llama_kpack_sidecar_reader reader;
-        check(reader.open(dir, error), error);
-        check(reader.load_unchecked(source, inventory, error), error);
+        check(reader.open(dir.u8string(), error), error);
+        check(reader.load_unchecked(source.u8string(), inventory, error), error);
         check(reader.size() == jobs.size(), "incomplete inventory");
         for (size_t i = 0; i < jobs.size(); ++i) {
             const auto * rec = reader.find(inventory[i].name);
@@ -134,7 +110,25 @@ struct fixture {
             check(memcmp(rec->planes.low, payloads[i]->data(), payloads[i]->size()) == 0, "roundtrip");
         }
     }
+
+    std::vector<fs::path> staging(const std::string & name) const {
+        std::vector<fs::path> result;
+        for (const auto & entry : fs::directory_iterator(root)) {
+            if (entry.path().filename().u8string().find(name + ".partial.") == 0) {
+                result.push_back(entry.path());
+            }
+        }
+        return result;
+    }
 };
+
+static int set_env(const char * name, const char * value) {
+#ifdef _WIN32
+    return _putenv_s(name, value ? value : "");
+#else
+    return value ? setenv(name, value, 1) : unsetenv(name);
+#endif
+}
 
 struct scoped_env {
     const char *      name;
@@ -146,58 +140,68 @@ struct scoped_env {
         present(getenv(name) != nullptr),
         value(present ? getenv(name) : "") {}
 
-    ~scoped_env() {
-        if (present) {
-            setenv(name, value.c_str(), 1);
-        } else {
-            unsetenv(name);
-        }
-    }
+    ~scoped_env() { set_env(name, present ? value.c_str() : nullptr); }
 };
 
 static void test_cache_directory(fixture & f) {
-    scoped_env configured("LLAMA_KPACK_CACHE_DIR"), tmp("TMPDIR");
-    check(unsetenv(configured.name) == 0 && setenv(tmp.name, f.root.c_str(), 1) == 0, "default environment");
+    scoped_env configured("LLAMA_KPACK_CACHE_DIR");
+#ifdef _WIN32
+    scoped_env tmp("TMP");
+    const auto root = f.root / "llama-kpack";
+#else
+    scoped_env tmp("TMPDIR");
+    const auto root = f.root / ("llama-kpack-" + std::to_string(geteuid()));
+#endif
+    check(set_env(configured.name, nullptr) == 0 && set_env(tmp.name, f.root.u8string().c_str()) == 0,
+          "default environment");
     std::string    error;
-    const fs::path automatic = llama_kpack_cache_directory(f.source, error);
-    const auto     root      = f.root / ("llama-kpack-" + std::to_string(geteuid()));
+    const fs::path automatic = fs::u8path(llama_kpack_cache_directory(f.source.u8string(), error));
     check(!automatic.empty() && automatic.parent_path() == root, "default cache directory: " + error);
 
+#ifndef _WIN32
     struct stat st {};
 
     check(lstat(root.c_str(), &st) == 0 && st.st_uid == geteuid() && (st.st_mode & 0077) == 0,
           "default cache is not private");
-    check(llama_kpack_cache_directory(f.source, error) == automatic, "unstable model key");
+#endif
+    check(llama_kpack_cache_directory(f.source.u8string(), error) == automatic.u8string(), "unstable model key");
     f.write(automatic);
-    f.verify(llama_kpack_cache_directory(f.source, error));
+    f.verify(fs::u8path(llama_kpack_cache_directory(f.source.u8string(), error)));
 
     const auto custom = f.root / "custom";
-    check(setenv(configured.name, (custom.string() + "/").c_str(), 1) == 0, "custom environment");
-    const fs::path overridden = llama_kpack_cache_directory(f.source, error);
+    check(set_env(configured.name, (custom.u8string() + "/").c_str()) == 0, "custom environment");
+    const fs::path overridden = fs::u8path(llama_kpack_cache_directory(f.source.u8string(), error));
     check(!overridden.empty() && overridden.parent_path() == custom && overridden.filename() == automatic.filename(),
           "cache root override: " + error);
-    fs::create_symlink(f.source, f.root / "alias.gguf");
-    check(llama_kpack_cache_directory(f.root / "alias.gguf", error) == overridden, "source alias changed key");
+    fs::create_hard_link(f.source, f.root / "alias.gguf");
+    // Creating a hard link updates ctime, so compare both names after the link exists.
+    check(llama_kpack_cache_directory((f.root / "alias.gguf").u8string(), error) ==
+              llama_kpack_cache_directory(f.source.u8string(), error),
+          "source alias changed key");
     fs::create_directory(f.root / "another");
     const auto other = f.root / "another/source.gguf";
     fs::copy_file(f.source, other);
-    const auto other_key = llama_kpack_cache_directory(other, error);
-    check(!other_key.empty() && other_key != overridden, "different models share a key");
+    const auto other_key = llama_kpack_cache_directory(other.u8string(), error);
+    check(!other_key.empty() && other_key != overridden.u8string(), "different models share a key");
     fs::resize_file(other, fs::file_size(other) + 1);
-    const auto changed_key = llama_kpack_cache_directory(other, error);
+    const auto changed_key = llama_kpack_cache_directory(other.u8string(), error);
     check(!changed_key.empty() && changed_key != other_key, "changed source reused key");
 
+#ifndef _WIN32
     const auto link = f.root / "cache-link";
     fs::create_directory_symlink(custom, link);
-    check(setenv(configured.name, (link.string() + "/").c_str(), 1) == 0, "symlink environment");
-    check(llama_kpack_cache_directory(f.source, error).empty(), "symlink cache root accepted");
-    check(setenv(configured.name, custom.c_str(), 1) == 0 && chmod(custom.c_str(), 0777) == 0, "shared cache root");
-    check(llama_kpack_cache_directory(f.source, error).empty(), "shared writable cache root accepted");
+    check(set_env(configured.name, (link.u8string() + "/").c_str()) == 0, "symlink environment");
+    check(llama_kpack_cache_directory(f.source.u8string(), error).empty(), "symlink cache root accepted");
+    check(set_env(configured.name, custom.u8string().c_str()) == 0 && chmod(custom.c_str(), 0777) == 0,
+          "shared cache root");
+    check(llama_kpack_cache_directory(f.source.u8string(), error).empty(), "shared writable cache root accepted");
     check(chmod(custom.c_str(), 0700) == 0, "restore private cache root");
-    check(setenv(configured.name, f.source.c_str(), 1) == 0, "file environment");
-    check(llama_kpack_cache_directory(f.source, error).empty(), "cache root file accepted");
-    check(setenv(configured.name, (f.root / "unused").c_str(), 1) == 0, "missing source environment");
-    check(llama_kpack_cache_directory(f.root / "missing.gguf", error).empty() && !fs::exists(f.root / "unused"),
+#endif
+    check(set_env(configured.name, f.source.u8string().c_str()) == 0, "file environment");
+    check(llama_kpack_cache_directory(f.source.u8string(), error).empty(), "cache root file accepted");
+    check(set_env(configured.name, (f.root / "unused").u8string().c_str()) == 0, "missing source environment");
+    check(llama_kpack_cache_directory((f.root / "missing.gguf").u8string(), error).empty() &&
+              !fs::exists(f.root / "unused"),
           "missing source created cache directory");
 }
 
@@ -220,31 +224,37 @@ int main() try {
     std::string error;
     test_cache_directory(f);
     test_prefetch_coverage();
-    for (bool fallback : {false, true}) {
-        manifest_last  = fallback;
-        const auto dir = f.root / (fallback ? "manifest-last" : "rename");
-        f.write(dir);
-        f.verify(dir);
+    const auto original = f.root / "complete";
+    f.write(original);
+    f.verify(original);
+    {
         llama_kpack_sidecar_writer other;
-        check(!other.begin(dir, error), "overwrite accepted");
-        f.verify(dir);
+        check(!other.begin(original.u8string(), error), "overwrite accepted");
+        f.verify(original);
+        fs::create_directory(f.root / "existing-empty");
+        check(!other.begin((f.root / "existing-empty").u8string(), error), "empty directory overwritten");
+        check(!other.begin(f.source.u8string(), error), "regular file overwritten");
+#ifndef _WIN32
+        fs::create_directory_symlink(f.root / "absent", f.root / "dangling");
+        check(!other.begin((f.root / "dangling").u8string(), error), "dangling symlink overwritten");
+#endif
     }
-    manifest_last = false;
     {
         const auto                    dir = f.root / "partial";
         llama_kpack_background_writer writer;
-        check(writer.prepare(dir, f.source, error), error);
+        check(writer.prepare(dir.u8string(), f.source.u8string(), error), error);
         check(writer.start({f.jobs.front()}, f.inventory, 4096, error), error);
         check(writer.wait(error), error);
         llama_kpack_sidecar_reader reader;
-        check(reader.open(dir, error) && reader.load_unchecked(f.source, f.inventory, error), error);
+        check(reader.open(dir.u8string(), error) && reader.load_unchecked(f.source.u8string(), f.inventory, error),
+              error);
         check(reader.size() == 1 && reader.find(f.inventory.front().name) && !reader.find(f.inventory.back().name),
               "partial cache inventory differs");
     }
     {
         const auto                    dir = f.root / "cancel";
         llama_kpack_background_writer writer;
-        check(writer.prepare(dir, f.source, error), error);
+        check(writer.prepare(dir.u8string(), f.source.u8string(), error), error);
         auto              jobs = f.jobs;
         std::atomic<bool> entered{false}, cancel_called{false};
         jobs[0].read = [&](size_t, size_t, std::string & why) -> const uint8_t * {
@@ -262,22 +272,63 @@ int main() try {
         cancel_called = true;
         writer.cancel();
         check(!fs::exists(dir), "cancel published");
-        check(!fs::exists(dir.string() + ".partial." + std::to_string(getpid())), "cancel leaked staging");
+        check(f.staging("cancel").empty(), "cancel leaked staging");
     }
     {
         const auto                 dir = f.root / "pending";
         llama_kpack_sidecar_writer owner;
-        check(owner.begin(dir, error), error);
+        check(owner.begin(dir.u8string(), error), error);
+        const auto staging = f.staging("pending");
+        check(staging.size() == 1, "missing staging directory");
         {
             llama_kpack_sidecar_writer other;
-            check(!other.begin(dir, error), "shared staging accepted");
+            check(other.begin(dir.u8string(), error), error);
+            check(f.staging("pending").size() == 2, "writers share staging directory");
         }
-        check(fs::exists(dir.string() + ".partial." + std::to_string(getpid()) + "/weights.bin"),
-              "removed other writer");
+        check(f.staging("pending") == staging && fs::exists(staging[0] / "weights.bin"), "removed other writer");
     }
-    const auto original = f.root / "rename";
+    check(f.staging("pending").empty(), "destructor leaked staging");
+    {
+        const auto                    dir = f.root / "concurrent";
+        llama_kpack_background_writer a, b;
+        check(a.prepare(dir.u8string(), f.source.u8string(), error), error);
+        check(b.prepare(dir.u8string(), f.source.u8string(), error), error);
+        check(a.start({f.jobs.front()}, f.inventory, 4096, error), error);
+        check(b.start({f.jobs.back()}, f.inventory, 4096, error), error);
+        std::string error_b;
+        const bool  first = a.wait(error), second = b.wait(error_b);
+        check(first != second, "concurrent publication must have exactly one winner");
+        llama_kpack_sidecar_reader reader;
+        check(reader.open(dir.u8string(), error) && reader.load_unchecked(f.source.u8string(), f.inventory, error),
+              error);
+        const size_t winner = first ? 0 : f.jobs.size() - 1;
+        const auto * rec    = reader.find(f.inventory[winner].name);
+        check(reader.size() == 1 && rec &&
+                  memcmp(rec->planes.low, f.payloads[winner]->data(), f.payloads[winner]->size()) == 0,
+              "mixed concurrent payloads");
+        check(f.staging("concurrent").empty(), "publication leaked staging");
+    }
+    {
+        llama_file                 loaded(f.source.u8string().c_str(), "rb");
+        llama_kpack_sidecar_reader reader;
+        check(reader.open(original.u8string(), error), error);
+        check(reader.load_unchecked(f.source.u8string(), f.inventory, error, loaded.file_id()), error);
+        const auto replacement = f.root / "replacement.gguf";
+        fs::copy_file(f.source, replacement);
+        fs::last_write_time(replacement, fs::last_write_time(f.source));
+        llama_file different(replacement.u8string().c_str(), "rb");
+        check(!reader.load_unchecked(f.source.u8string(), f.inventory, error, different.file_id()),
+              "different loader file accepted");
+        llama_kpack_sidecar_writer writer;
+        check(!writer.bind_source(replacement.u8string(), error, loaded.file_id()), "loader file mismatch accepted");
+    }
     const json manifest = json::parse(std::ifstream(original / "manifest.json"));
     for (const std::string kind : {"truncated", "offset", "overflow", "duplicate-key", "missing-manifest", "symlink"}) {
+#ifdef _WIN32
+        if (kind == "symlink") {
+            continue;  // Creating symlinks may require elevated privileges on Windows.
+        }
+#endif
         const auto dir = f.root / kind;
         fs::create_directory(dir);
         fs::copy_file(original / "weights.bin", dir / "weights.bin");
@@ -301,23 +352,23 @@ int main() try {
             fs::create_symlink(original / "weights.bin", dir / "weights.bin");
         }
         llama_kpack_sidecar_reader reader;
-        check(!reader.open(dir, error), kind + " accepted");
+        check(!reader.open(dir.u8string(), error), kind + " accepted");
     }
     {
         llama_kpack_sidecar_reader reader;
-        check(reader.open(original, error), error);
+        check(reader.open(original.u8string(), error), error);
         auto wrong = f.inventory;
         ++wrong[0].data_offset;
-        check(!reader.load_unchecked(f.source, wrong, error), "different inventory accepted");
+        check(!reader.load_unchecked(f.source.u8string(), wrong, error), "different inventory accepted");
         std::ofstream out(f.source, std::ios::binary | std::ios::app);
         out.put(0);
         out.close();
-        check(!reader.load_unchecked(f.source, f.inventory, error), "changed source accepted");
+        check(!reader.load_unchecked(f.source.u8string(), f.inventory, error), "changed source accepted");
     }
     {
         const auto                    dir = f.root / "changed-during-write";
         llama_kpack_background_writer writer;
-        check(writer.prepare(dir, f.source, error), error);
+        check(writer.prepare(dir.u8string(), f.source.u8string(), error), error);
         std::ofstream out(f.source, std::ios::binary | std::ios::app);
         out.put(0);
         out.close();
@@ -325,8 +376,21 @@ int main() try {
         check(!writer.wait(error), "published after source changed");
         check(!fs::exists(dir), "invalid publication");
     }
+#ifndef _WIN32
+    {
+        const auto                    dir = f.root / "replaced-during-write";
+        llama_kpack_background_writer writer;
+        check(writer.prepare(dir.u8string(), f.source.u8string(), error), error);
+        const auto old_time = fs::last_write_time(f.source);
+        fs::copy_file(f.source, f.root / "next.gguf");
+        fs::last_write_time(f.root / "next.gguf", old_time);
+        fs::rename(f.root / "next.gguf", f.source);
+        check(writer.start(f.jobs, f.inventory, 4096, error), error);
+        check(!writer.wait(error) && !fs::exists(dir), "same-size same-mtime replacement accepted");
+    }
+#endif
     puts(
-        "KPACK_SIDECAR PASS formats=6 dense=6 grouped=6 atomic=rename+manifest-last directory=default+env "
+        "KPACK_SIDECAR PASS formats=6 dense=6 grouped=6 atomic=manifest-last concurrent=PASS directory=default+env "
         "prefetch=BYTES_95_PERCENT rejections=PASS");
     return 0;
 } catch (const std::exception & error) {
