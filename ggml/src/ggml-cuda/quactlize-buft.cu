@@ -3,12 +3,16 @@
 #    include "common.cuh"
 #    include "ggml-backend-impl.h"
 
+#    include <atomic>
 #    include <climits>
 #    include <cstring>
 #    include <dlfcn.h>
 #    include <map>
 
 namespace {
+
+// Once a buffer type escapes, keep checking even after its buffers are freed.
+std::atomic<bool> buffer_type_exposed{false};
 
 struct pack_library {
     void *                                                                  handle      = nullptr;
@@ -281,6 +285,7 @@ ggml_backend_buffer_type_t * ggml_cuda_quactlize_extra_bufts(ggml_backend_dev_t 
         ctx.extra[0] = &ctx.type;
         found        = types.find(dev);
     }
+    buffer_type_exposed.store(true, std::memory_order_release);
     return found->second.extra;
 }
 
@@ -397,6 +402,9 @@ bool ggml_quactlize_copy_range_wait(ggml_backend_event_t completion) {
 }
 
 void ggml_quactlize_assert_no_compute(const ggml_cgraph * graph) {
+    if (!buffer_type_exposed.load(std::memory_order_acquire)) {
+        return;
+    }
     for (int i = 0; i < graph->n_nodes; ++i) {
         const auto * node = graph->nodes[i];
         if (packed_source(node)) {
