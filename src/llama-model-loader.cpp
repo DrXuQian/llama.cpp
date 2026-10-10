@@ -1,4 +1,7 @@
 #include "llama-model-loader.h"
+#ifdef GGML_NCP_QUACTLIZE
+#    include "llama-kpack-cache.h"
+#endif
 
 #include "ggml-alloc.h"
 #include "ggml.h"
@@ -538,6 +541,7 @@ llama_model_loader::llama_model_loader(
         const llama_model_kv_override * param_overrides_p,
         const llama_model_tensor_buft_override * param_tensor_buft_overrides_p)
         : metadata(meta), set_tensor_data(set_tensor_data), set_tensor_data_ud(set_tensor_data_ud) {
+    source_path = fname;
     int trace = 0;
     if (getenv("LLAMA_TRACE")) {
         trace = atoi(getenv("LLAMA_TRACE"));
@@ -1559,6 +1563,12 @@ bool llama_model_loader::load_all_data(
         }
 
         size_t n_size = ggml_nbytes(cur);
+#ifdef GGML_NCP_QUACTLIZE
+        if (kpack_cache && kpack_cache->load(cur)) {
+            size_done += n_size;
+            continue;
+        }
+#endif
 
         if (use_mmap) {
             const auto & mapping = mappings.at(weight->idx);
@@ -1665,6 +1675,11 @@ bool llama_model_loader::load_all_data(
             }
         }
 
+#ifdef GGML_NCP_QUACTLIZE
+        if (kpack_cache) {
+            kpack_cache->capture(cur);
+        }
+#endif
         size_done += n_size;
     }
 

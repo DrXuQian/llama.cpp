@@ -290,14 +290,25 @@ if (NOT LLAMA_SANITIZE_ADDRESS AND NOT GGML_SCHED_NO_REALLOC)
 endif()
 llama_build_and_test(test-backend-ops.cpp)
 
+if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    find_package(Threads REQUIRED)
+    add_executable(test-kpack-sidecar test-kpack-sidecar.cpp ../src/llama-kpack-sidecar.cpp)
+    target_link_libraries(test-kpack-sidecar PRIVATE ggml-base vendor::nlohmann Threads::Threads)
+    target_compile_features(test-kpack-sidecar PRIVATE cxx_std_17)
+    target_link_options(test-kpack-sidecar PRIVATE "-Wl,--wrap=syscall")
+    add_test(NAME test-kpack-sidecar COMMAND test-kpack-sidecar)
+    set_tests_properties(test-kpack-sidecar PROPERTIES LABELS "kpack" TIMEOUT 60)
+endif()
+
 # K-pack load-only buffer type against an offline reference GGUF; test-kpack-load.py generates the reference and
 # drives the binary through the online/offline, forward-rejected and missing-packer cases.
 if (GGML_NCP_QUACTLIZE)
     llama_build(test-kpack-load.cpp)
+    llama_build(test-kpack-cache.cpp)
     find_package(Python3 REQUIRED COMPONENTS Interpreter)
     add_test(NAME test-kpack-load
         COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/test-kpack-load.py"
-            --binary $<TARGET_FILE:test-kpack-load>)
+            --binary $<TARGET_FILE:test-kpack-load> --cache-binary $<TARGET_FILE:test-kpack-cache>)
     set_tests_properties(test-kpack-load PROPERTIES LABELS "ppu;kpack" TIMEOUT 600 RUN_SERIAL TRUE)
 endif()
 

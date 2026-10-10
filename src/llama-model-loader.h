@@ -28,7 +28,11 @@ enum llama_fver {
 
 const char * llama_file_version_name(llama_fver version);
 
+class llama_kpack_cache;
+
 struct llama_model_loader {
+    llama_kpack_cache * kpack_cache = nullptr;  // model-owned
+    std::string         source_path;
     // Holds information on a model weight
     struct llama_tensor_weight {
         uint16_t  idx; // source file index

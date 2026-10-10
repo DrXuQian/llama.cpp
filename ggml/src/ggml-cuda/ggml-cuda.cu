@@ -5648,11 +5648,23 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     if (strcmp(name, "ggml_quactlize_can_load") == 0) {
         return (void *) ggml_quactlize_can_load;
     }
+    if (strcmp(name, "ggml_cuda_buft_is_quactlize") == 0) {
+        return (void *) ggml_cuda_buft_is_quactlize;
+    }
     if (strcmp(name, "ggml_quactlize_read_packed") == 0) {
         return (void *) ggml_quactlize_read_packed;
     }
     if (strcmp(name, "ggml_quactlize_set_packed") == 0) {
         return (void *) ggml_quactlize_set_packed;
+    }
+    if (strcmp(name, "ggml_quactlize_tensor_is_kpack") == 0) {
+        return (void *) ggml_quactlize_tensor_is_kpack;
+    }
+    if (strcmp(name, "ggml_quactlize_copy_range_async") == 0) {
+        return (void *) ggml_quactlize_copy_range_async;
+    }
+    if (strcmp(name, "ggml_quactlize_copy_range_wait") == 0) {
+        return (void *) ggml_quactlize_copy_range_wait;
     }
 #endif
     if (strcmp(name, "ggml_backend_comm_init") == 0) {
