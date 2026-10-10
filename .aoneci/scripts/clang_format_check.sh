@@ -15,10 +15,16 @@ set -e
 if command -v apt-get >/dev/null 2>&1; then
     apt-get update -qq
     apt-get install -y -qq clang-format-18 git python3
-elif command -v yum >/dev/null 2>&1; then
-    yum install -y clang-tools-extra git python3
-elif command -v dnf >/dev/null 2>&1; then
-    dnf install -y clang-tools-extra git python3
+elif command -v yum >/dev/null 2>&1 || command -v dnf >/dev/null 2>&1; then
+    # yum/dnf repos only ship clang-tools-extra 15, which cannot parse .clang-format
+    # (AlignTrailingComments.Kind needs >= 16). Take the 18 wheel from pip instead, so
+    # both distro families format with the same clang-format as the apt branch above.
+    PKG=$(command -v dnf || command -v yum)
+    "$PKG" install -y git python3 python3-pip
+    # The distro pip is too old to accept the wheel's manylinux2014 tag; 21.x is the
+    # last pip that still runs on python 3.6.
+    python3 -m pip install -q --upgrade 'pip<22'
+    python3 -m pip install -q --only-binary :all: 'clang-format==18.1.8'
 else
     echo "❌ No supported package manager found" >&2
     exit 1
@@ -76,6 +82,14 @@ if [ -z "$CF_BIN" ]; then
     exit 1
 fi
 echo "Using clang-format binary: $CF_BIN"
+
+# Fail loudly on a wrong version: an older clang-format errors out reading .clang-format,
+# and that error text would otherwise be reported as a formatting diff below.
+CF_VER=$("$CF_BIN" --version | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n 1)
+if [ "${CF_VER%%.*}" != "18" ]; then
+    echo "❌ clang-format 18 required, found ${CF_VER:-unknown}" >&2
+    exit 1
+fi
 
 # Check only the lines changed in this PR/MR
 CF_STATUS=0

@@ -4,8 +4,10 @@
 #   NCP_LIB_DIR   - ncp_flash_lib 仓库路径
 # 可选环境变量:
 #   LLAMA_MODEL   - 模型 .gguf 路径 (仅集成测试需要)
-#   USRNAME/TOKEN - gitlab 凭证 (仅子模块拉取需要)
-#   PPU_NVCC      - PPU nvcc 路径
+#   USRNAME/TOKEN - git 凭证 (可选; 仅当某个 submodule 仍指向内网 git 时需要,
+#                    当前 FA/DeepGemm/FLA 及其嵌套依赖都在 github)
+#   PPU_NVCC      - CUDA_SDK nvcc 路径, 作 ncp_flash_lib 与 llama.cpp 的 CMAKE_CUDA_COMPILER
+#                    (FA kernel 不经它编译, 见下方构建参数说明)。
 #   JOBS          - 并行数
 
 # --- 路径配置 (必填) ---
@@ -32,11 +34,18 @@ export http_proxy=http://11.122.78.49:3128
 export no_proxy=localhost,127.0.0.1,::1,.eng.t-head.cn,.dev.t-head.cn
 
 # --- 构建参数 ---
+# CMAKE_CUDA_COMPILER 只能是 nvcc: CMake 的 CUDA 编译器探测不认 hgcc。nvcc 负责启用 CUDA 语言
+# 和定位 CUDA::cudart; ncp_flash_lib 的 FA kernel 由其 CMake 直接调用 $PPU_SDK/bin/hgcc 编译,
+# DeepGemm 则在运行时 JIT 调用 hgcc。
 export PPU_NVCC="${PPU_NVCC:-/usr/local/PPU_SDK/CUDA_SDK/bin/nvcc}"
 export JOBS="${JOBS:-$(nproc 2>/dev/null || echo 4)}"
 
 # Ensure PPU nvcc is in PATH
+export CUDACXX="${PPU_NVCC}"
 export PATH="${PPU_NVCC%/*}:${PATH}"
+
+# HGGC_ENABLE_COMPRESS=1 (编译期 fatbin 压缩) 不在这里 export: ncp_flash_lib/CMakeLists.txt
+# 已用 `cmake -E env` 对每次 hgcc 调用设置。
 
 # --- 运行时环境 (build 和 test 共用) ---
 # .so 路径不再由环境变量给出: 由编译开关 (-DGGML_NCP_MOE) 决定加载哪个库,
@@ -55,6 +64,10 @@ export GGML_NCP_GDN_CHUNKED=ON
 # cubins; kept under ncp build/, not build-ci which every build wipes, so
 # first-run auto-warm survives a rebuild.
 export CUDA_HOME="${CUDA_HOME:-/usr/local/cuda}"
+
+# 运行时库搜索优先用本次构建产出的 libggml-*/libllama-*/libncp_fa.so，避免被 /app 里已部署的旧版本
+# (0.15.2) 抢先加载。prepend 到最前，同时保留后面的原有路径作为回退。
+export LD_LIBRARY_PATH="${LLAMA_CI_DIR}/build-ci/bin${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
 export DG_JIT_CACHE_DIR="${DG_JIT_CACHE_DIR:-${NCP_LIB_DIR}/build/ncp_moe_cache}"
 mkdir -p "$DG_JIT_CACHE_DIR"
 

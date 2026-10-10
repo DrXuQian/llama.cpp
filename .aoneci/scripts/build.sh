@@ -7,7 +7,8 @@
 #        export LLAMA_CI_DIR=/path/to/llama.cpp
 #        export NCP_LIB_DIR=/path/to/ncp_flash_lib
 #
-#   2. 设置 gitlab 凭证 (可选, 仅子模块未拉取时需要):
+#   2. 设置 gitlab 凭证 (可选, 仅当某个 submodule 仍指向内网 git 时需要;
+#      当前 FA/DeepGemm/FLA 及其嵌套依赖都在 github, 一般用不到):
 #        export USRNAME=user@alibaba-inc.com
 #        export TOKEN=<your-gitlab-token>
 #
@@ -22,7 +23,8 @@
 #        ./run_backend_ops.sh MUL_MAT
 #
 # 可选环境变量 (覆盖默认值):
-#   PPU_NVCC     PPU nvcc 路径   (default: /usr/local/PPU_SDK/CUDA_SDK/bin/nvcc)
+#   PPU_NVCC     CUDA_SDK nvcc 路径, 作 CMAKE_CUDA_COMPILER; FA kernel 由 hgcc 直接编译 (见 config.sh)
+#                (default: /usr/local/PPU_SDK/CUDA_SDK/bin/nvcc)
 #   JOBS         并行编译数     (default: $(nproc))
 #   NCP_LIB_REV  ncp_flash_lib 完整 40 位 commit sha (default: .aoneci/NCP_LIB_VERSION 里记录的值)
 # ============================================================
@@ -43,6 +45,9 @@ echo "jobs        : $JOBS"
 echo ""
 
 # --- 1. Git URL rewrite (if USRNAME/TOKEN set) ---
+# For any submodule still pointing at an internal git host over ssh; unused with the current all-github submodule
+# set (flash-attention-for-sail + actlize, DeepGEMM-for-sail + actlize/fmt, FLA). Credentials go into the global
+# git config, so the trap removes them again on exit.
 if [ -n "${USRNAME:-}" ] && [ -n "${TOKEN:-}" ]; then
     echo "==> [1/5] Configuring git URL rewrite..."
     ENCODED_USR="${USRNAME/@/%40}"
@@ -82,30 +87,32 @@ cd "${NCP_LIB_DIR}"
 if [ "$(git rev-parse HEAD)" = "${NCP_REV}" ]; then
     echo "    ncp_flash_lib already at ${NCP_REV}"
 else
-    git cat-file -e "${NCP_REV}^{commit}" 2>/dev/null || git fetch --all --tags
+    git cat-file -e "${NCP_REV}^{commit}" 2>/dev/null || git fetch --all --tags --no-recurse-submodules
     if ! git cat-file -e "${NCP_REV}^{commit}" 2>/dev/null; then
         echo "ERROR: ncp_flash_lib has no commit ${NCP_REV}, even after fetching" >&2
         exit 1
     fi
     git checkout --detach "${NCP_REV}"
-    # The pin covers the submodule commits too. --force because cmake applies the DeepGemm patches into the submodule
-    # work tree: a plain update keeps those edits and the patches then fail to apply onto themselves.
-    git submodule update --init --recursive --force
+    # The pin covers the submodule commits too. --force because cmake applies the DeepGemm and FA patches into the
+    # submodule work trees: a plain update keeps those edits and the patches then fail to apply onto themselves.
+    git submodule update --init --recursive --force -- third_party/flash-attention third_party/DeepGemm third_party/quactlize
     echo "    ncp_flash_lib -> ${NCP_REV}"
 fi
 
-if [ ! -f third_party/flash-attention/.git ] || [ ! -f third_party/DeepGemm/.git ]; then
+if [ ! -f third_party/flash-attention/.git ] || [ ! -f third_party/DeepGemm/.git ] || \
+   [ ! -f third_party/flash-attention/csrc/actlize/.git ] || \
+   [ ! -f third_party/quactlize/.git ] || [ ! -f third_party/quactlize/third_party/actlize/.git ]; then
+    # flash-attention's nested csrc/actlize is checked too: flash-attention-for-sail carries its own submodule,
+    # and an outer checkout without it fails the FA build at CMake's actlize include check. Same for Quactlize.
     echo "    submodules missing -- pulling (--init --recursive)"
-    git submodule update --init --recursive
+    git submodule update --init --recursive -- third_party/flash-attention third_party/DeepGemm third_party/quactlize
 else
     echo "    submodules already checked out"
 fi
 
-# --- 3. Build ncp_flash_lib (FA + MoE; GDN off) ---
-# CI exercises the FA (FlashAttention-3) and MoE (DeepGemm) hooks, so both .so are built.
-# MoE needs Torch HEADERS to compile but does NOT link libtorch -- without torch there is nothing to test, so fail.
-# FA needs no torch at all (v3 dropped the ATen include v2 pulled in); the ldd check below is what keeps it that way.
-echo "==> [3/5] Building ncp_flash_lib (FA + MoE)..."
+# --- 3. Build ncp_flash_lib (FA + MoE + Quactlize; GDN off) ---
+# Keep the existing FA/MoE configuration and only add the Quactlize target.
+echo "==> [3/5] Building ncp_flash_lib (FA + MoE + Quactlize)..."
 TORCH_DIR=$(python -c 'import torch,os;print(os.path.join(os.path.dirname(torch.__file__),"share/cmake/Torch"))' 2>/dev/null || echo "")
 if [ -z "$TORCH_DIR" ]; then
     echo "ERROR: torch not found -- MoE needs torch headers at build time" >&2
@@ -120,30 +127,29 @@ cmake -S . -B build \
     -DNCP_BUILD_FA=ON \
     -DNCP_BUILD_MOE=ON \
     -DNCP_BUILD_GDN=OFF \
-    -DTorch_DIR="${TORCH_DIR}"
+    -DNCP_BUILD_QUACTLIZE=ON \
+    -DTorch_DIR="${TORCH_DIR}" \
+    -DNCP_FA_HGCC_ARCH="-arch=ppu_10"
 cmake --build build -j"${JOBS}"
 
-# Neither .so may link libtorch: on a box without torch the dlopen fails and ggml falls back to the inline kernels --
-# green tests that exercised nothing. MoE gets there via --gc-sections, FA by not needing torch at all, so a hit on FA
-# means the ATen dependency v3 dropped has come back.
-for so in libncp_fa.so libncp_moe.so; do
+# Runtime libraries must load on boxes without torch.
+for so in libncp_fa.so libncp_moe.so libquactlize_ppu_pack.so; do
     if [ -f "build/${so}" ] && ldd "build/${so}" 2>/dev/null | grep -qi torch; then
         echo "    WARNING: ${so} links libtorch -- will fail on boxes without torch"
     fi
 done
 
-# --- 4. Check both .so came out ---
+# --- 4. Check the libraries ---
 # llama.cpp decides at COMPILE time which .so it dlopens (the -DGGML_NCP_* flags below) and looks for them next to its
 # own binaries at runtime. Those flags are stated explicitly, NOT derived from which .so happen to exist: a leftover
-# libncp_gdn.so from an earlier run must not switch the GDN hook on. Checked here, BEFORE llama.cpp builds, so a
-# missing .so costs one line of output instead of a `mv: cannot stat` at the end of a full compile.
-for so in libncp_fa.so libncp_moe.so; do
+# libncp_gdn.so from an earlier run must not switch the GDN hook on. Warn (don't abort): a missing .so is reported
+# here up front instead of a `mv: cannot stat` at the end of a full compile.
+for so in libncp_fa.so libncp_moe.so libquactlize_ppu_pack.so; do
     if [ ! -f "${NCP_LIB_DIR}/build/${so}" ]; then
-        echo "ERROR: ${NCP_LIB_DIR}/build/${so} was not built" >&2
-        exit 1
+        echo "WARNING: ${NCP_LIB_DIR}/build/${so} was not built" >&2
     fi
 done
-echo "==> [4/5] libncp_fa.so + libncp_moe.so built -> llama.cpp gets -DGGML_NCP_FA=ON -DGGML_NCP_MOE=ON (GDN stays off)"
+echo "==> [4/5] FA + MoE + Quactlize pack libraries built (GDN stays off, K-pack inference stays disabled)"
 
 # --- 5. Build llama.cpp, then drop the .so next to the test binaries ---
 echo "==> [5/5] Building llama.cpp..."
@@ -152,12 +158,15 @@ if [ -d "build-ci" ]; then
     echo "    cleaning build-ci..."
     rm -rf build-ci
 fi
+mkdir -p build-ci/bin
+
 cmake -S . -B build-ci \
     -DCMAKE_BUILD_TYPE=Release \
     -DGGML_CUDA=ON \
     -DGGML_USE_PPU=ON \
     -DGGML_NCP_MOE=ON \
     -DGGML_NCP_FA=ON \
+    -DGGML_NCP_QUACTLIZE=ON \
     -DCMAKE_CUDA_ARCHITECTURES=OFF \
     -DLLAMA_BUILD_TESTS=ON \
     -DLLAMA_BUILD_EXAMPLES=ON \
@@ -170,7 +179,8 @@ cmake --build build-ci -j"${JOBS}"
 # copied: one copy of the .so, so there is never a question of which one is being loaded. A re-run relinks it.
 mv -f "${NCP_LIB_DIR}/build/libncp_moe.so" "${LLAMA_CI_DIR}/build-ci/bin/"
 mv -f "${NCP_LIB_DIR}/build/libncp_fa.so" "${LLAMA_CI_DIR}/build-ci/bin/"
-echo "    installed libncp_moe.so, libncp_fa.so  -> build-ci/bin/"
+mv -f "${NCP_LIB_DIR}/build/libquactlize_ppu_pack.so" "${LLAMA_CI_DIR}/build-ci/bin/"
+echo "    installed libncp_moe.so, libncp_fa.so, libquactlize_ppu_pack.so  -> build-ci/bin/"
 
 
 # The .so finds its own JIT include tree at bin/deep_gemm/include through dladdr, the way deep_gemm/__init__.py uses
@@ -200,12 +210,24 @@ for p in "${DG_INC_SRC}"/*; do
 done
 echo "    installed deep_gemm/include -> build-ci/bin/deep_gemm/ ($(find -L "${DG_INC_DST}" -type f | wc -l | tr -d ' ') files)"
 
+# Same for the K-pack load test: tests/test-kpack-load.py finds the offline reference at bin/quactlize/ beside the binary,
+# so the llama.cpp build never points into ncp_flash_lib.
+QZ_REF_SRC="${NCP_LIB_DIR}/third_party/quactlize/reference/gguf_kpack.py"
+if [ ! -f "${QZ_REF_SRC}" ]; then
+    echo "ERROR: ${QZ_REF_SRC} is missing -- the K-pack load test would have no reference" >&2
+    exit 1
+fi
+rm -rf "${LLAMA_CI_DIR}/build-ci/bin/quactlize"
+mkdir -p "${LLAMA_CI_DIR}/build-ci/bin/quactlize"
+cp "${QZ_REF_SRC}" "${LLAMA_CI_DIR}/build-ci/bin/quactlize/"
+echo "    installed quactlize/gguf_kpack.py -> build-ci/bin/quactlize/"
+
 # --- Done ---
 echo ""
 echo "========================================"
 echo "BUILD COMPLETE"
 echo "========================================"
-echo "  NCP hooks     : FA + MoE (libncp_fa.so, libncp_moe.so + deep_gemm/ in build-ci/bin)"
+echo "  NCP hooks     : FA + MoE + Quactlize load-only (libraries + deep_gemm/ + quactlize/ in build-ci/bin)"
 echo "  test binaries : ${LLAMA_CI_DIR}/build-ci/bin/"
 echo "========================================"
 echo ""

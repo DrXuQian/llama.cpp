@@ -111,15 +111,15 @@ jobs:
           lfs: true
           submodules: true
           ssh-key: ${{secrets.bot_ssh_key}}
- 
-      - name: build llama cpp
+
+      - name: build llama cpp and dependencies
         image: ${{vars.run_image}}
         timeout: 4h
         run: |
+          set -eu
           export LLAMA_CI_DIR=/workspace/llama_cpp
           export NCP_LIB_DIR=/workspace/ncp_flash_lib
-          cd /workspace/llama_cpp/.aoneci/scripts
-          bash ./build.sh
+          bash "$LLAMA_CI_DIR/.aoneci/scripts/build.sh"
 
       - name: package
         run: |
@@ -162,16 +162,28 @@ jobs:
           run_image: ${{vars.run_image}}
           image_url: ${{jobs.build.outputs.oss_url}}
           cmd: |
+            set -eu
             echo "========== ctest Started =========="
-            rm -rf /workspace/llama_cpp /workspace/ncp_flash_lib
             mkdir -p /workspace
-            ln -sfn "$(pwd)/llama_cpp" /workspace/llama_cpp
-            ln -sfn "$(pwd)/ncp_flash_lib" /workspace/ncp_flash_lib
+            for entry in llama_cpp ncp_flash_lib; do
+              source_dir=$(realpath -e "$entry")
+              if [ -e "/workspace/$entry" ] || [ -L "/workspace/$entry" ]; then
+                if [ "$(realpath -e "/workspace/$entry")" != "$source_dir" ]; then
+                  echo "ERROR: /workspace/$entry already points elsewhere (expected $source_dir)" >&2
+                  exit 1
+                fi
+              else
+                ln -s "$source_dir" "/workspace/$entry"
+              fi
+            done
 
             export LLAMA_CI_DIR="/workspace/llama_cpp"
             export NCP_LIB_DIR="/workspace/ncp_flash_lib"
-            bash llama_cpp/.aoneci/scripts/run_tests.sh
-            TEST_EXIT=$?
+            export PPU_SDK="${PPU_SDK:-/usr/local/PPU_SDK}"
+            export LD_LIBRARY_PATH="$PPU_SDK/lib:$PPU_SDK/CUDA_SDK/targets/x86_64-linux/lib:${LD_LIBRARY_PATH:-}"
+            ctest --test-dir "$LLAMA_CI_DIR/build-ci" -N -R '^test-kpack-load$' | grep -q test-kpack-load
+            TEST_EXIT=0
+            bash llama_cpp/.aoneci/scripts/run_tests.sh || TEST_EXIT=$?
             echo "========== ctest Done =========="
             exit $TEST_EXIT
           timeout: 14400

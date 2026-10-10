@@ -162,7 +162,7 @@ if (CUDAToolkit_FOUND)
 
     # NCP external kernel library support: dlopen libncp_fa.so / libncp_moe.so / libncp_gdn.so at runtime (built
     # separately from the private ncp_flash_lib repo). llama.cpp itself pulls in NO cutlass/FA/torch/Triton headers --
-    # only the thin C ABI (ncp-fa-lib.h, ncp-moe-lib.h, ncp-gdn-lib.h) + the dlopen loader (ncp-lib.cu).
+    # only the thin C ABI (ncp-fa-lib.h, ncp-moe-lib.h, ncp-gdn-lib.h, ncp-quactlize-lib.h) + the dlopen loader (ncp-lib.cu).
     #
     # One flag per library, because they are three independent kernel sets with three independent .so:
     #   -DGGML_NCP_FA=ON   fattn-ncp.cu           -> libncp_fa.so
@@ -186,8 +186,8 @@ if (CUDAToolkit_FOUND)
         set(GGML_NCP_GDN OFF)
     endif()
 
-    if (GGML_NCP_FA OR GGML_NCP_MOE OR GGML_NCP_GDN)
-        message(STATUS "ggml-cuda: NCP libs -> FA=${GGML_NCP_FA} MOE=${GGML_NCP_MOE} GDN=${GGML_NCP_GDN}")
+    if (GGML_NCP_FA OR GGML_NCP_MOE OR GGML_NCP_GDN OR GGML_NCP_QUACTLIZE)
+        message(STATUS "ggml-cuda: NCP libs -> FA=${GGML_NCP_FA} MOE=${GGML_NCP_MOE} GDN=${GGML_NCP_GDN} QUACTLIZE=${GGML_NCP_QUACTLIZE}")
         if (GGML_NCP_FA)
             add_compile_definitions(GGML_NCP_FA)
         endif()
@@ -196,6 +196,12 @@ if (CUDAToolkit_FOUND)
         endif()
         if (GGML_NCP_GDN)
             add_compile_definitions(GGML_NCP_GDN)
+        endif()
+        if (GGML_NCP_QUACTLIZE)
+            if (NOT GGML_USE_PPU OR WIN32)
+                message(FATAL_ERROR "K-pack loading requires a Linux PPU build")
+            endif()
+            add_compile_definitions(GGML_NCP_QUACTLIZE)
         endif()
         target_link_libraries(ggml-cuda PRIVATE ${CMAKE_DL_LIBS})
         set_property(TARGET ggml-cuda APPEND PROPERTY BUILD_RPATH   "$ORIGIN")

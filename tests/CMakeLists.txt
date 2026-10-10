@@ -290,6 +290,17 @@ if (NOT LLAMA_SANITIZE_ADDRESS AND NOT GGML_SCHED_NO_REALLOC)
 endif()
 llama_build_and_test(test-backend-ops.cpp)
 
+# K-pack load-only buffer type against an offline reference GGUF; test-kpack-load.py generates the reference and
+# drives the binary through the online/offline, forward-rejected and missing-packer cases.
+if (GGML_NCP_QUACTLIZE)
+    llama_build(test-kpack-load.cpp)
+    find_package(Python3 REQUIRED COMPONENTS Interpreter)
+    add_test(NAME test-kpack-load
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/test-kpack-load.py"
+            --binary $<TARGET_FILE:test-kpack-load>)
+    set_tests_properties(test-kpack-load PROPERTIES LABELS "ppu;kpack" TIMEOUT 600 RUN_SERIAL TRUE)
+endif()
+
 # NCP external kernel .so vs ggml's inline kernels. Needs at least one hook compiled in to have anything to compare;
 # the test itself skips cleanly when the .so is absent or the GPU backend exposes no route control, so the OR is only
 # about not building a binary that can do nothing at all.
