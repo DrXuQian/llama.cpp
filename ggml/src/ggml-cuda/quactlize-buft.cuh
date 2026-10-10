@@ -19,3 +19,13 @@ bool ggml_quactlize_set_packed(ggml_tensor *                        tensor,
                                const ggml_quactlize_packed_layout * layout,
                                const void *                         data,
                                size_t                               size);
+
+// Snapshot after loading is sealed. Caller owns pinned memory and event until completion.
+// Submit and wait on the writer, and join it before freeing the tensor buffer.
+bool ggml_quactlize_tensor_is_kpack(const ggml_tensor * tensor);
+bool ggml_quactlize_copy_range_async(const ggml_tensor *  tensor,
+                                     void *               pinned,
+                                     size_t               offset,
+                                     size_t               bytes,
+                                     ggml_backend_event_t completion);
+bool ggml_quactlize_copy_range_wait(ggml_backend_event_t completion);

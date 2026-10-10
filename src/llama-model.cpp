@@ -7,6 +7,9 @@
 #include "llama-mmap.h"
 #include "llama-cparams.h"
 #include "llama-model-loader.h"
+#ifdef GGML_NCP_QUACTLIZE
+#    include "llama-kpack-cache.h"
+#endif
 
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-iswa.h"
@@ -1136,6 +1139,10 @@ struct llama_model::impl {
 
     // contexts where the model tensors metadata is stored as well as the corresponding buffers:
     std::vector<std::pair<ggml_context_ptr, std::vector<ggml_backend_buffer_ptr>>> ctxs_bufs;
+#ifdef GGML_NCP_QUACTLIZE
+    // Destroy first: the writer reads weights owned by ctxs_bufs.
+    std::unique_ptr<llama_kpack_cache> kpack_cache;
+#endif
 
     buft_list_t cpu_buft_list;
     std::map<ggml_backend_dev_t, buft_list_t> gpu_buft_list;
@@ -1660,7 +1667,15 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     }
 
-    ml.init_mappings(true, use_mlock ? &pimpl->mlock_mmaps : nullptr);
+    bool prefetch_source = true;
+#ifdef GGML_NCP_QUACTLIZE
+    if (params.split_mode != LLAMA_SPLIT_MODE_TENSOR && params.split_mode != LLAMA_SPLIT_MODE_ROW) {
+        pimpl->kpack_cache = llama_kpack_cache::create(ml);
+        ml.kpack_cache     = pimpl->kpack_cache.get();
+        prefetch_source    = !ml.kpack_cache || !ml.kpack_cache->has_cached_tensors();
+    }
+#endif
+    ml.init_mappings(prefetch_source, use_mlock ? &pimpl->mlock_mmaps : nullptr);
     pimpl->mappings.reserve(ml.mappings.size());
 
     // create the backend buffers
@@ -1788,6 +1803,11 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             return false;
         }
     }
+#ifdef GGML_NCP_QUACTLIZE
+    if (pimpl->kpack_cache) {
+        pimpl->kpack_cache->start();
+    }
+#endif
 
     if (use_mmap_buffer) {
         for (auto & mapping : ml.mappings) {

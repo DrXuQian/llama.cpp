@@ -44,17 +44,29 @@ const pack_library & library() {
 struct tensor_state {
     ggml_quactlize_packed_layout layout{};
     bool                         loaded = false;
+    cudaEvent_t                  ready  = nullptr;
+};
+
+constexpr size_t cache_chunk_bytes = 8 * 1024 * 1024;
+
+struct upload_slot {
+    void *      host     = nullptr;
+    cudaEvent_t reusable = nullptr;
+    bool        pending  = false;
 };
 
 struct buffer_context {
     int                                         device;
     void *                                      data     = nullptr;
     cudaStream_t                                stream   = nullptr;
+    cudaStream_t                                copy_stream = nullptr;
     cudaEvent_t                                 uploaded = nullptr;
     void *                                      scratch  = nullptr;
     size_t                                      capacity = 0;
     const ggml_tensor *                         pending  = nullptr;
     size_t                                      received = 0;
+    upload_slot                                 uploads[2];
+    unsigned                                    upload_index = 0;
     std::map<const ggml_tensor *, tensor_state> tensors;
 };
 
@@ -83,6 +95,21 @@ void free_buffer(ggml_backend_buffer_t buffer) {
     auto * ctx = static_cast<buffer_context *>(buffer->context);
     ggml_cuda_set_device(ctx->device);
     CUDA_CHECK(cudaStreamSynchronize(ctx->stream));
+    CUDA_CHECK(cudaStreamSynchronize(ctx->copy_stream));
+    for (const auto & item : ctx->tensors) {
+        if (item.second.ready) {
+            CUDA_CHECK(cudaEventDestroy(item.second.ready));
+        }
+    }
+    for (auto & slot : ctx->uploads) {
+        if (slot.reusable) {
+            CUDA_CHECK(cudaEventDestroy(slot.reusable));
+        }
+        if (slot.host) {
+            CUDA_CHECK(cudaFreeHost(slot.host));
+        }
+    }
+    CUDA_CHECK(cudaStreamDestroy(ctx->copy_stream));
     CUDA_CHECK(cudaEventDestroy(ctx->uploaded));
     CUDA_CHECK(cudaStreamDestroy(ctx->stream));
     CUDA_CHECK(cudaFree(ctx->scratch));
@@ -138,6 +165,8 @@ void set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void *
         if (rc) {
             GGML_ABORT("quactlize: GPU shuffle failed for %s (rc=%d)", tensor->name, rc);
         }
+        CUDA_CHECK(cudaEventCreateWithFlags(&found->second.ready, cudaEventDisableTiming));
+        CUDA_CHECK(cudaEventRecord(found->second.ready, ctx->stream));
         found->second.loaded = true;
         ctx->pending         = nullptr;
         ctx->received        = 0;
@@ -172,6 +201,7 @@ ggml_backend_buffer_t alloc_buffer(ggml_backend_buffer_type_t buft, size_t size)
     ctx->device = type->device;
     ctx->data   = data;
     CUDA_CHECK(cudaStreamCreateWithFlags(&ctx->stream, cudaStreamNonBlocking));
+    CUDA_CHECK(cudaStreamCreateWithFlags(&ctx->copy_stream, cudaStreamNonBlocking));
     CUDA_CHECK(cudaEventCreateWithFlags(&ctx->uploaded, cudaEventDisableTiming));
     return ggml_backend_buffer_init(buft, buffer_interface, ctx, size);
 }
@@ -283,10 +313,87 @@ bool ggml_quactlize_set_packed(ggml_tensor *                        tensor,
         return false;
     }
     ggml_cuda_set_device(ctx->device);
-    CUDA_CHECK(cudaMemcpyAsync(tensor->data, data, size, cudaMemcpyHostToDevice, ctx->stream));
-    CUDA_CHECK(cudaStreamSynchronize(ctx->stream));
+    if (!ctx->uploads[0].host) {
+        for (auto & slot : ctx->uploads) {
+            CUDA_CHECK(cudaMallocHost(&slot.host, cache_chunk_bytes));
+            CUDA_CHECK(cudaEventCreateWithFlags(&slot.reusable, cudaEventDisableTiming));
+        }
+    }
+    for (size_t offset = 0; offset < size;) {
+        auto & slot = ctx->uploads[ctx->upload_index];
+        if (slot.pending) {
+            CUDA_CHECK(cudaEventSynchronize(slot.reusable));
+        }
+        const size_t bytes = std::min(cache_chunk_bytes, size - offset);
+        memcpy(slot.host, static_cast<const uint8_t *>(data) + offset, bytes);
+        CUDA_CHECK(cudaMemcpyAsync(static_cast<uint8_t *>(tensor->data) + offset, slot.host, bytes,
+                                   cudaMemcpyHostToDevice, ctx->stream));
+        CUDA_CHECK(cudaEventRecord(slot.reusable, ctx->stream));
+        slot.pending = true;
+        ctx->upload_index ^= 1;
+        offset += bytes;
+    }
+    CUDA_CHECK(cudaEventCreateWithFlags(&found->second.ready, cudaEventDisableTiming));
+    CUDA_CHECK(cudaEventRecord(found->second.ready, ctx->stream));
+    // Host input is consumed into owned slots; the last uploads may still be in flight.
     found->second.loaded = true;
     return true;
+}
+
+bool ggml_quactlize_tensor_is_kpack(const ggml_tensor * tensor) {
+    return tensor && !tensor->view_src && packed_source(tensor);
+}
+
+bool ggml_quactlize_copy_range_async(const ggml_tensor *  tensor,
+                                     void *               pinned,
+                                     size_t               offset,
+                                     size_t               bytes,
+                                     ggml_backend_event_t completion) {
+    if (!ggml_quactlize_tensor_is_kpack(tensor) || !pinned || !completion || !completion->context || !bytes ||
+        offset > ggml_nbytes(tensor) || bytes > ggml_nbytes(tensor) - offset ||
+        completion->device != ggml_backend_buft_get_device(tensor->buffer->buft)) {
+        return false;
+    }
+    auto *     ctx   = static_cast<buffer_context *>(tensor->buffer->context);
+    const auto found = ctx->tensors.find(tensor);
+    if (found == ctx->tensors.end() || !found->second.loaded) {
+        return false;
+    }
+    ggml_cuda_set_device(ctx->device);
+    cudaPointerAttributes attributes{};
+    cudaError_t           rc = cudaPointerGetAttributes(&attributes, pinned);
+    if (rc != cudaSuccess || attributes.type != cudaMemoryTypeHost) {
+        if (rc != cudaSuccess) {
+            (void) cudaGetLastError();
+        }
+        return false;
+    }
+    rc = cudaStreamWaitEvent(ctx->copy_stream, found->second.ready, 0);
+    if (rc == cudaSuccess) {
+        rc = cudaMemcpyAsync(pinned, static_cast<const uint8_t *>(tensor->data) + offset, bytes, cudaMemcpyDeviceToHost,
+                             ctx->copy_stream);
+    }
+    if (rc == cudaSuccess) {
+        rc = cudaEventRecord((cudaEvent_t) completion->context, ctx->copy_stream);
+    }
+    if (rc == cudaSuccess) {
+        return true;
+    }
+    // A failed enqueue may already reference the destination. Drain this stream before returning it.
+    CUDA_CHECK(cudaStreamSynchronize(ctx->copy_stream));
+    (void) cudaGetLastError();
+    return false;
+}
+
+bool ggml_quactlize_copy_range_wait(ggml_backend_event_t completion) {
+    if (!completion || !completion->context) {
+        return false;
+    }
+    const cudaError_t rc = cudaEventSynchronize((cudaEvent_t) completion->context);
+    if (rc != cudaSuccess) {
+        (void) cudaGetLastError();
+    }
+    return rc == cudaSuccess;
 }
 
 void ggml_quactlize_assert_no_compute(const ggml_cgraph * graph) {

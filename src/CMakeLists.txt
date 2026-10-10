@@ -62,6 +62,16 @@ target_compile_features   (llama PRIVATE cxx_std_17) # don't bump
 
 target_link_libraries(llama PUBLIC ggml)
 
+if (GGML_NCP_QUACTLIZE)
+    find_package(Threads REQUIRED)
+    if (NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        message(FATAL_ERROR "K-pack cache requires Linux")
+    endif()
+    target_sources(llama PRIVATE llama-kpack-cache.cpp llama-kpack-sidecar.cpp)
+    target_compile_definitions(llama PRIVATE GGML_NCP_QUACTLIZE)
+    target_link_libraries(llama PRIVATE vendor::nlohmann Threads::Threads)
+endif()
+
 if (BUILD_SHARED_LIBS)
     set_target_properties(llama PROPERTIES POSITION_INDEPENDENT_CODE ON)
     target_compile_definitions(llama PRIVATE LLAMA_BUILD)
