@@ -30,6 +30,7 @@ extern "C" void ggml_log_internal(enum ggml_log_level level, const char * format
 #    include <windows.h>
 #    include <io.h>
 #else
+#    include <fcntl.h>
 #    include <sys/stat.h>
 #    include <unistd.h>
 #endif
@@ -42,6 +43,57 @@ namespace {
 
 constexpr int64_t      KPACK_ALIGN        = 128;
 constexpr const char * KPACK_CACHE_SCHEMA = "llama.kpack-cache";
+
+bool sync_file(int fd, std::string & error) {
+#ifdef _WIN32
+    const HANDLE handle = reinterpret_cast<HANDLE>(_get_osfhandle(fd));
+    if (!FlushFileBuffers(handle)) {
+        error = "FlushFileBuffers: error " + std::to_string(GetLastError());
+        return false;
+    }
+#else
+    int rc;
+    do {
+#    ifdef __APPLE__
+        rc = fcntl(fd, F_FULLFSYNC);
+#    else
+        rc = fsync(fd);
+#    endif
+    } while (rc < 0 && errno == EINTR);
+    if (rc < 0) {
+        error = std::string("file sync: ") + strerror(errno);
+        return false;
+    }
+#endif
+    return true;
+}
+
+bool sync_directory(const fs::path & path, std::string & error) {
+#ifdef _WIN32
+    // Windows has no directory fsync equivalent.
+    GGML_UNUSED(path);
+    GGML_UNUSED(error);
+    return true;
+#else
+    int fd;
+    do {
+        fd = open(path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    } while (fd < 0 && errno == EINTR);
+    if (fd < 0) {
+        error = path.u8string() + ": open directory: " + strerror(errno);
+        return false;
+    }
+    bool ok = sync_file(fd, error);
+    if (close(fd) != 0 && ok) {
+        error = std::string("close directory: ") + strerror(errno);
+        ok    = false;
+    }
+    if (!ok) {
+        error = path.u8string() + ": " + error;
+    }
+    return ok;
+#endif
+}
 
 inline uint64_t align_up(uint64_t v) {
     return (v + KPACK_ALIGN - 1) & ~(uint64_t) (KPACK_ALIGN - 1);
@@ -956,6 +1008,16 @@ struct llama_kpack_sidecar_writer::impl {
     }
 
     bool close_output(std::string & error) {
+        if (output) {
+            if (std::fflush(output.get()) != 0) {
+                error = std::string("weights.bin: flush: ") + strerror(errno);
+                return false;
+            }
+            if (!sync_file(file->file_id(), error)) {
+                error = "weights.bin: " + error;
+                return false;
+            }
+        }
         file.reset();
         if (output && std::fclose(output.release()) != 0) {
             error = std::string("weights.bin: close: ") + strerror(errno);
@@ -1232,7 +1294,8 @@ static bool publish_cache_files(const std::string & staging, const std::string &
     // Links cannot overwrite another file. Readers admit the cache only after the manifest is published.
     fs::create_hard_link(from / "weights.bin", to / "weights.bin");
     fs::create_hard_link(from / "manifest.json", to / "manifest.json");
-    return true;
+    const auto parent = to.parent_path();
+    return sync_directory(to, error) && sync_directory(parent.empty() ? fs::path(".") : parent, error);
 } catch (const std::exception & e) {
     // A partial destination remains a cache miss; never remove an existing or concurrently replaced output.
     error = e.what();
@@ -1318,6 +1381,12 @@ bool llama_kpack_sidecar_writer::finish(const std::string & model_label,
         {
             llama_file file(fp.get());
             file.write_raw(text.data(), text.size());
+            if (std::fflush(fp.get()) != 0) {
+                throw std::runtime_error(std::string("manifest.json: flush: ") + strerror(errno));
+            }
+            if (!sync_file(file.file_id(), error)) {
+                throw std::runtime_error("manifest.json: " + error);
+            }
         }
         if (std::fclose(fp.release()) != 0) {
             throw std::runtime_error(std::string("manifest.json: close: ") + strerror(errno));
@@ -1328,7 +1397,10 @@ bool llama_kpack_sidecar_writer::finish(const std::string & model_label,
         abort();
         return false;
     }
-
+    if (!sync_directory(fs::u8path(I.staging), error)) {
+        abort();
+        return false;
+    }
     if (!publish_cache_files(I.staging, I.final_dir, error)) {
         abort();
         return false;

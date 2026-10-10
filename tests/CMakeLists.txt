@@ -296,6 +296,10 @@ add_executable(test-kpack-sidecar test-kpack-sidecar.cpp ../src/llama-kpack-side
 target_include_directories(test-kpack-sidecar PRIVATE ../include)
 target_link_libraries(test-kpack-sidecar PRIVATE ggml-base vendor::nlohmann Threads::Threads)
 target_compile_features(test-kpack-sidecar PRIVATE cxx_std_17)
+if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    target_compile_definitions(test-kpack-sidecar PRIVATE LLAMA_KPACK_TEST_FSYNC)
+    target_link_options(test-kpack-sidecar PRIVATE "-Wl,--wrap=fsync")
+endif()
 add_test(NAME test-kpack-sidecar COMMAND test-kpack-sidecar)
 set_tests_properties(test-kpack-sidecar PROPERTIES LABELS "kpack" TIMEOUT 60)
 

@@ -4,6 +4,7 @@
 
 #include <nlohmann/json.hpp>
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
@@ -24,6 +25,29 @@ static void check(bool ok, const std::string & message) {
         throw std::runtime_error(message);
     }
 }
+
+#ifdef LLAMA_KPACK_TEST_FSYNC
+static bool                  trace_sync = false;
+static size_t                fail_sync = 0, interrupt_sync = 0;
+static std::vector<fs::path> sync_paths;
+static std::vector<uint64_t> sync_sizes;
+
+extern "C" int __real_fsync(int fd);
+extern "C" int __wrap_fsync(int fd);
+
+extern "C" int __wrap_fsync(int fd) {
+    if (trace_sync) {
+        const auto path = fs::read_symlink("/proc/self/fd/" + std::to_string(fd));
+        sync_paths.push_back(path);
+        sync_sizes.push_back(fs::is_regular_file(path) ? fs::file_size(path) : 0);
+        if (sync_paths.size() == fail_sync || sync_paths.size() == interrupt_sync) {
+            errno = sync_paths.size() == interrupt_sync ? EINTR : EIO;
+            return -1;
+        }
+    }
+    return __real_fsync(fd);
+}
+#endif
 
 struct fixture {
     fs::path                                           root, source;
@@ -219,11 +243,70 @@ static void test_prefetch_coverage() {
     check(prefetch(UINT64_MAX, 0) && !prefetch(UINT64_MAX, UINT64_MAX), "coverage overflow");
 }
 
+#ifdef LLAMA_KPACK_TEST_FSYNC
+static void test_sync(fixture & f) {
+    // Fail each barrier separately, then retry an interrupted file sync.
+    for (size_t fault = 0; fault <= 6; ++fault) {
+        const auto                    dir = f.root / ("sync-" + std::to_string(fault));
+        std::string                   error;
+        llama_kpack_background_writer writer;
+        check(writer.prepare(dir.u8string(), f.source.u8string(), error), error);
+        const auto staging = f.staging(dir.filename().u8string());
+        check(staging.size() == 1, "sync fixture staging");
+        auto expected = std::vector<fs::path>{staging[0] / "weights.bin", staging[0] / "manifest.json", staging[0], dir,
+                                              dir.parent_path()};
+        fail_sync     = fault <= 5 ? fault : 0;
+        interrupt_sync = fault == 6 ? 1 : 0;
+        sync_paths.clear();
+        sync_sizes.clear();
+        trace_sync = true;
+        check(writer.start({f.jobs.front()}, f.inventory, 4096, error), error);
+        const bool ok = writer.wait(error);
+        trace_sync    = false;
+        check(ok == (fail_sync == 0), "sync error was not propagated");
+        if (fail_sync) {
+            check(!error.empty(), "sync error lacks context");
+            expected.resize(fail_sync);
+        } else if (interrupt_sync) {
+            expected.insert(expected.begin(), staging[0] / "weights.bin");
+        }
+        check(sync_paths == expected, "cache sync order differs");
+        check(sync_sizes.front() == f.payloads.front()->size(), "weights were not flushed before sync");
+        const size_t manifest_sync = interrupt_sync ? 2 : 1;
+        if (sync_sizes.size() > manifest_sync) {
+            check(sync_sizes[manifest_sync] > 0, "manifest was not flushed before sync");
+        }
+        check(f.staging(dir.filename().u8string()).empty(), "sync failure leaked staging");
+        if (fail_sync && fail_sync <= 3) {
+            check(!fs::exists(dir), "cache published before staging was synced");
+        } else {
+            // A post-publication sync error must not erase an already visible cache.
+            const auto count = sync_paths.size();
+            trace_sync       = true;
+            llama_kpack_sidecar_reader reader;
+            check(reader.open(dir.u8string(), error) && reader.load_unchecked(f.source.u8string(), f.inventory, error),
+                  error);
+            const auto * rec = reader.find(f.inventory.front().name);
+            check(reader.size() == 1 && rec &&
+                      memcmp(rec->planes.low, f.payloads.front()->data(), f.payloads.front()->size()) == 0,
+                  "synced cache payload differs");
+            trace_sync = false;
+            check(sync_paths.size() == count, "cache loading performs sync");
+        }
+    }
+    fail_sync = interrupt_sync = 0;
+    puts("KPACK_SIDECAR_SYNC PASS order=weights+manifest+staging+target+parent failures=5 retry=EINTR load_syncs=0");
+}
+#endif
+
 int main() try {
     fixture     f;
     std::string error;
     test_cache_directory(f);
     test_prefetch_coverage();
+#ifdef LLAMA_KPACK_TEST_FSYNC
+    test_sync(f);
+#endif
     const auto original = f.root / "complete";
     f.write(original);
     f.verify(original);
