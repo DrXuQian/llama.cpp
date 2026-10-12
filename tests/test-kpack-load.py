@@ -100,8 +100,8 @@ def tp_fixture(path, reference, count):
     records = []
     for q in (8, 10, 11, 12, 13, 14):
         block, block_bytes = gguf.GGML_QUANT_SIZES[gguf.GGMLQuantizationType(q)]
-        for case, axis in (('k', 0), ('n', 1), ('experts', 2), ('dim3', 3), ('mirror', 10),
-                           ('uneven-empty', 1), ('segments', 0)):
+        for case, axis in (('k', 0), ('n', 1), ('experts', 2), ('outer4d', 1), ('mirror', 10),
+                           ('uneven-empty', 1), ('segments-k', 0), ('segments-n', 1)):
             ne = [512, 256, 1, 1]
             widths, repeats = [], []
             coordinates = [[] for _ in range(count)]
@@ -111,9 +111,13 @@ def tp_fixture(path, reference, count):
                 repeats = [1]
                 if case == 'uneven-empty':
                     widths = [unit * (d + 1) for d in range(count - 1)] + [0]
-                if case == 'segments':
+                if case == 'segments-k':
                     widths = [256] * count + [512] * count
                     repeats = [2, 1]
+                if case == 'segments-n':
+                    widths = [256] * (2 * count)
+                    repeats = [1, 1]
+                    ne[2] = 2
                 position = 0
                 for s, repeat in enumerate(repeats):
                     for _ in range(repeat):
@@ -122,8 +126,8 @@ def tp_fixture(path, reference, count):
                             coordinates[d].extend(range(position, position + width))
                             position += width
                 ne[axis] = position
-            if axis == 3:
-                ne[2] = 2
+            if case == 'outer4d':
+                ne[2] = ne[3] = 2
             name = f'tp.q{q}.{case}.weight'
             raw = np.random.default_rng(q * 100 + axis).integers(
                 0, 256, (ne[3], ne[2], ne[1], ne[0] // block, block_bytes), dtype=np.uint8)
@@ -167,6 +171,7 @@ def tp_fixture(path, reference, count):
     writer.write_kv_data_to_file()
     writer.write_tensors_to_file()
     writer.close()
+    return len(records)
 
 
 def run_suite(args):
@@ -251,10 +256,10 @@ def run_suite(args):
         if not 2 <= count <= 16:
             raise ValueError('--tp-devices needs 2..16 logical ranks')
         tp = args.output / 'tp-reference.gguf'
-        tp_fixture(tp, args.reference, count)
+        tensors = tp_fixture(tp, args.reference, count)
         command = [str(args.cache_binary.resolve()), devices, str(tp), str(args.output / 'cache-tp')]
         run('tp-cache-cold', command + ['cold', 'tp'], env, 0, f'KPACK_TP_CACHE PASS ranks={count}')
-        run('tp-cache-hot', command + ['hot', 'tp'], env, 0, 'hits=42 gpu_shuffle=0')
+        run('tp-cache-hot', command + ['hot', 'tp'], env, 0, f'hits={tensors} gpu_shuffle=0')
         run('tp-cache-forward-rejected', command + ['hot', 'tp-reject'], env, None,
             'K-pack is load-only; inference is not enabled')
         manifest_path = args.output / 'cache-tp' / 'manifest.json'
@@ -262,11 +267,11 @@ def run_suite(args):
         for record in changed['tensors']:
             record['arrangement']['mapping_id'] ^= 1
         manifest_path.write_text(json.dumps(changed))
-        run('tp-cache-layout-miss', command + ['incompatible', 'tp'], env, 0, 'hits=0 gpu_shuffle=42')
+        run('tp-cache-layout-miss', command + ['incompatible', 'tp'], env, 0, f'hits=0 gpu_shuffle={tensors}')
         partial = command[:-1] + [str(args.output / 'cache-tp-partial')]
-        run('tp-cache-partial-cold', partial + ['cold-partial', 'tp'], env, 0, 'hits=0 gpu_shuffle=42')
-        run('tp-cache-partial-hot', partial + ['hot-partial', 'tp'], env, 0, 'hits=1 gpu_shuffle=41')
-        print(f'KPACK_TP_SUITE PASS formats=6 cases=42 logical_ranks={count} devices={devices}', flush=True)
+        run('tp-cache-partial-cold', partial + ['cold-partial', 'tp'], env, 0, f'hits=0 gpu_shuffle={tensors}')
+        run('tp-cache-partial-hot', partial + ['hot-partial', 'tp'], env, 0, f'hits=1 gpu_shuffle={tensors - 1}')
+        print(f'KPACK_TP_SUITE PASS formats=6 cases={tensors} logical_ranks={count} devices={devices}', flush=True)
     print(f'KPACK_LOAD_SUITE PASS formats=5 tensors=10 results={args.output}', flush=True)
 
 

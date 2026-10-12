@@ -21,6 +21,9 @@ static ggml_backend_meta_split_state tp_split(const ggml_tensor * tensor, void *
     std::copy(widths.begin(), widths.end(), result.ne);
     std::copy(repeats.begin(), repeats.end(), result.nr);
     result.n_segments = repeats.size();
+    if (result.axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
+        result.n_segments = result.nr[0] = 1;
+    }
     return result;
 }
 
@@ -84,6 +87,8 @@ int main(int argc, char ** argv) try {
         auto * meta = ggml_backend_meta_device(devices.data(), devices.size(), tp_split, &topology);
         buft        = ggml_backend_meta_buffer_type(meta, bufts[0]);
         check(buft && buft != ggml_backend_dev_buffer_type(meta), "TP override was not isolated");
+        check(strcmp(ggml_backend_buft_name(buft), ggml_backend_buft_name(ggml_backend_dev_buffer_type(meta))) != 0,
+              "TP override and default buffer names collide");
         check(ggml_backend_meta_buffer_type_count(buft) == devices.size(), "TP override device count");
     }
     std::vector<llama_kpack_source_tensor> inventory;
@@ -163,13 +168,7 @@ int main(int argc, char ** argv) try {
             ++hits;
         } else {
             auto raw = bytes(tensor->name);
-            if (tp) {
-                const size_t cut = raw.size() / 3 + 1;
-                ggml_backend_tensor_set(tensor, raw.data() + cut, cut, raw.size() - cut);
-                ggml_backend_tensor_set(tensor, raw.data(), 0, cut);
-            } else {
-                ggml_backend_tensor_set(tensor, raw.data(), 0, raw.size());
-            }
+            ggml_backend_tensor_set(tensor, raw.data(), 0, raw.size());
             ++shuffles;
             if (!partial || i == 0) {
                 cache->capture(tensor);

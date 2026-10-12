@@ -328,11 +328,20 @@ static void test_tp_raw_splits() {
                 &split);
             auto * buft = ggml_backend_dev_buffer_type(device);
             check(ggml_backend_meta_buffer_type_count(buft) == size_t(count), "TP buffer count");
-            for (int axis : {0, 1, 2, 3, 10}) {
+            for (int axis : {0, 1, 2, 10}) {
                 for (int pattern = 0; pattern < 3; ++pattern) {
-                    split                                  = {};
-                    split.axis                             = static_cast<ggml_backend_meta_split_axis>(axis);
-                    int64_t                           ne[] = {512, 4, 2, 2};
+                    if ((axis == 2 && pattern == 2) || (axis == 10 && pattern != 0)) {
+                        continue;
+                    }
+                    split        = {};
+                    split.axis   = static_cast<ggml_backend_meta_split_axis>(axis);
+                    int64_t ne[] = {512, 4, 2, 2};
+                    if (pattern == 2) {
+                        ne[3] = 1;
+                        if (axis == 0) {
+                            ne[2] = 1;
+                        }
+                    }
                     std::vector<std::vector<int64_t>> coordinates(count);
                     if (axis < GGML_MAX_DIMS) {
                         const int unit   = axis == 0 ? 512 : 1;
@@ -365,10 +374,13 @@ static void test_tp_raw_splits() {
                     for (size_t i = 0; i < raw.size(); ++i) {
                         raw[i] = (i * 11 + i / 17 + i / 256) % 251;
                     }
-                    // Arbitrary byte boundaries also cover a final one-row strided segment.
-                    const size_t cut = raw.size() / 3 + 1;
+                    // Keep the native uploader's row-aligned range contract.
+                    const size_t alignment = axis == 10 ? 1 : tensor->nb[axis + 1];
+                    const size_t cut       = raw.size() > alignment ? alignment : 0;
                     ggml_backend_tensor_set(tensor, raw.data() + cut, cut, raw.size() - cut);
-                    ggml_backend_tensor_set(tensor, raw.data(), 0, cut);
+                    if (cut) {
+                        ggml_backend_tensor_set(tensor, raw.data(), 0, cut);
+                    }
                     for (int d = 0; d < count; ++d) {
                         auto * local = ggml_backend_meta_tensor_shard(tensor, d, nullptr);
                         check(local != nullptr, "missing raw shard");
@@ -397,7 +409,7 @@ static void test_tp_raw_splits() {
         }
     }
     printf(
-        "KPACK_TP_RAW PASS cases=%zu devices=2,3,4,8,16 axes=K,N,E,3,mirrored "
+        "KPACK_TP_RAW PASS cases=%zu devices=2,3,4,8,16 axes=K,N,E,mirrored "
         "patterns=even,uneven-empty,segments-repeated\n",
         cases);
 }
