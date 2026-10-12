@@ -28,6 +28,8 @@ int32_t common_speculative_n_max(const common_params_speculative * spec);
 
 common_params common_base_params_to_speculative(const common_params & params);
 
+bool common_speculative_prepare_gpu_pipeline(common_speculative * spec);
+
 struct common_speculative_output_limits {
     int32_t total;
     int32_t per_seq;
@@ -75,6 +77,12 @@ bool common_speculative_can_process_before_sync(const common_speculative * spec,
 
 // generate drafts for the sequences specified with `common_speculative_get_draft_params`
 void common_speculative_draft(common_speculative * spec);
+
+// Decode the target batch, using a deferred GPU draft when available.
+int32_t common_speculative_decode(common_speculative * spec,
+                                  llama_context *      ctx_tgt,
+                                  llama_context *      ctx_dft,
+                                  llama_batch          batch);
 
 // informs the speculative context that n_accepted tokens were accepted by the target model
 void common_speculative_accept(common_speculative * spec, llama_seq_id, uint16_t n_accepted);

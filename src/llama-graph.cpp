@@ -1433,7 +1433,7 @@ void llm_graph_result::reset() {
     t_embd        = nullptr;
     t_embd_pooled = nullptr;
     t_h_nextn     = nullptr;
-    t_g_catchup   = nullptr;
+    t_g_draft_state = nullptr;
 
     t_layer_inp.resize(LLAMA_MAX_LAYERS + 1);
     std::fill(t_layer_inp.begin(), t_layer_inp.end(), nullptr);
@@ -1601,6 +1601,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     samplers         (params.samplers),
     cb_func          (params.cb),
     nextn_positions  (params.nextn_positions),
+    draft_tokens_input (params.draft_tokens_input),
     res              (params.res),
     ctx0             (res->get_ctx()),
     gf               (res->get_gf()) {
@@ -2433,6 +2434,13 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd) const {
     ggml_set_input(inp->tokens);
     res->t_inp_tokens = inp->tokens;
 
+    auto * token_ids = inp->tokens;
+    if (draft_tokens_input) {
+        auto * seed       = ggml_view_1d(ctx0, inp->tokens, 1, 0);
+        token_ids         = ggml_concat(ctx0, seed, draft_tokens_input, 0);
+        res->t_inp_tokens = token_ids;
+    }
+
     inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd_inp, ubatch.n_tokens);
     cb(inp->embd, "inp_embd", -1);
     ggml_set_input(inp->embd);
@@ -2445,7 +2453,7 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd) const {
     {
         auto & cur = inps[0];
 
-        cur = ggml_get_rows(ctx0, tok_embd, inp->tokens);
+        cur = ggml_get_rows(ctx0, tok_embd, token_ids);
 
         // apply lora for embedding tokens if needed
         for (const auto & lora : *loras) {
@@ -2457,10 +2465,10 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd) const {
             const float adapter_scale = lora.second;
             const float scale = lw->get_scale(lora.first->alpha, adapter_scale);
 
-            ggml_tensor * inpL_delta = ggml_scale(ctx0, ggml_mul_mat(
-                        ctx0, lw->b, // non-transposed lora_b
-                        ggml_get_rows(ctx0, lw->a, inp->tokens)
-                        ), scale);
+            ggml_tensor * inpL_delta = ggml_scale(ctx0,
+                                                  ggml_mul_mat(ctx0, lw->b,  // non-transposed lora_b
+                                                               ggml_get_rows(ctx0, lw->a, token_ids)),
+                                                  scale);
 
             cur = ggml_add(ctx0, cur, inpL_delta);
         }

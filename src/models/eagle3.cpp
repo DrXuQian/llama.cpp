@@ -190,8 +190,8 @@ llama_model_eagle3::graph<false>::graph(const llama_model & model, const llm_gra
     inp->from_graph = params.nextn_tokens != nullptr;
     inp->tokens     = inp->from_graph ? params.nextn_tokens : ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
     inp->embd       = inp->from_graph ? params.nextn_hidden : ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd, n_tokens);
-    const bool has_catchup_features = !params.nextn_features.layers.empty();
-    if (has_catchup_features) {
+    const bool has_draft_state_features = !params.nextn_features.layers.empty();
+    if (has_draft_state_features) {
         inp->embd = nullptr;
     }
     if (!inp->from_graph) {
@@ -205,7 +205,7 @@ llama_model_eagle3::graph<false>::graph(const llama_model & model, const llm_gra
     cb(inp_embd, "inp_embd", -1);
 
     ggml_tensor * inp_g = inp->embd;
-    if (has_catchup_features) {
+    if (has_draft_state_features) {
         const auto &  layers   = params.nextn_features.layers;
         ggml_tensor * features = layers[0];
         for (size_t i = 1; i < layers.size(); ++i) {
@@ -216,7 +216,7 @@ llama_model_eagle3::graph<false>::graph(const llama_model & model, const llm_gra
         }
         auto * encoded = build_lora_mm(model.fc, features);
         ggml_set_output(encoded);
-        res->t_g_catchup = encoded;
+        res->t_g_draft_state = encoded;
         ggml_build_forward_expand(gf, encoded);
         inp_g = ggml_view_2d(ctx0, encoded, n_embd, n_tokens, encoded->nb[1], 0);
     }

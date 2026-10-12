@@ -846,6 +846,7 @@ private:
     common_context_seq_rm_type ctx_dft_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
 
     common_speculative_ptr spec;
+    bool                   spec_gpu_pipeline = false;
 
     bool add_bos_token = true;
 
@@ -1195,7 +1196,14 @@ private:
         }
 
         if (spec) {
-            SRV_TRC("%s", "speculative decoding context initialized\n");
+            const int n_draft = params_base.speculative.draft.n_max;
+            spec_gpu_pipeline =
+                ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_PART &&
+                (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_PART ||
+                 (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && n_draft <= (int) llama_n_rs_seq(ctx_tgt))) &&
+                common_speculative_prepare_gpu_pipeline(spec.get());
+            SRV_TRC("speculative decoding context initialized, GPU pipeline = %s\n",
+                    spec_gpu_pipeline ? "enabled" : "disabled");
         } else {
             spec_init.reset();
             ctx_dft   = nullptr;
@@ -1700,6 +1708,12 @@ private:
 
             // TODO: getting pre sampling logits is not yet supported with backend sampling
             use_backend_sampling &= !need_pre_sample_logits;
+
+            if (spec_gpu_pipeline && !use_backend_sampling) {
+                SLT_INF(
+                    slot, "%s",
+                    "GPU NextN pipeline needs target backend sampling, falling back to normal speculative decoding\n");
+            }
 
             // TODO: tmp until backend sampling is fully implemented
             if (use_backend_sampling) {
@@ -3565,7 +3579,7 @@ private:
         bool       spec_ok             = true;
         const bool process_before_sync = spec && common_speculative_can_process_before_sync(spec.get(), batch_view);
         queue_tasks.yield_to_queue([&]() {
-            ret = llama_decode(ctx_tgt, batch_view);
+            ret = common_speculative_decode(spec.get(), ctx_tgt, ctx_dft, batch_view);
             if (ret == 0 && process_before_sync) {
                 spec_ok = common_speculative_process(spec.get(), batch_view);
             }

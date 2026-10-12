@@ -600,7 +600,7 @@ void llama_context::sched_reserve() {
 
     LLAMA_LOG_DEBUG("%s: max_nodes = %zu\n", __func__, max_nodes);
 
-    nextn_graph.reset();
+    nextn_chain.reset();
 
     gf_res_prev.reset(new llm_graph_result(max_nodes));
     gf_res_reserve.reset(new llm_graph_result(max_nodes));
@@ -1339,7 +1339,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // the new graph parameters
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
     auto gparams                  = graph_params(res, ubatch, mctx, gtype);
-    gparams.nextn_features.layers = catchup_copy.dst;
+    gparams.nextn_features.layers = draft_state_copy.dst;
+    gparams.draft_tokens_input    = verify_copy.src_backend ? verify_handoff->input : nullptr;
 
     if (!graph_reuse_disable && res->can_reuse(gparams)) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
@@ -1387,11 +1388,14 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
 
-    if (catchup_copy.src_backend) {
+    auto * deferred_copy = draft_state_copy.src_backend ? &draft_state_copy :
+                           verify_copy.src_backend      ? &verify_copy :
+                                                          nullptr;
+    if (deferred_copy) {
         ggml_backend_sched_set_before_compute_callback(
             sched.get(),
             [](ggml_backend_t backend, void * user_data) {
-                auto & copy = *static_cast<llama_catchup_copy *>(user_data);
+                auto & copy = *static_cast<llama_deferred_copy *>(user_data);
                 if (backend != copy.dst_backend || copy.submitted) {
                     return true;
                 }
@@ -1402,11 +1406,11 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                 copy.submitted = true;
                 return true;
             },
-            &catchup_copy);
+            deferred_copy);
     }
 
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
-    if (catchup_copy.src_backend) {
+    if (deferred_copy) {
         ggml_backend_sched_set_before_compute_callback(sched.get(), nullptr, nullptr);
     }
     if (status != GGML_STATUS_SUCCESS) {
@@ -2051,20 +2055,17 @@ int llama_context::decode(const llama_batch & batch_inp) {
     return 0;
 }
 
-static bool catchup_handoff_ensure(std::unique_ptr<llama_catchup_handoff> & handoff,
-                                   ggml_backend_t                           backend,
-                                   ggml_backend_dev_t                       dev,
-                                   int64_t                                  feature_dim,
-                                   int64_t                                  hidden_dim,
-                                   int64_t                                  n_rows,
-                                   size_t                                   n_layers) {
-    if (handoff && handoff->features.size() == n_layers && handoff->features[0]->ne[0] == feature_dim &&
-        handoff->features[0]->ne[1] == n_rows && handoff->output_g->ne[0] == hidden_dim &&
-        handoff->output_g->ne[1] == n_rows) {
+static bool draft_state_handoff_ensure(std::unique_ptr<llama_draft_state_handoff> & handoff,
+                                       ggml_backend_t                               backend,
+                                       ggml_backend_dev_t                           dev,
+                                       int64_t                                      feature_dim,
+                                       int64_t                                      hidden_dim,
+                                       int64_t                                      n_rows,
+                                       size_t                                       n_layers) {
+    if (handoff) {
         return true;
     }
-    handoff.reset();
-    auto state = std::make_unique<llama_catchup_handoff>();
+    auto state = std::make_unique<llama_draft_state_handoff>();
     state->ctx.reset(ggml_init({(n_layers + 1) * ggml_tensor_overhead(), nullptr, true}));
     state->features.resize(n_layers);
     for (auto & feature : state->features) {
@@ -2084,34 +2085,23 @@ static bool catchup_handoff_ensure(std::unique_ptr<llama_catchup_handoff> & hand
     return true;
 }
 
-bool llama_context::decode_catchup_async(llama_context & source, const llama_batch & batch, const float ** g_out) {
+bool llama_context::update_draft_state_async(llama_context & target, const llama_batch & batch, const float ** g_out) {
     // reuse the target's fresh hidden states: copy them draft-side by D2D, so the fused encoder
-    // and catch-up decode never touch the host
+    // and the draft state update never touches the host
     // the encoder gets one row more than the decoder: the extra row makes the g for the new
     // deferred boundary, which the caller keeps for the next round instead of decoding it
     // TODO: eagle3-only; MTP needs its own feature source
-    if (!g_out) {
-        return false;
-    }
+    GGML_ASSERT(g_out);
     *g_out               = nullptr;
     const int n          = batch.n_tokens;
     const int n_features = n + 1;
-    if (&source == this || n > (int) cparams.n_ubatch || cparams.pipeline_parallel || cparams.cb_eval || opt_ctx ||
-        !dynamic_cast<llama_kv_cache *>(memory.get()) || source.cparams.embeddings_nextn_masked ||
-        source.cparams.pooling_type != LLAMA_POOLING_TYPE_NONE || sched_need_reserve || model.devices.size() != 1 ||
-        source.model.devices.size() != 1 || model.devices[0].dev != source.model.devices[0].dev ||
-        model.n_gpu_layers() <= model.hparams.n_layer_all || source.balloc->get_n_tokens() != (uint32_t) n_features) {
+    if (sched_need_reserve || target.balloc->get_n_tokens() != (uint32_t) n_features ||
+        (nextn_chain && nextn_chain->prefetched) || target.gf_res_prev->t_sampled.size() != (size_t) n_features) {
         return false;
     }
 
-    // the D2D handoff needs both contexts on the same CUDA device
-    auto * src_backend = source.backend_ptrs[0];
+    auto * src_backend = target.backend_ptrs[0];
     auto * dst_backend = backend_ptrs[0];
-    auto * dev         = ggml_backend_get_device(dst_backend);
-    if (!dev || ggml_backend_get_device(src_backend) != dev ||
-        strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(dev)), "CUDA") != 0) {
-        return false;
-    }
 
     const llama_seq_id seq_id = batch.seq_id[0][0];
 
@@ -2123,53 +2113,35 @@ bool llama_context::decode_catchup_async(llama_context & source, const llama_bat
 
     const int64_t dim      = model.hparams.n_embd_out();
     const size_t  n_layers = model.target_layer_ids.size();
-    if (n_layers == 0 || model.hparams.n_embd_inp_enc() % (int64_t) n_layers != 0) {
-        return false;
-    }
+    GGML_ASSERT(n_layers > 0 && model.hparams.n_embd_inp_enc() % (int64_t) n_layers == 0);
     const int64_t feature_dim = model.hparams.n_embd_inp_enc() / (int64_t) n_layers;
-    if (feature_dim != source.model.hparams.n_embd) {
-        return false;
-    }
+    GGML_ASSERT(feature_dim == target.model.hparams.n_embd);
 
-    // the target hidden states still live in the source graph result
+    // the target hidden states still live in the target graph result
     std::vector<ggml_tensor *> hidden(n_layers);
     for (size_t layer = 0; layer < n_layers; ++layer) {
         const int id = model.target_layer_ids[layer];
-        ggml_tensor * tensor;
-        if (id >= 0 && id < (int) source.model.hparams.n_layer() && source.cparams.embeddings_layer_inp[id]) {
-            tensor = source.gf_res_prev->get_layer_inp(id);
-        } else if (id == (int) source.model.hparams.n_layer() && source.cparams.embeddings_nextn) {
-            tensor = source.gf_res_prev->get_h_nextn();
-        } else {
-            return false;
-        }
-        // they must be contiguous device tensors on the source backend, ready for a D2D copy
+        ggml_tensor * tensor = id < (int) target.model.hparams.n_layer() ? target.gf_res_prev->get_layer_inp(id) :
+                                                                           target.gf_res_prev->get_h_nextn();
+        // they must be contiguous device tensors on the target backend, ready for a D2D copy
         if (!tensor || !tensor->buffer || tensor->type != GGML_TYPE_F32 || tensor->ne[0] != feature_dim ||
             tensor->ne[1] != n_features || !ggml_is_contiguous(tensor) || ggml_backend_buffer_is_host(tensor->buffer) ||
-            ggml_backend_sched_get_tensor_backend(source.sched.get(), tensor) != src_backend) {
+            ggml_backend_sched_get_tensor_backend(target.sched.get(), tensor) != src_backend) {
             return false;
         }
         hidden[layer] = tensor;
     }
 
-    // draft-side landing buffer for the copied features; row count only changes with the draft
-    // count, which rebuilds the graph anyway
-    if (catchup_handoff &&
-        (catchup_handoff->features.size() != n_layers || catchup_handoff->features[0]->ne[1] != n_features)) {
-        synchronize();
-    }
-    if (!catchup_handoff_ensure(catchup_handoff, dst_backend, dev, feature_dim, dim, n_features, n_layers)) {
-        return false;
-    }
+    GGML_ASSERT(draft_state_handoff);
 
     // the before-compute callback submits the D2D copy once the draft split is ready; no host input
-    auto & state              = *catchup_handoff;
-    catchup_copy              = {src_backend, dst_backend, std::move(hidden), state.features};
+    auto & state              = *draft_state_handoff;
+    draft_state_copy          = {src_backend, dst_backend, std::move(hidden), state.features};
     auto decode_batch         = batch;
     decode_batch.embd         = nullptr;
     const int  ret            = decode(decode_batch);
-    const bool copy_submitted = catchup_copy.submitted;
-    catchup_copy              = {};
+    const bool copy_submitted = draft_state_copy.submitted;
+    draft_state_copy          = {};
     if (ret != 0 || !copy_submitted) {
         synchronize();
         // drop the seed row too, so the next draft() rebuilds it through the host bridge
@@ -2177,7 +2149,7 @@ bool llama_context::decode_catchup_async(llama_context & source, const llama_bat
         return false;
     }
 
-    auto * g = gf_res_prev->get_g_catchup();
+    auto * g = gf_res_prev->get_g_draft_state();
     if (!g || g->ne[0] != dim || g->ne[1] != n_features) {
         synchronize();
         memory->seq_rm(seq_id, seed_pos, -1);
@@ -2192,14 +2164,14 @@ bool llama_context::decode_catchup_async(llama_context & source, const llama_bat
 }
 
 bool llama_context::build_nextn_chain(llama_kv_cache_context * kv_ctx, int32_t n_draft, int64_t dim) {
-    if (!nextn_graph || (int) nextn_graph->params.size() != n_draft) {
+    if (!nextn_chain) {
         const size_t max_nodes = graph_max_nodes(1) * n_draft;
-        nextn_graph.reset(new llama_nextn_graph);
-        nextn_graph->res.reset(new llm_graph_result(max_nodes));
-        nextn_graph->sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(),
+        nextn_chain.reset(new llama_nextn_chain);
+        nextn_chain->res.reset(new llm_graph_result(max_nodes));
+        nextn_chain->sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(),
                                                         max_nodes, false, cparams.op_offload));
     }
-    auto & chain      = *nextn_graph;
+    auto & chain      = *nextn_chain;
     auto * res        = chain.res.get();
     // build graph parameters for one chain step
     auto   params_for = [&](int i, ggml_tensor * nextn_tokens, ggml_tensor * nextn_hidden,
@@ -2239,18 +2211,19 @@ bool llama_context::build_nextn_chain(llama_kv_cache_context * kv_ctx, int32_t n
     chain.params.clear();
     chain.candidates.clear();
     chain.logits.clear();
+    chain.tokens.clear();
     n_inputs_per_step = 0;
 
     auto * ctx             = res->get_ctx();
-    auto * inp_draft       = nextn_lookahead->inp_draft;
-    auto * inp_weights     = nextn_lookahead->inp_weights;
-    auto * inp_positions   = nextn_lookahead->inp_positions;
-    auto * sampled         = nextn_lookahead->sampled;
+    auto * inp_draft       = nextn_input->inp_draft;
+    auto * inp_weights     = nextn_input->inp_weights;
+    auto * inp_positions   = nextn_input->inp_positions;
+    auto * sampled         = nextn_input->sampled;
     auto * mismatch        = ggml_step(ctx, ggml_abs(ctx, ggml_sub(ctx, ggml_cast(ctx, sampled, GGML_TYPE_F32),
                                                                    ggml_cast(ctx, inp_draft, GGML_TYPE_F32))));
     auto * accepted        = ggml_argmax(ctx, ggml_mul(ctx, mismatch, inp_weights));
     auto * selected_token  = ggml_get_rows(ctx, ggml_reshape_2d(ctx, sampled, 1, n_draft + 1), accepted);
-    auto * selected_hidden = ggml_get_rows(ctx, catchup_handoff->output_g, accepted);
+    auto * selected_hidden = ggml_get_rows(ctx, draft_state_handoff->output_g, accepted);
     auto * nextn_pos =
         ggml_cast(ctx, ggml_add(ctx, inp_positions, ggml_cast(ctx, accepted, GGML_TYPE_F32)), GGML_TYPE_I32);
     // draft chain runs serially, so each step only needs the previous step's token/hidden
@@ -2275,6 +2248,7 @@ bool llama_context::build_nextn_chain(llama_kv_cache_context * kv_ctx, int32_t n
         ggml_build_forward_expand(res->get_gf(), token);
         chain.candidates.push_back(ids);
         chain.logits.push_back(top_k_logits);
+        chain.tokens.push_back(token);
         prev_tokens = token;
         prev_hidden = res->get_h_nextn();
         // every step adds the same inputs, so keep one per-step count instead of per-step ends
@@ -2299,25 +2273,10 @@ bool llama_context::build_nextn_chain(llama_kv_cache_context * kv_ctx, int32_t n
 }
 
 bool llama_context::decode_nextn_async(llama_context & source, const llama_batch & batch) {
-    const int n_draft  = batch.n_tokens;
-    const int n_verify = n_draft + 1;
+    const int n_draft = batch.n_tokens;
 
-    // not yet supported by the dynamic attention inputs or F32 acceptance arithmetic
-    if (model.hparams.n_pos_per_embd() != 1 || model.hparams.n_swa || model.hparams.use_alibi || !cparams.flash_attn ||
-        batch.pos[0] > (1 << 24) - 2 * n_verify || model.vocab.n_tokens() > (1u << 24)) {
-        return false;
-    }
-
-    // require one free prefetch slot, one sample per verify row, and enough output capacity
-    if ((nextn_graph && nextn_graph->prefetched) || source.gf_res_prev->t_sampled.size() != (size_t) n_verify ||
-        n_draft > (int32_t) cparams.n_outputs_max) {
-        return false;
-    }
-
-    // dynamic KV indexing requires one unshifted, unquantized stream
     auto * kv = static_cast<llama_kv_cache *>(memory.get());
-    if (kv->get_n_stream() != 1 || kv->get_has_shift() || ggml_is_quantized(kv->type_k()) ||
-        ggml_is_quantized(kv->type_v())) {
+    if (kv->get_has_shift()) {
         return false;
     }
 
@@ -2330,15 +2289,8 @@ bool llama_context::decode_nextn_async(llama_context & source, const llama_batch
         return false;
     }
 
-    // GPU acceptance reads one scalar I32 sample per verification row from the source backend
     auto * src_backend = source.backend_ptrs[0];
     auto * dst_backend = backend_ptrs[0];
-    for (auto * sampled : source.gf_res_prev->t_sampled) {
-        if (!sampled || !sampled->buffer || sampled->type != GGML_TYPE_I32 || ggml_nelements(sampled) != 1 ||
-            ggml_backend_sched_get_tensor_backend(source.sched.get(), sampled) != src_backend) {
-            return false;
-        }
-    }
 
     sched_reserve();
     memory_update(false);
@@ -2364,7 +2316,7 @@ bool llama_context::decode_nextn_async(llama_context & source, const llama_batch
     auto fail         = [&]() {
         synchronize();
         memory->seq_rm(seq_id, seed_pos, -1);
-        nextn_graph.reset();
+        nextn_chain.reset();
         if (stamped_here) {
             t_compute_start_us = 0;
         }  // only undo our own stamp
@@ -2375,7 +2327,8 @@ bool llama_context::decode_nextn_async(llama_context & source, const llama_batch
     if (!mctx || mctx->get_status() != LLAMA_MEMORY_STATUS_SUCCESS) {
         return false;
     }
-    if (mctx->get_ubatch().n_tokens != (uint32_t) n_draft || !mctx->apply()) {
+    GGML_ASSERT(mctx->get_ubatch().n_tokens == (uint32_t) n_draft);
+    if (!mctx->apply()) {
         return fail();
     }
     auto * kv_ctx = static_cast<llama_kv_cache_context *>(mctx.get());
@@ -2392,7 +2345,7 @@ bool llama_context::decode_nextn_async(llama_context & source, const llama_batch
     if (!build_nextn_chain(kv_ctx, n_draft, dim)) {
         return fail();
     }
-    auto & chain = *nextn_graph;
+    auto &       chain             = *nextn_chain;
     auto * res   = chain.res.get();
     const size_t n_inputs_per_step = res->inputs.size() / n_draft;
     for (int i = 0; i < n_draft; i++) {
@@ -2424,21 +2377,19 @@ bool llama_context::decode_nextn_async(llama_context & source, const llama_batch
     return true;
 }
 
-void llama_context::synchronize_catchup() {
-    GGML_ASSERT(catchup_handoff && catchup_handoff->host && catchup_handoff->ready && catchup_handoff->output_g);
-    ggml_backend_event_synchronize(catchup_handoff->ready.get());
+void llama_context::synchronize_draft_state() {
+    GGML_ASSERT(draft_state_handoff && draft_state_handoff->host && draft_state_handoff->ready &&
+                draft_state_handoff->output_g);
+    ggml_backend_event_synchronize(draft_state_handoff->ready.get());
 }
 
 bool llama_context::commit_nextn(llama_pos seed_pos) {
-    if (!nextn_graph || !nextn_graph->prefetched || !nextn_lookahead) {
+    if (!nextn_chain || !nextn_chain->prefetched || !nextn_input) {
         return false;
     }
-    auto &        chain   = *nextn_graph;
-    auto &        state   = *nextn_lookahead;
+    auto &        chain   = *nextn_chain;
+    auto &        state   = *nextn_input;
     const int32_t n_draft = (int32_t) chain.params.size();
-    chain.prefetched      = false;
-
-    ggml_backend_sched_synchronize(chain.sched.get());
 
     const auto                  dim = model.hparams.n_embd_out();
     std::vector<llama_pos>      positions(n_draft);
@@ -2463,37 +2414,149 @@ bool llama_context::commit_nextn(llama_pos seed_pos) {
     return true;
 }
 
+void llama_context::discard_nextn() {
+    if (!nextn_chain) {
+        return;
+    }
+
+    auto & chain = *nextn_chain;
+    if (chain.prefetched) {
+        ggml_backend_sched_synchronize(chain.sched.get());
+    }
+    chain.prefetched = false;
+}
+
+bool llama_context::prepare_nextn_gpu_pipeline(llama_context & draft, int32_t n_draft) {
+    if (draft.model.arch != LLM_ARCH_EAGLE3 || n_draft <= 0) {
+        return false;
+    }
+    const int64_t n_verify = (int64_t) n_draft + 1;
+    if (cparams.ctx_type != LLAMA_CONTEXT_TYPE_DEFAULT || cparams.n_seq_max != 1 || cparams.pipeline_parallel ||
+        cparams.cb_eval || opt_ctx || cparams.pooling_type != LLAMA_POOLING_TYPE_NONE ||
+        cparams.embeddings_nextn_masked || n_verify > (int64_t) cparams.n_ubatch) {
+        return false;
+    }
+    if (draft.cparams.ctx_type != LLAMA_CONTEXT_TYPE_DEFAULT || draft.cparams.n_seq_max != 1 ||
+        draft.cparams.pipeline_parallel || draft.cparams.cb_eval || draft.opt_ctx || !draft.cparams.flash_attn ||
+        n_draft > (int32_t) draft.cparams.n_ubatch || n_draft > (int32_t) draft.cparams.n_outputs_max) {
+        return false;
+    }
+    if ((model.arch != LLM_ARCH_QWEN3 && model.arch != LLM_ARCH_QWEN3MOE) || !model.tok_embd ||
+        !model.tok_embd->buffer || ggml_backend_buffer_is_host(model.tok_embd->buffer) || model.devices.size() != 1 ||
+        draft.model.devices.size() != 1 || model.n_gpu_layers() <= model.hparams.n_layer_all ||
+        draft.model.n_gpu_layers() <= draft.model.hparams.n_layer_all || draft.model.hparams.n_pos_per_embd() != 1 ||
+        draft.model.hparams.n_swa || draft.model.hparams.use_alibi || draft.model.vocab.n_tokens() > (1u << 24) ||
+        model.vocab.n_tokens() != draft.model.vocab.n_tokens()) {
+        return false;
+    }
+
+    const size_t n_layers = draft.model.target_layer_ids.size();
+    if (n_layers == 0 || draft.model.hparams.n_embd_inp_enc() % (int64_t) n_layers != 0 ||
+        draft.model.hparams.n_embd_inp_enc() / (int64_t) n_layers != model.hparams.n_embd) {
+        return false;
+    }
+    for (const int id : draft.model.target_layer_ids) {
+        if (id < 0 || id > (int) model.hparams.n_layer() ||
+            (id < (int) model.hparams.n_layer() && !cparams.embeddings_layer_inp[id]) ||
+            (id == (int) model.hparams.n_layer() && !cparams.embeddings_nextn)) {
+            return false;
+        }
+    }
+
+    auto * kv = dynamic_cast<llama_kv_cache *>(draft.memory.get());
+    if (!kv || kv->get_n_stream() != 1 || ggml_is_quantized(kv->type_k()) || ggml_is_quantized(kv->type_v())) {
+        return false;
+    }
+
+    auto * target_backend = backend_ptrs[0];
+    auto * draft_backend  = draft.backend_ptrs[0];
+    auto * dev            = ggml_backend_get_device(target_backend);
+    if (!dev || ggml_backend_get_device(draft_backend) != dev ||
+        strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(dev)), "CUDA") != 0) {
+        return false;
+    }
+
+    const int64_t feature_dim = model.hparams.n_embd;
+    const int64_t hidden_dim  = draft.model.hparams.n_embd_out();
+    if (!draft_state_handoff_ensure(draft.draft_state_handoff, draft_backend, dev, feature_dim, hidden_dim, n_verify,
+                                    n_layers)) {
+        return false;
+    }
+
+    if (!draft.nextn_input) {
+        auto         state     = std::make_unique<llama_nextn_input>();
+        const size_t n_tensors = 4 + (size_t) n_verify;
+        state->ctx.reset(ggml_init({n_tensors * ggml_tensor_overhead(), nullptr, true}));
+        state->sampled       = ggml_new_tensor_1d(state->ctx.get(), GGML_TYPE_I32, n_verify);
+        state->inp_draft     = ggml_new_tensor_1d(state->ctx.get(), GGML_TYPE_I32, n_verify);
+        state->inp_weights   = ggml_new_tensor_1d(state->ctx.get(), GGML_TYPE_F32, n_verify);
+        state->inp_positions = ggml_new_tensor_1d(state->ctx.get(), GGML_TYPE_F32, n_draft);
+        for (int32_t i = 0; i < n_verify; ++i) {
+            state->rows.push_back(ggml_view_1d(state->ctx.get(), state->sampled, 1, i * sizeof(llama_token)));
+        }
+        state->device.reset(ggml_backend_alloc_ctx_tensors(state->ctx.get(), draft_backend));
+        if (!state->device) {
+            return false;
+        }
+        std::vector<float> weights(n_verify);
+        for (int32_t i = 0; i < n_verify; ++i) {
+            weights[i] = n_verify - i;
+        }
+        ggml_backend_tensor_set(state->inp_weights, weights.data(), 0, ggml_nbytes(state->inp_weights));
+        draft.nextn_input = std::move(state);
+    }
+
+    if (!verify_handoff) {
+        auto         state     = std::make_unique<llama_verify_handoff>();
+        const size_t n_tensors = 1 + (size_t) n_draft;
+        state->ctx.reset(ggml_init({n_tensors * ggml_tensor_overhead(), nullptr, true}));
+        state->input = ggml_new_tensor_1d(state->ctx.get(), GGML_TYPE_I32, n_draft);
+        for (int32_t i = 0; i < n_draft; i++) {
+            state->input_tokens.push_back(ggml_view_1d(state->ctx.get(), state->input, 1, i * sizeof(llama_token)));
+        }
+        state->device.reset(ggml_backend_alloc_ctx_tensors(state->ctx.get(), target_backend));
+        if (!state->device) {
+            return false;
+        }
+        verify_handoff = std::move(state);
+    }
+
+    return true;
+}
+
+int32_t llama_context::decode_speculative_verify(llama_context & draft, const llama_batch & batch) {
+    GGML_ASSERT(verify_handoff && draft.nextn_chain && draft.nextn_chain->prefetched);
+
+    auto &    state   = *verify_handoff;
+    auto &    chain   = *draft.nextn_chain;
+    const int n_draft = (int) chain.tokens.size();
+    GGML_ASSERT(n_draft > 0 && batch.n_tokens == n_draft + 1);
+    GGML_ASSERT((int) state.input_tokens.size() == n_draft);
+
+    auto * dst_backend = backend_ptrs[0];
+    auto * src_backend = draft.backend_ptrs[0];
+
+    verify_copy               = {src_backend, dst_backend, chain.tokens, state.input_tokens};
+    int32_t    result         = decode(batch);
+    const bool copy_submitted = verify_copy.submitted;
+    verify_copy               = {};
+    ggml_backend_sched_synchronize(chain.sched.get());
+    chain.prefetched = false;
+    if (result == 0 && !copy_submitted) {
+        LLAMA_LOG_ERROR("%s: target token copy was not submitted\n", __func__);
+        result = -3;  // llama_decode maps GGML_STATUS_FAILED to -3
+    }
+    return result;
+}
+
 bool llama_context::prepare_nextn_input(llama_context &     source,
                                         const llama_batch & batch,
                                         ggml_backend_t      src_backend,
                                         ggml_backend_t      dst_backend) {
     const int n_draft  = batch.n_tokens;
     const int n_verify = n_draft + 1;
-    if (nextn_lookahead && nextn_lookahead->sampled->ne[0] != n_verify) {
-        nextn_lookahead.reset();
-    }
-    if (!nextn_lookahead) {
-        auto la = std::make_unique<llama_nextn_lookahead>();
-        la->ctx.reset(ggml_init({(size_t) (n_verify + 4) * ggml_tensor_overhead(), nullptr, true}));
-        la->sampled       = ggml_new_tensor_1d(la->ctx.get(), GGML_TYPE_I32, n_verify);
-        la->inp_draft     = ggml_new_tensor_1d(la->ctx.get(), GGML_TYPE_I32, n_verify);
-        la->inp_weights   = ggml_new_tensor_1d(la->ctx.get(), GGML_TYPE_F32, n_verify);
-        la->inp_positions = ggml_new_tensor_1d(la->ctx.get(), GGML_TYPE_F32, n_draft);
-        for (int i = 0; i < n_verify; ++i) {
-            la->rows.push_back(ggml_view_1d(la->ctx.get(), la->sampled, 1, i * sizeof(llama_token)));
-        }
-        la->device.reset(ggml_backend_alloc_ctx_tensors(la->ctx.get(), dst_backend));
-        if (!la->device) {
-            return false;
-        }
-        std::vector<float> weights(n_verify);
-        for (int i = 0; i < n_verify; ++i) {
-            weights[i] = n_verify - i;
-        }
-        ggml_backend_tensor_set(la->inp_weights, weights.data(), 0, ggml_nbytes(la->inp_weights));
-        nextn_lookahead = std::move(la);
-    }
-    auto & state = *nextn_lookahead;
+    GGML_ASSERT(nextn_input);
+    auto & state = *nextn_input;
     for (int i = 0; i < n_verify; ++i) {
         ggml_backend_tensor_copy_async(src_backend, dst_backend, source.gf_res_prev->t_sampled[i], state.rows[i]);
     }
@@ -2515,10 +2578,10 @@ bool llama_context::prepare_nextn_input(llama_context &     source,
 //
 
 uint32_t llama_context::output_reserve(int32_t n_outputs) {
-    if (nextn_graph && nextn_graph->prefetched) {
-        auto & chain     = *nextn_graph;
-        chain.prefetched = false;
+    if (nextn_chain && nextn_chain->prefetched) {
+        auto & chain = *nextn_chain;
         ggml_backend_sched_synchronize(chain.sched.get());
+        chain.prefetched = false;
         LLAMA_LOG_DEBUG("%s: discarded stale NextN prefetch\n", __func__);
     }
 
@@ -3772,14 +3835,14 @@ llama_memory_breakdown llama_context::memory_breakdown() const {
             ggml_backend_buffer_type_t buft    = ggml_backend_sched_get_buffer_type(sched.get(), backend);
             ret[buft].compute += ggml_backend_sched_get_buffer_size(sched.get(), backend);
             // nextn chain runs on its own sched, so add its compute buffers too
-            if (nextn_graph) {
-                ret[buft].compute += ggml_backend_sched_get_buffer_size(nextn_graph->sched.get(), backend);
+            if (nextn_chain) {
+                ret[buft].compute += ggml_backend_sched_get_buffer_size(nextn_chain->sched.get(), backend);
             }
         }
     }
-    if (catchup_handoff) {
-        ret[ggml_backend_buffer_get_type(catchup_handoff->device.get())].compute +=
-            ggml_backend_buffer_get_size(catchup_handoff->device.get());
+    if (draft_state_handoff) {
+        ret[ggml_backend_buffer_get_type(draft_state_handoff->device.get())].compute +=
+            ggml_backend_buffer_get_size(draft_state_handoff->device.get());
     }
     return ret;
 }
@@ -4278,12 +4341,27 @@ bool llama_decode_nextn_async(llama_context * ctx, llama_context * source, llama
     return ctx->decode_nextn_async(*source, batch);
 }
 
-bool llama_decode_catchup_async(llama_context * ctx, llama_context * source, llama_batch batch, const float ** g_out) {
-    return ctx->decode_catchup_async(*source, batch, g_out);
+bool llama_prepare_nextn_gpu_pipeline(llama_context * ctx, llama_context * draft, int32_t n_draft) {
+    return ctx->prepare_nextn_gpu_pipeline(*draft, n_draft);
 }
 
-void llama_synchronize_catchup(llama_context * ctx) {
-    ctx->synchronize_catchup();
+int32_t llama_decode_speculative_verify(llama_context * ctx, llama_context * draft, llama_batch batch) {
+    return ctx->decode_speculative_verify(*draft, batch);
+}
+
+void llama_discard_nextn(llama_context * ctx) {
+    ctx->discard_nextn();
+}
+
+bool llama_update_draft_state_async(llama_context * draft,
+                                    llama_context * target,
+                                    llama_batch     batch,
+                                    const float **  g_out) {
+    return draft->update_draft_state_async(*target, batch, g_out);
+}
+
+void llama_synchronize_draft_state(llama_context * draft) {
+    draft->synchronize_draft_state();
 }
 
 bool llama_commit_nextn(llama_context * ctx, llama_pos seed_pos) {

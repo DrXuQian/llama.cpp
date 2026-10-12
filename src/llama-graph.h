@@ -792,7 +792,7 @@ using llm_graph_cb = std::function<void(const llama_ubatch & ubatch, ggml_tensor
 
 class llm_graph_result;
 
-// target hidden states copied draft-side for the EAGLE3 catch-up encoder input
+// target hidden states copied draft-side for the EAGLE3 draft state encoder input
 // TODO: only eagle3 fills this; MTP needs its own feature source
 struct llm_nextn_features {
     std::vector<ggml_tensor *> layers;
@@ -846,11 +846,16 @@ struct llm_graph_params {
     ggml_tensor * nextn_tokens = nullptr;
     ggml_tensor * nextn_hidden = nullptr;
     ggml_tensor *      nextn_positions = nullptr;
+    ggml_tensor *      draft_tokens_input = nullptr;
     llm_nextn_features nextn_features;
 
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
     bool allow_reuse(const llm_graph_params & other) const {
+        if (draft_tokens_input != other.draft_tokens_input) {
+            return false;
+        }
+
         // first check the ubatch
         bool can_reuse_ubatch =
             ubatch.equal_seqs() == other.ubatch.equal_seqs() &&
@@ -904,7 +909,7 @@ struct llm_graph_params {
             }
         }
 
-        // all null outside the nextn chain and the catch-up, so this only fires for those paths
+        // all null outside the nextn chain and the draft state update, so this only fires for those paths
         // they change the graph input wiring - no other check covers that
         if (nextn_tokens != other.nextn_tokens || nextn_hidden != other.nextn_hidden ||
             nextn_positions != other.nextn_positions || nextn_features != other.nextn_features) {
@@ -947,7 +952,7 @@ public:
     ggml_tensor * get_embd_pooled() const { return t_embd_pooled; }
     ggml_tensor * get_h_nextn()     const { return t_h_nextn; }
 
-    ggml_tensor * get_g_catchup() const { return t_g_catchup; }
+    ggml_tensor * get_g_draft_state() const { return t_g_draft_state; }
 
     ggml_tensor * get_layer_inp(int il) const { return t_layer_inp[il]; }
 
@@ -983,7 +988,7 @@ public:
     ggml_tensor * t_embd        = nullptr;
     ggml_tensor * t_embd_pooled = nullptr;
     ggml_tensor * t_h_nextn     = nullptr; // [n_embd, n_outputs] hidden state before final output norm
-    ggml_tensor * t_g_catchup   = nullptr;  // [n_embd_out, n+1] fused encoder g, read back to host in decode_catchup
+    ggml_tensor * t_g_draft_state = nullptr;  // [n_embd_out, n+1] fused encoder g for the draft state update
 
     std::vector<ggml_tensor *> t_layer_inp;
 
@@ -1080,6 +1085,7 @@ struct llm_graph_context {
     const llm_graph_cb & cb_func;
 
     ggml_tensor * nextn_positions;
+    ggml_tensor * draft_tokens_input;
 
     llm_graph_result * res;
 

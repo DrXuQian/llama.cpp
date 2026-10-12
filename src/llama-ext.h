@@ -96,24 +96,38 @@ LLAMA_API llama_memory_breakdown llama_get_memory_breakdown(const struct llama_c
 LLAMA_API void llama_set_embeddings_nextn(struct llama_context * ctx, bool value, bool masked);
 
 // Schedule an async NextN draft chain with GPU-side acceptance from the source
-// context's sampled tokens and catch-up output. Returns false when unsupported or on failure.
+// context's sampled tokens and draft state output. Returns false when unsupported or on failure.
 LLAMA_API bool llama_decode_nextn_async(struct llama_context * ctx,
                                         struct llama_context * source,
                                         struct llama_batch     batch);
 
-// Commit host-side KV metadata for a previously submitted NextN chain.
-// Returns false when no submission is pending or metadata setup fails.
+// Validate and allocate fixed resources for the NextN GPU pipeline.
+LLAMA_API bool llama_prepare_nextn_gpu_pipeline(struct llama_context * ctx,
+                                                struct llama_context * draft,
+                                                int32_t                n_draft);
+
+// Submit target verification using device-resident GPU NextN tokens.
+// Returns the same status as llama_decode.
+LLAMA_API int32_t llama_decode_speculative_verify(struct llama_context * ctx,
+                                                  struct llama_context * draft,
+                                                  struct llama_batch     batch);
+
+// Wait for and discard an active NextN chain.
+LLAMA_API void llama_discard_nextn(struct llama_context * ctx);
+
+// Commit host-side KV metadata without waiting for the submitted NextN chain.
+// Returns false when no chain is prefetched or metadata setup fails.
 LLAMA_API bool llama_commit_nextn(struct llama_context * ctx, llama_pos seed_pos);
 
-// Prepare an async single-sequence EAGLE3 catch-up directly from the target context.
-// The returned pointer becomes readable after llama_synchronize_catchup completes.
-LLAMA_API bool llama_decode_catchup_async(struct llama_context * ctx,
-                                          struct llama_context * source,
-                                          struct llama_batch     batch,
-                                          const float **         g_out);
+// Update single-sequence EAGLE3 draft state asynchronously from the target context.
+// The returned pointer becomes readable after llama_synchronize_draft_state completes.
+LLAMA_API bool llama_update_draft_state_async(struct llama_context * draft,
+                                              struct llama_context * target,
+                                              struct llama_batch     batch,
+                                              const float **         g_out);
 
-// Block until the pending catch-up output reaches host pinned memory.
-LLAMA_API void llama_synchronize_catchup(struct llama_context * ctx);
+// Block until the pending draft state output reaches host pinned memory.
+LLAMA_API void llama_synchronize_draft_state(struct llama_context * draft);
 
 // Select which appended NextN block the DECODER_MTP graph runs (offset past
 // the trunk: il = n_layer() + offset). Used by the speculative NextN driver to

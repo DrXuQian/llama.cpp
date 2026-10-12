@@ -29,28 +29,6 @@
 #define SPEC_VOCAB_MAX_SIZE_DIFFERENCE  128
 #define SPEC_VOCAB_CHECK_START_TOKEN_ID 5
 
-static bool common_speculative_nextn_chain(llama_context *     ctx,
-                                           const llama_batch & batch,
-                                           int                 n_max,
-                                           float               p_min,
-                                           common_sampler *    sampler,
-                                           llama_tokens &      result) {
-    if (p_min > 0.0f || !result.empty() || !llama_commit_nextn(ctx, batch.pos[0])) {
-        return false;
-    }
-    GGML_ASSERT(p_min <= 0.0f);  // chain is greedy-only
-    SPC_DBG("GPU NextN chain: %d steps\n", n_max);
-    for (int i = 0; i < n_max; i++) {
-        common_sampler_sample(sampler, ctx, i, true);
-        const auto * candidates = common_sampler_get_candidates(sampler, true);
-        const auto   token      = candidates->data[0].id;
-        common_sampler_accept(sampler, token, true);
-        result.push_back(token);
-    }
-    llama_memory_seq_rm(llama_get_memory(ctx), batch.seq_id[0][0], batch.pos[0] + n_max, -1);
-    return true;
-}
-
 const std::map<std::string, common_speculative_type> common_speculative_type_from_name_map = {
     {"none",          COMMON_SPECULATIVE_TYPE_NONE},
     {"draft-simple",  COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE},
@@ -478,6 +456,9 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
 
     const float * async_verify_g = nullptr;
 
+    bool gpu_pipeline   = false;
+    bool draft_deferred = false;
+
     common_speculative_impl_draft_eagle3(const common_params_speculative & params, uint32_t n_seq)
         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3, n_seq)
         , params(params.draft)
@@ -595,27 +576,12 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
     }
 
     bool can_prefetch(const llama_batch & batch_in) const {
-        if (!params.backend_sampling || params.p_min != 0.0f || params.n_max < 2 ||
-            batch_in.n_tokens != params.n_max + 1 || n_seq != 1 || !batch_in.token || batch_in.embd || !batch_in.pos ||
-            !batch_in.n_seq_id || !batch_in.seq_id || pending_pos_last.empty() || batch_in.n_seq_id[0] != 1 ||
-            !batch_in.seq_id[0]) {
+        if (!gpu_pipeline || batch_in.n_tokens != params.n_max + 1 || !batch_in.token || batch_in.embd) {
             return false;
         }
 
-        const llama_seq_id seq_id = batch_in.seq_id[0][0];
-        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq || !backend_chains[seq_id] ||
-            pending_pos_last[0] + 1 != batch_in.pos[0]) {
-            return false;
-        }
-
-        for (int32_t i = 1; i < batch_in.n_tokens; ++i) {
-            if (batch_in.n_seq_id[i] != 1 || !batch_in.seq_id[i] || batch_in.seq_id[i][0] != seq_id ||
-                batch_in.pos[i] != batch_in.pos[0] + i) {
-                return false;
-            }
-        }
-
-        return true;
+        // F32 acceptance arithmetic requires exact positions.
+        return pending_pos_last[0] + 1 == batch_in.pos[0] && batch_in.pos[0] <= (1 << 24) - 2 * batch_in.n_tokens;
     }
 
     bool can_process_before_sync(const llama_batch & batch_in) const override { return can_prefetch(batch_in); }
@@ -651,9 +617,9 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
         auto * ctx_tgt = this->params.ctx_tgt;
         auto * ctx_dft = this->params.ctx_dft;
 
-        // the fused encoder and catch-up decode reuses the seed row that draft() left at the
+        // the fused encoder and draft state update reuse the seed row that draft() left at the
         // deferred boundary, so it only decodes batch_in[1..] and never runs the host encoder.
-        // the catch-up result is kept only when the NextN prefetch is also submitted
+        // the draft state output is kept only when the NextN prefetch is also submitted
         if (can_prefetch(batch_in)) {
             common_batch_clear(batch);
             for (int32_t k = 0; k < n_tokens - 1; ++k) {
@@ -661,19 +627,21 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
                                  /*logits=*/false);
             }
             const float * snapshot = nullptr;
-            if (llama_decode_catchup_async(ctx_dft, ctx_tgt, batch, &snapshot)) {
+            if (llama_update_draft_state_async(ctx_dft, ctx_tgt, batch, &snapshot)) {
                 if (llama_decode_nextn_async(ctx_dft, ctx_tgt, batch)) {
                     verify_g_rows[0]    = n_tokens;
                     verify_pos_first[0] = batch_in.pos[0];
                     pending_pos_last[0] = batch_in.pos[n_tokens - 1];
                     async_verify_g      = snapshot;
-                    SPC_DBG("GPU EAGLE3 async encoder, catch-up and next-draft prefetch: %d rows\n", n_tokens);
+                    SPC_DBG("GPU EAGLE3 async encoder, draft state update and next-draft prefetch: %d rows\n",
+                            n_tokens);
                     return true;
                 }
                 llama_synchronize(ctx_dft);
                 llama_memory_seq_rm(llama_get_memory(ctx_dft), batch.seq_id[0][0], batch.pos[0], -1);
             }
         }
+        llama_discard_nextn(ctx_dft);
 
         // Interleave each extract_layer's hidden state into a contiguous buffer of
         // shape [n_tokens, target_layer_ids_n * n_embd_tgt]. Then run EAGLE3 encoder
@@ -834,15 +802,20 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
             return;
         }
 
-        if (n_drafting == 1 && params.backend_sampling) {
-            const auto seq_id = batch.seq_id[0][0];
-            if (backend_chains[seq_id] &&
-                common_speculative_nextn_chain(ctx_dft, batch, params.n_max, params.p_min, smpls[seq_id].get(),
-                                               *dparams[seq_id].result)) {
-                return;
+        if (gpu_pipeline) {
+            auto & dp = dparams[batch.seq_id[0][0]];
+            if (dp.n_max >= params.n_max) {
+                GGML_ASSERT(dp.result->empty());
+                if (llama_commit_nextn(ctx_dft, batch.pos[0])) {
+                    SPC_DBG("GPU NextN chain: %d steps\n", params.n_max);
+                    dp.result->assign(params.n_max, 0);
+                    draft_deferred = true;
+                    return;
+                }
             }
         }
 
+        llama_discard_nextn(ctx_dft);
         int ret = llama_decode(ctx_dft, batch);
         if (ret != 0) {
             SPC_ERR("llama_decode returned %d\n", ret);
@@ -932,7 +905,7 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
     void accept(llama_seq_id seq_id, uint16_t n_accepted, bool /*is_other*/) override {
         const float * verify_g_data = async_verify_g;
         if (verify_g_data) {
-            llama_synchronize_catchup(params.ctx_dft);
+            llama_synchronize_draft_state(params.ctx_dft);
             async_verify_g = nullptr;
         }
         if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
@@ -1558,7 +1531,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
 
-        // if kv is shared with target (e.g Gemma4), then we can skip this catch-up decode
+        // if kv is shared with target (e.g Gemma4), then we can skip this draft state update
         if (!is_mem_shared) {
             common_batch_clear(batch);
 
@@ -2409,6 +2382,22 @@ int32_t common_speculative_n_max(const common_params_speculative * spec) {
     return n_max;
 }
 
+bool common_speculative_prepare_gpu_pipeline(common_speculative * spec) {
+    if (!spec || spec->impls.size() != 1 || spec->dparams.size() != 1) {
+        return false;
+    }
+
+    auto * eagle = dynamic_cast<common_speculative_impl_draft_eagle3 *>(spec->impls[0].get());
+    if (!eagle || !eagle->params.backend_sampling || eagle->params.p_min != 0.0f || eagle->backend_chains.size() != 1 ||
+        !eagle->backend_chains[0] ||
+        !llama_prepare_nextn_gpu_pipeline(eagle->params.ctx_tgt, eagle->params.ctx_dft, eagle->params.n_max)) {
+        return false;
+    }
+
+    eagle->gpu_pipeline = true;
+    return true;
+}
+
 common_params common_base_params_to_speculative(const common_params & params) {
     const bool has_draft = params.speculative.has_dft();
 
@@ -2818,6 +2807,35 @@ void common_speculative_draft(common_speculative * spec) {
             dp.drafting = false;
         }
     }
+}
+
+int32_t common_speculative_decode(common_speculative * spec,
+                                  llama_context *      ctx_tgt,
+                                  llama_context *      ctx_dft,
+                                  llama_batch          batch) {
+    auto * eagle = spec && spec->impls.size() == 1 ?
+                       dynamic_cast<common_speculative_impl_draft_eagle3 *>(spec->impls[0].get()) :
+                       nullptr;
+    if (!eagle || !eagle->draft_deferred) {
+        return llama_decode(ctx_tgt, batch);
+    }
+
+    GGML_ASSERT(eagle->gpu_pipeline && spec->dparams.size() == 1);
+    const int32_t result = llama_decode_speculative_verify(ctx_tgt, ctx_dft, batch);
+
+    auto & draft = *spec->dparams[0].result;
+    draft.clear();
+    for (int i = 0; i < eagle->params.n_max; i++) {
+        common_sampler_sample(eagle->smpls[0].get(), eagle->params.ctx_dft, i, true);
+        const auto * candidates = common_sampler_get_candidates(eagle->smpls[0].get(), true);
+        const auto   token      = candidates->data[0].id;
+        common_sampler_accept(eagle->smpls[0].get(), token, true);
+        draft.push_back(token);
+        batch.token[i + 1] = token;
+    }
+    eagle->draft_deferred = false;
+
+    return result;
 }
 
 void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id, uint16_t n_accepted) {
