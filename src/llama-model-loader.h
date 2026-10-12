@@ -33,15 +33,18 @@ class llama_kpack_cache;
 struct llama_model_loader {
     llama_kpack_cache * kpack_cache = nullptr;  // model-owned
     std::string         source_path;
+    std::vector<std::string> source_paths;
     // Holds information on a model weight
     struct llama_tensor_weight {
         uint16_t  idx; // source file index
         size_t   offs; // tensor data offset in the original file
+        int32_t   tensor_index;
 
         ggml_tensor * tensor;
 
         llama_tensor_weight(const llama_file * file, uint16_t idx, const struct gguf_context * gguf_ctx, ggml_tensor * tensor) : idx(idx), tensor(tensor) {
             const int tensor_idx = gguf_find_tensor(gguf_ctx,  ggml_get_name(tensor));
+            tensor_index         = tensor_idx;
             if (tensor_idx < 0) {
                 throw std::runtime_error(format("tensor '%s' not found in the model", ggml_get_name(tensor)));
             }

@@ -9,8 +9,22 @@
 #include <cstring>
 #include <fstream>
 #include <stdexcept>
+#include <sstream>
 
-static void check(bool ok, const char * message) {
+static ggml_backend_meta_split_state tp_split(const ggml_tensor * tensor, void * userdata) {
+    const auto &                  split = static_cast<const nlohmann::json *>(userdata)->at(tensor->name);
+    ggml_backend_meta_split_state result{};
+    result.axis        = static_cast<ggml_backend_meta_split_axis>(split.at("axis").get<int>());
+    const auto widths  = split.at("widths").get<std::vector<int64_t>>();
+    const auto repeats = split.at("repeats").get<std::vector<uint32_t>>();
+    GGML_ASSERT(widths.size() <= 16 * GGML_BACKEND_META_MAX_DEVICES && repeats.size() <= 16);
+    std::copy(widths.begin(), widths.end(), result.ne);
+    std::copy(repeats.begin(), repeats.end(), result.nr);
+    result.n_segments = repeats.size();
+    return result;
+}
+
+static void check(bool ok, const std::string & message) {
     if (!ok) {
         throw std::runtime_error(message);
     }
@@ -19,14 +33,26 @@ static void check(bool ok, const char * message) {
 int main(int argc, char ** argv) try {
     check(argc == 5 || argc == 6,
           "usage: test-kpack-cache BACKEND REFERENCE.GGUF CACHE cold|hot|cold-partial|hot-partial|miss|incompatible "
-          "[reject]");
+          "[reject|tp|tp-reject]");
+    const std::string option = argc == 6 ? argv[5] : "";
+    const bool        tp     = option == "tp" || option == "tp-reject";
+    const bool        reject = option == "reject" || option == "tp-reject";
+    check(option.empty() || tp || reject, "invalid option");
     const std::string mode    = argv[4];
     const bool        partial = mode == "cold-partial" || mode == "hot-partial";
     const bool        cold    = mode == "cold" || mode == "cold-partial";
     const bool        hot     = mode == "hot" || mode == "hot-partial";
     check(cold || hot || mode == "miss" || mode == "incompatible", "invalid mode");
     ggml_backend_load_all();
-    auto * dev = ggml_backend_dev_by_name(argv[1]);
+    std::vector<ggml_backend_dev_t> devices;
+    std::istringstream              device_names(argv[1]);
+    for (std::string name; std::getline(device_names, name, ',');) {
+        auto * item = ggml_backend_dev_by_name(name.c_str());
+        check(item != nullptr, "requested TP device unavailable");
+        devices.push_back(item);
+    }
+    check(!devices.empty() && devices.size() <= GGML_BACKEND_META_MAX_DEVICES, "invalid device count");
+    auto * dev = devices[0];
     check(dev != nullptr, "device unavailable");
     ggml_backend_ptr backend(ggml_backend_dev_init(dev, nullptr));
     auto *           reg   = ggml_backend_dev_backend_reg(dev);
@@ -48,6 +74,18 @@ int main(int argc, char ** argv) try {
     const auto key = gguf_find_key(file.get(), "quactlize.kpack.reference.manifest");
     check(key >= 0, "reference manifest missing");
     const auto                             manifest = nlohmann::json::parse(gguf_get_val_str(file.get(), key));
+    nlohmann::json                         topology;
+    ggml_backend_buffer_type_t             buft = bufts[0];
+    if (tp) {
+        for (const auto & record : manifest.at("tensors")) {
+            check(record.at("shards").size() == devices.size(), "fixture device count differs");
+            topology[record.at("source_name").get<std::string>()] = record.at("partition");
+        }
+        auto * meta = ggml_backend_meta_device(devices.data(), devices.size(), tp_split, &topology);
+        buft        = ggml_backend_meta_buffer_type(meta, bufts[0]);
+        check(buft && buft != ggml_backend_dev_buffer_type(meta), "TP override was not isolated");
+        check(ggml_backend_meta_buffer_type_count(buft) == devices.size(), "TP override device count");
+    }
     std::vector<llama_kpack_source_tensor> inventory;
     std::vector<ggml_tensor *>             tensors;
     const size_t                           count = manifest.at("tensors").size();
@@ -60,6 +98,7 @@ int main(int argc, char ** argv) try {
         const auto * source = ggml_get_tensor(metadata, name.c_str());
         auto *       t      = ggml_dup_tensor(ctx.get(), source);
         ggml_set_name(t, name.c_str());
+        ggml_set_param(t);
         tensors.push_back(t);
         llama_kpack_source_tensor src;
         src.name        = name;
@@ -70,7 +109,8 @@ int main(int argc, char ** argv) try {
         src.n           = t->ne[1];
         src.k           = t->ne[0];
         src.rank        = ggml_n_dims(t);
-        src.experts     = src.rank == 3 ? t->ne[2] : 0;
+        src.experts     = src.rank >= 3 ? t->ne[2] : 0;
+        src.batches     = t->ne[3];
         inventory.push_back(src);
     }
     ggml_backend_buffer_ptr buffer;
@@ -81,7 +121,7 @@ int main(int argc, char ** argv) try {
     for (const auto & src : inventory) {
         source_bytes += src.size_bytes;
     }
-    const auto planned = cache->coverage(ctx.get(), bufts[0]);
+    const auto planned = cache->coverage(ctx.get(), buft);
     check(planned.source_bytes == source_bytes &&
               planned.cached_bytes == (hot ? (partial ? inventory[0].size_bytes : source_bytes) : 0),
           "pre-allocation cache coverage differs");
@@ -98,12 +138,12 @@ int main(int argc, char ** argv) try {
         auto * changed = ggml_dup_tensor(probe.get(), tensors[0]);
         ggml_set_name(changed, tensors[0]->name);
         changed->ne[1] /= 2;
-        const auto mismatched = cache->coverage(probe.get(), bufts[0]);
+        const auto mismatched = cache->coverage(probe.get(), buft);
         check(mismatched.source_bytes == ggml_nbytes(changed) && mismatched.cached_bytes == 0 &&
                   mismatched.should_prefetch(),
               "different shape was treated as cached");
     }
-    buffer.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), bufts[0]));
+    buffer.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft));
     check(buffer != nullptr, "buffer allocation");
     std::ifstream input(argv[2], std::ios::binary);
     auto          bytes = [&](const std::string & name) {
@@ -123,7 +163,13 @@ int main(int argc, char ** argv) try {
             ++hits;
         } else {
             auto raw = bytes(tensor->name);
-            ggml_backend_tensor_set(tensor, raw.data(), 0, raw.size());
+            if (tp) {
+                const size_t cut = raw.size() / 3 + 1;
+                ggml_backend_tensor_set(tensor, raw.data() + cut, cut, raw.size() - cut);
+                ggml_backend_tensor_set(tensor, raw.data(), 0, cut);
+            } else {
+                ggml_backend_tensor_set(tensor, raw.data(), 0, raw.size());
+            }
             ++shuffles;
             if (!partial || i == 0) {
                 cache->capture(tensor);
@@ -132,28 +178,39 @@ int main(int argc, char ** argv) try {
     }
     cache->start();
     // No explicit wait here: readback races the background snapshot on a separate stream.
+    size_t snapshots = 0, stored = 0;
     for (size_t i = 0; i < count; ++i) {
-        std::vector<uint8_t> expected;
-        for (const char * plane : {"low", "high", "units"}) {
-            const auto & carrier = manifest.at("tensors")[i].at("carriers").at(plane);
-            if (!carrier.is_null()) {
-                auto part = bytes(carrier.at("name"));
-                expected.insert(expected.end(), part.begin(), part.end());
+        for (size_t rank = 0; rank < (tp ? devices.size() : 1); ++rank) {
+            auto * local = tp ? ggml_backend_meta_tensor_shard(tensors[i], rank, nullptr) : tensors[i];
+            check(local != nullptr, "TP local tensor missing");
+            if (!ggml_nelements(local)) {
+                continue;
             }
+            ++snapshots;
+            stored += !partial || i == 0;
+            std::vector<uint8_t> expected;
+            for (const char * plane : {"low", "high", "units"}) {
+                const auto & record  = manifest.at("tensors")[i];
+                const auto & carrier = (tp ? record.at("shards")[rank] : record).at("carriers").at(plane);
+                if (!carrier.is_null()) {
+                    auto part = bytes(carrier.at("name"));
+                    expected.insert(expected.end(), part.begin(), part.end());
+                }
+            }
+            std::vector<uint8_t> observed(expected.size());
+            check(read(local, observed.data(), observed.size()), "readback failed");
+            check(observed == expected, "cache bytes differ from independent offline reference");
         }
-        std::vector<uint8_t> observed(expected.size());
-        check(read(tensors[i], observed.data(), observed.size()), "readback failed");
-        check(observed == expected, "cache bytes differ from independent offline reference");
     }
     cache.reset();
     if (cold) {
         std::string                error;
         llama_kpack_sidecar_reader reader;
-        check(reader.open(argv[3], error) && reader.load_unchecked(argv[2], inventory, error), error.c_str());
-        check(reader.size() == (partial ? 1 : count), "publication incomplete");
+        check(reader.open(argv[3], error) && reader.load_unchecked(argv[2], inventory, error), error);
+        check(reader.size() == stored, "publication incomplete");
     }
-    if (argc == 6) {
-        auto * t = tensors[0];
+    if (reject) {
+        auto * t = tp ? ggml_backend_meta_tensor_shard(tensors[0], 0, nullptr) : tensors[0];
         auto * a = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, t->ne[0], 1, t->ne[2]);
         auto * g = ggml_new_graph(ctx.get());
         ggml_build_forward_expand(g, ggml_mul_mat(ctx.get(), t, a));
@@ -162,6 +219,9 @@ int main(int argc, char ** argv) try {
     }
     printf("KPACK_CACHE PASS mode=%s tensors=%zu hits=%zu gpu_shuffle=%zu inference=DISABLED\n", mode.c_str(), count,
            hits, shuffles);
+    if (tp) {
+        printf("KPACK_TP_CACHE PASS ranks=%zu snapshots=%zu\n", devices.size(), snapshots);
+    }
     return 0;
 } catch (const std::exception & error) {
     fprintf(stderr, "KPACK_CACHE FAIL: %s\n", error.what());

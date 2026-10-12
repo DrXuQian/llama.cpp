@@ -8,6 +8,7 @@
 #include <cinttypes>
 #include <filesystem>
 #include <set>
+#include <sstream>
 
 namespace {
 
@@ -175,6 +176,68 @@ bool same_layout(const llama_kpack_planes & a, const llama_kpack_planes & b) {
            a.group_size == b.group_size && a.reserved == b.reserved && a.mapping_id == b.mapping_id;
 }
 
+bool partition_for(const ggml_backend_meta_split_state & split, size_t count, size_t index, llama_kpack_partition & p) {
+    if (!count || count > GGML_BACKEND_META_MAX_DEVICES || index >= count || split.n_segments > 16) {
+        return false;
+    }
+    p.axis  = split.axis;
+    p.count = count;
+    p.index = index;
+    if (split.axis != GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
+        p.widths.assign(split.ne, split.ne + split.n_segments * count);
+        p.repeats.assign(split.nr, split.nr + split.n_segments);
+    }
+    return true;
+}
+
+bool partition_for(ggml_backend_buffer_type_t buft,
+                   const ggml_tensor *        tensor,
+                   size_t                     index,
+                   llama_kpack_partition &    p) {
+    const size_t                  count = ggml_backend_meta_buffer_type_count(buft);
+    ggml_backend_meta_split_state split{};
+    return count ? ggml_backend_meta_tensor_split(buft, tensor, &split) && partition_for(split, count, index, p) :
+                   index == 0;
+}
+
+bool matches_source(const ggml_tensor * tensor, const llama_kpack_source_tensor & src) {
+    return tensor->type == src.ggml_type && tensor->ne[0] == src.k && tensor->ne[1] == src.n &&
+           tensor->ne[2] == std::max<int64_t>(1, src.experts) && tensor->ne[3] == src.batches &&
+           ggml_nbytes(tensor) == src.size_bytes;
+}
+
+struct resident_shard {
+    ggml_tensor *         tensor;
+    llama_kpack_partition partition;
+    cache_api             api;
+};
+
+std::vector<resident_shard> resident_shards(ggml_tensor * tensor) {
+    std::vector<resident_shard> result;
+    if (!tensor || !tensor->buffer) {
+        return result;
+    }
+    auto *       buft  = ggml_backend_buffer_get_type(tensor->buffer);
+    const size_t count = ggml_backend_meta_buffer_type_count(buft);
+    for (size_t index = 0; index < std::max<size_t>(1, count); ++index) {
+        ggml_backend_meta_split_state split{};
+        auto *                        local = count ? ggml_backend_meta_tensor_shard(tensor, index, &split) : tensor;
+        if (!local) {
+            return {};
+        }
+        if (!ggml_nelements(local)) {
+            continue;
+        }
+        const auto            api = api_for(local);
+        llama_kpack_partition p;
+        if (!api.is_kpack || !api.is_kpack(local) || (count && !partition_for(split, count, index, p))) {
+            return {};
+        }
+        result.push_back({local, std::move(p), api});
+    }
+    return result;
+}
+
 }  // namespace
 
 struct llama_kpack_cache::impl {
@@ -187,20 +250,21 @@ struct llama_kpack_cache::impl {
     std::set<std::string>                                     captured;
     size_t                                                    resident_requests = 0, cache_uploads = 0;
     bool                                                      writable = false, started = false;
+    std::vector<std::unique_ptr<llama_kpack_cache>>           files;
 
     const llama_kpack_sidecar_record * matching_record(const ggml_tensor *            tensor,
                                                        const cache_api &              api,
-                                                       ggml_quactlize_packed_layout & layout) const {
+                                                       ggml_quactlize_packed_layout & layout,
+                                                       const llama_kpack_partition &  partition = {}) const {
         if (!reader || !api.is_kpack || !api.layout || !api.set) {
             return nullptr;
         }
-        const auto * rec = reader->find(tensor->name);
+        const auto *              rec = reader->find(tensor->name, partition);
         const auto   src = sources.find(tensor->name);
-        if (!rec || src == sources.end() || tensor->type != src->second.ggml_type ||
-            (src->second.rank != 2 && src->second.rank != 3) || tensor->ne[0] != src->second.k ||
-            tensor->ne[1] != src->second.n ||
-            tensor->ne[2] * tensor->ne[3] != std::max<int64_t>(1, src->second.experts) ||
-            ggml_nbytes(tensor) != src->second.size_bytes) {
+        llama_kpack_source_tensor local;
+        std::string               error;
+        if (!rec || src == sources.end() || !llama_kpack_shard_source(src->second, partition, local, error) ||
+            !matches_source(tensor, local)) {
             return nullptr;
         }
         if (!api.layout(tensor, &layout) || layout.arrangement.version != 2 ||
@@ -210,6 +274,8 @@ struct llama_kpack_cache::impl {
         return rec;
     }
 };
+
+llama_kpack_cache::llama_kpack_cache() : pimpl(new impl) {}
 
 llama_kpack_cache::llama_kpack_cache(const std::string &                            dir,
                                      const std::string &                            source,
@@ -258,12 +324,28 @@ llama_kpack_cache::~llama_kpack_cache() {
 }
 
 bool llama_kpack_cache::has_cached_tensors() const {
+    for (const auto & file : pimpl->files) {
+        if (file->has_cached_tensors()) {
+            return true;
+        }
+    }
     return pimpl->reader && pimpl->reader->size() > 0;
 }
 
 llama_kpack_cache_coverage llama_kpack_cache::coverage(ggml_context * ctx, ggml_backend_buffer_type_t buft) const {
     llama_kpack_cache_coverage result;
-    const auto                 api = api_for(buft);
+    for (const auto & file : pimpl->files) {
+        const auto part = file->coverage(ctx, buft);
+        if (part.source_bytes > UINT64_MAX - result.source_bytes) {
+            return {UINT64_MAX, 0};
+        }
+        result.source_bytes += part.source_bytes;
+        result.cached_bytes += part.cached_bytes;
+    }
+    if (!pimpl->files.empty()) {
+        return result;
+    }
+    const size_t count = ggml_backend_meta_buffer_type_count(buft);
     for (auto * tensor = ggml_get_first_tensor(ctx); tensor; tensor = ggml_get_next_tensor(ctx, tensor)) {
         if (!pimpl->sources.count(tensor->name)) {
             continue;
@@ -273,8 +355,41 @@ llama_kpack_cache_coverage llama_kpack_cache::coverage(ggml_context * ctx, ggml_
             return {UINT64_MAX, 0};
         }
         result.source_bytes += bytes;
-        ggml_quactlize_packed_layout layout{};
-        if (pimpl->matching_record(tensor, api, layout)) {
+        if (!matches_source(tensor, pimpl->sources.at(tensor->name))) {
+            continue;
+        }
+        bool cached = true;
+        for (size_t index = 0; index < std::max<size_t>(1, count); ++index) {
+            llama_kpack_partition partition;
+            if (!partition_for(buft, tensor, index, partition)) {
+                cached = false;
+                break;
+            }
+            llama_kpack_source_tensor local;
+            std::string               error;
+            if (!llama_kpack_shard_source(pimpl->sources.at(tensor->name), partition, local, error)) {
+                cached = false;
+                break;
+            }
+            if (!local.size_bytes) {
+                continue;
+            }
+            ggml_tensor probe = *tensor;
+            probe.ne[0]       = local.k;
+            probe.ne[1]       = local.n;
+            probe.ne[2]       = std::max<int64_t>(1, local.experts);
+            probe.ne[3]       = local.batches;
+            probe.nb[1]       = ggml_row_size(probe.type, probe.ne[0]);
+            probe.nb[2]       = probe.nb[1] * probe.ne[1];
+            probe.nb[3]       = probe.nb[2] * probe.ne[2];
+            ggml_quactlize_packed_layout layout{};
+            const auto                   api = api_for(count ? ggml_backend_meta_buffer_type_at(buft, index) : buft);
+            if (!pimpl->matching_record(&probe, api, layout, partition)) {
+                cached = false;
+                break;
+            }
+        }
+        if (cached) {
             result.cached_bytes += bytes;
         }
     }
@@ -298,21 +413,35 @@ bool llama_kpack_cache::should_prefetch(const llama_model_loader & loader) const
 
 bool llama_kpack_cache::load(ggml_tensor * tensor) {
     auto & I = *pimpl;
+    for (const auto & file : I.files) {
+        if (file->load(tensor)) {
+            return true;
+        }
+    }
     if (!I.reader) {
         return false;
     }
-    const auto api = api_for(tensor);
-    if (!api.is_kpack || !api.is_kpack(tensor)) {
+    const auto shards = resident_shards(tensor);
+    const auto src    = I.sources.find(tensor->name);
+    if (shards.empty() || src == I.sources.end() || !matches_source(tensor, src->second)) {
         return false;
     }
     ++I.resident_requests;
-    ggml_quactlize_packed_layout p{};
-    const auto *                 rec = I.matching_record(tensor, api, p);
-    if (!rec) {
-        return false;
+    std::vector<ggml_quactlize_packed_layout>       layouts(shards.size());
+    std::vector<const llama_kpack_sidecar_record *> records;
+    for (size_t i = 0; i < shards.size(); ++i) {
+        const auto & shard = shards[i];
+        const auto * rec   = I.matching_record(shard.tensor, shard.api, layouts[i], shard.partition);
+        if (!rec) {
+            return false;
+        }
+        records.push_back(rec);
     }
-    if (!api.set(tensor, &p, rec->planes.low, p.sizes.raw_bytes)) {
-        return false;
+    // All shards are admitted before installing any. A miss leaves raw loading untouched.
+    for (size_t i = 0; i < shards.size(); ++i) {
+        if (!shards[i].api.set(shards[i].tensor, &layouts[i], records[i]->planes.low, layouts[i].sizes.raw_bytes)) {
+            throw std::runtime_error("K-pack shard cache upload failed");
+        }
     }
     ++I.cache_uploads;
     return true;
@@ -320,11 +449,15 @@ bool llama_kpack_cache::load(ggml_tensor * tensor) {
 
 void llama_kpack_cache::capture(ggml_tensor * tensor) {
     auto & I = *pimpl;
+    for (const auto & file : I.files) {
+        file->capture(tensor);
+    }
     if (!I.writable || I.started || I.captured.count(tensor->name)) {
         return;
     }
-    const auto api = api_for(tensor);
-    if (!api.is_kpack || !api.is_kpack(tensor)) {
+    const auto shards = resident_shards(tensor);
+    const auto src    = I.sources.find(tensor->name);
+    if (shards.empty() || src == I.sources.end()) {
         return;
     }
     const auto disable = [&](const char * why) {
@@ -333,45 +466,48 @@ void llama_kpack_cache::capture(ggml_tensor * tensor) {
         I.jobs.clear();
         I.writer.cancel();
     };
-    if (!api.layout || !api.copy || !api.wait) {
-        disable("resident backend lacks snapshot support");
-        return;
-    }
-    const auto src = I.sources.find(tensor->name);
-    if (src == I.sources.end() || tensor->type != src->second.ggml_type ||
-        (src->second.rank != 2 && src->second.rank != 3) || tensor->ne[0] != src->second.k ||
-        tensor->ne[1] != src->second.n || tensor->ne[2] * tensor->ne[3] != std::max<int64_t>(1, src->second.experts) ||
-        ggml_nbytes(tensor) != src->second.size_bytes) {
+    if (!matches_source(tensor, src->second)) {
         disable("resident tensor does not match its source record");
         return;
     }
-    ggml_quactlize_packed_layout p{};
-    if (!api.layout(tensor, &p) || p.arrangement.version != 2) {
-        disable("resident descriptor is unavailable");
-        return;
-    }
-    auto * dev  = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(tensor->buffer));
-    auto & slot = I.slots[dev];
-    if (!slot) {
-        // Allocate before inference starts; never allocate/free pinned storage in
-        // the running writer, where runtime allocation could synchronize a device.
-        slot = std::make_shared<copy_slots>();
-        if (!(*slot)[0].allocate(dev) || !(*slot)[1].allocate(dev)) {
-            disable("pinned staging unavailable");
+    for (const auto & shard : shards) {
+        const auto api   = shard.api;
+        auto *     local = shard.tensor;
+        if (!api.layout || !api.copy || !api.wait) {
+            disable("resident backend lacks snapshot support");
             return;
         }
+        ggml_quactlize_packed_layout p{};
+        if (!api.layout(local, &p) || p.arrangement.version != 2) {
+            disable("resident descriptor is unavailable");
+            return;
+        }
+        auto * dev  = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(local->buffer));
+        auto & slot = I.slots[dev];
+        if (!slot) {
+            // Allocate before inference starts; never allocate/free pinned storage in
+            // the running writer, where runtime allocation could synchronize a device.
+            slot = std::make_shared<copy_slots>();
+            if (!(*slot)[0].allocate(dev) || !(*slot)[1].allocate(dev)) {
+                disable("pinned staging unavailable");
+                return;
+            }
+        }
+        llama_kpack_write_job job{src->second, describe(p), {}, shard.partition};
+        auto                  reader = std::make_shared<copy_reader>(local, slot, api, job.planes);
+        job.read                     = [reader](size_t offset, size_t bytes, std::string & error) {
+            return reader->read(offset, bytes, error);
+        };
+        I.jobs.push_back(std::move(job));
     }
-    llama_kpack_write_job job{src->second, describe(p), {}};
-    auto                  reader = std::make_shared<copy_reader>(tensor, slot, api, job.planes);
-    job.read                     = [reader](size_t offset, size_t bytes, std::string & error) {
-        return reader->read(offset, bytes, error);
-    };
-    I.jobs.push_back(std::move(job));
     I.captured.insert(tensor->name);
 }
 
 void llama_kpack_cache::start() {
     auto & I = *pimpl;
+    for (const auto & file : I.files) {
+        file->start();
+    }
     if (I.reader) {
         LLAMA_LOG_INFO("[kpack-cache] cache_uploads=%zu resident_misses=%zu\n", I.cache_uploads,
                        I.resident_requests - I.cache_uploads);
@@ -403,39 +539,99 @@ std::unique_ptr<llama_kpack_cache> llama_kpack_cache::create(const llama_model_l
         return nullptr;
     }
     const bool has_kpack = std::any_of(loader.ctx_map.begin(), loader.ctx_map.end(), [](const auto & entry) {
-        return api_for(entry.first).is_kpack && ggml_get_first_tensor(entry.second.get());
+        if (!ggml_get_first_tensor(entry.second.get())) {
+            return false;
+        }
+        if (api_for(entry.first).is_kpack) {
+            return true;
+        }
+        for (size_t i = 0; i < ggml_backend_meta_buffer_type_count(entry.first); ++i) {
+            if (api_for(ggml_backend_meta_buffer_type_at(entry.first, i)).is_kpack) {
+                return true;
+            }
+        }
+        return false;
     });
     if (!has_kpack) {
         return nullptr;
     }
-    if (loader.files.size() != 1 || loader.source_path.empty()) {
-        LLAMA_LOG_WARN("[kpack-cache] persistence requires one named GGUF source; cache disabled\n");
+    if (loader.files.empty() || loader.source_paths.size() != loader.files.size()) {
+        LLAMA_LOG_WARN("[kpack-cache] persistence requires named GGUF sources; cache disabled\n");
         return nullptr;
     }
     if (loader.check_tensors) {
         LLAMA_LOG_WARN("[kpack-cache] source validation requested; cache disabled\n");
         return nullptr;
     }
-    std::string error;
-    const auto  dir = llama_kpack_cache_directory(loader.source_path, error);
-    if (dir.empty()) {
-        LLAMA_LOG_WARN("[kpack-cache] persistence disabled: %s\n", error.c_str());
-        return nullptr;
-    }
-    std::vector<llama_kpack_source_tensor> inventory;
+    std::vector<std::vector<llama_kpack_source_tensor>> inventories(loader.files.size());
     for (const auto & entry : loader.weights_map) {
         const auto &              w = entry.second;
         llama_kpack_source_tensor src;
         src.name        = entry.first;
-        src.gguf_index  = gguf_find_tensor(loader.metadata, src.name.c_str());
+        src.gguf_index  = w.tensor_index;
         src.data_offset = w.offs;
         src.size_bytes  = ggml_nbytes(w.tensor);
         src.ggml_type   = w.tensor->type;
         src.rank        = ggml_n_dims(w.tensor);
         src.n           = w.tensor->ne[1];
         src.k           = w.tensor->ne[0];
-        src.experts     = src.rank == 3 ? w.tensor->ne[2] : 0;
-        inventory.push_back(std::move(src));
+        src.experts     = src.rank >= 3 ? w.tensor->ne[2] : 0;
+        src.batches     = w.tensor->ne[3];
+        inventories.at(w.idx).push_back(std::move(src));
     }
-    return std::make_unique<llama_kpack_cache>(dir, loader.source_path, inventory, loader.files[0]->file_id());
+    auto                                         result = std::unique_ptr<llama_kpack_cache>(new llama_kpack_cache);
+    std::map<std::string, llama_kpack_partition> topology;
+    for (const auto & entry : loader.ctx_map) {
+        if (!ggml_backend_meta_buffer_type_count(entry.first)) {
+            continue;
+        }
+        for (auto * t = ggml_get_first_tensor(entry.second.get()); t; t = ggml_get_next_tensor(entry.second.get(), t)) {
+            llama_kpack_partition p;
+            if (!partition_for(entry.first, t, 0, p)) {
+                return nullptr;
+            }
+            topology.emplace(t->name, std::move(p));
+        }
+    }
+    std::string variant;
+    if (!topology.empty()) {
+        // Namespace only. Cache admission still compares the full split map, not this hash.
+        uint64_t   hash   = UINT64_C(14695981039346656037);
+        const auto append = [&](uint64_t value) {
+            for (int b = 0; b < 8; ++b) {
+                hash = (hash ^ ((value >> (b * 8)) & 255)) * UINT64_C(1099511628211);
+            }
+        };
+        for (const auto & entry : topology) {
+            append(entry.first.size());
+            for (unsigned char c : entry.first) {
+                append(c);
+            }
+            const auto & p = entry.second;
+            append(p.axis);
+            append(p.count);
+            append(p.widths.size());
+            append(p.repeats.size());
+            for (auto width : p.widths) {
+                append(width);
+            }
+            for (auto repeat : p.repeats) {
+                append(repeat);
+            }
+        }
+        std::ostringstream suffix;
+        suffix << "-tp-" << std::hex << hash;
+        variant = suffix.str();
+    }
+    for (size_t i = 0; i < loader.files.size(); ++i) {
+        std::string error;
+        const auto  dir = llama_kpack_cache_directory(loader.source_paths[i], error);
+        if (dir.empty()) {
+            LLAMA_LOG_WARN("[kpack-cache] persistence disabled: %s\n", error.c_str());
+            continue;
+        }
+        result->pimpl->files.push_back(std::make_unique<llama_kpack_cache>(dir + variant, loader.source_paths[i],
+                                                                           inventories[i], loader.files[i]->file_id()));
+    }
+    return result;
 }

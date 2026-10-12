@@ -1674,7 +1674,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
     bool prefetch_source = true;
 #ifdef GGML_NCP_QUACTLIZE
-    if (params.split_mode != LLAMA_SPLIT_MODE_TENSOR && params.split_mode != LLAMA_SPLIT_MODE_ROW) {
+    if (params.split_mode != LLAMA_SPLIT_MODE_ROW) {
         pimpl->kpack_cache = llama_kpack_cache::create(ml);
         ml.kpack_cache     = pimpl->kpack_cache.get();
         prefetch_source    = !ml.kpack_cache || ml.kpack_cache->should_prefetch(ml);

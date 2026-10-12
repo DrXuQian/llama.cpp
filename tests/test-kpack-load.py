@@ -2,6 +2,7 @@
 """Compare the actual buffer's GPU shuffle with offline reference GGUF bytes."""
 
 import argparse
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -28,6 +29,8 @@ def main():
     parser.add_argument('--output', type=Path,
                         help='new directory; default: temporary kpack-load-* directory, removed on success')
     parser.add_argument('--backend', default='CUDA0')
+    parser.add_argument('--tp-devices', default=os.environ.get('KPACK_TP_DEVICES'),
+                        help='comma-separated TP devices; default: two logical ranks on --backend')
     args = parser.parse_args()
     if args.packer is None:
         args.packer = args.binary.resolve().parent / 'libquactlize_ppu_pack.so'
@@ -81,6 +84,85 @@ def q8_fixture(path):
     writer.add_string('quactlize.kpack.reference.manifest', json.dumps({
         'schema': 'quactlize.kquant-kpack.reference-gguf', 'schema_version': 1, 'tensors': records,
     }))
+    writer.write_header_to_file()
+    writer.write_kv_data_to_file()
+    writer.write_tensors_to_file()
+    writer.close()
+
+
+def tp_fixture(path, reference, count):
+    import torch
+    spec = importlib.util.spec_from_file_location('kpack_reference', reference)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    writer = gguf.GGUFWriter(path, 'llama')
+    records = []
+    for q in (8, 10, 11, 12, 13, 14):
+        block, block_bytes = gguf.GGML_QUANT_SIZES[gguf.GGMLQuantizationType(q)]
+        for case, axis in (('k', 0), ('n', 1), ('experts', 2), ('dim3', 3), ('mirror', 10),
+                           ('uneven-empty', 1), ('segments', 0)):
+            ne = [512, 256, 1, 1]
+            widths, repeats = [], []
+            coordinates = [[] for _ in range(count)]
+            if axis < 4:
+                unit = 512 if axis == 0 else 256 if axis == 1 else 1
+                widths = [unit] * count
+                repeats = [1]
+                if case == 'uneven-empty':
+                    widths = [unit * (d + 1) for d in range(count - 1)] + [0]
+                if case == 'segments':
+                    widths = [256] * count + [512] * count
+                    repeats = [2, 1]
+                position = 0
+                for s, repeat in enumerate(repeats):
+                    for _ in range(repeat):
+                        for d in range(count):
+                            width = widths[s * count + d]
+                            coordinates[d].extend(range(position, position + width))
+                            position += width
+                ne[axis] = position
+            if axis == 3:
+                ne[2] = 2
+            name = f'tp.q{q}.{case}.weight'
+            raw = np.random.default_rng(q * 100 + axis).integers(
+                0, 256, (ne[3], ne[2], ne[1], ne[0] // block, block_bytes), dtype=np.uint8)
+            writer.add_tensor(name, raw.reshape(ne[3], ne[2], ne[1], -1), raw_dtype=gguf.GGMLQuantizationType(q))
+            shards = []
+            for d in range(count):
+                if axis < 4 and not coordinates[d]:
+                    shards.append({'carriers': {}})
+                    continue
+                indices = coordinates[d]
+                if axis == 0:
+                    indices = np.asarray(indices[::block]) // block
+                local = raw if axis == 10 else np.take(raw, indices, axis=3-axis)
+                local = np.ascontiguousarray(local)
+                e = local.shape[0] * local.shape[1]
+                n, k = local.shape[2], local.shape[3] * block
+                if q == 8:
+                    blocks = local.reshape(e, n, k // 32, 34)
+                    codes = blocks[..., 2:] ^ np.uint8(128)
+                    low = codes.reshape(e, n, k // 16, 2, 8).transpose(0, 2, 4, 1, 3).copy()
+                    high = np.empty(0, dtype=np.uint8)
+                    units = blocks[..., :2].transpose(0, 2, 1, 3).copy()
+                else:
+                    art = module.prepare_grouped(torch.from_numpy(local.reshape(-1, block_bytes)), n, k, q, e)
+                    low, high, units = (plane.numpy() for plane in (art.low, art.high, art.units))
+                    recovered = module.recover_raw_blocks(art).numpy()
+                    if not np.array_equal(recovered.reshape(-1), local.reshape(-1)):
+                        raise RuntimeError(f'TP reference inverse differs: {name}/{d}')
+                carriers = {}
+                for plane, data in (('low', low), ('high', high), ('units', units)):
+                    carrier = f'{name}.rank{d}.{plane}'
+                    carriers[plane] = {'name': carrier} if data.size else None
+                    if data.size:
+                        writer.add_tensor(carrier, data.reshape(-1).view(np.int8))
+                shards.append({'carriers': carriers})
+            records.append({'source_name': name, 'partition': {'axis': axis, 'widths': widths, 'repeats': repeats},
+                            'shards': shards})
+            print(f'KPACK_TP_FIXTURE q={q} case={case} ranks={count}', flush=True)
+    writer.add_string('quactlize.kpack.reference.manifest', json.dumps({'tensors': records}))
     writer.write_header_to_file()
     writer.write_kv_data_to_file()
     writer.write_tensors_to_file()
@@ -164,6 +246,27 @@ def run_suite(args):
             run(label + '-cache-partial-hot', partial + ['hot-partial'], env, 0,
                 f'KPACK_CACHE PASS mode=hot-partial tensors={tensors} hits=1 gpu_shuffle={tensors - 1}')
         print(f'KPACK_CACHE_SUITE PASS formats=6 tensors=13 results={args.output}', flush=True)
+        devices = args.tp_devices or f'{args.backend},{args.backend}'
+        count = len(devices.split(','))
+        if not 2 <= count <= 16:
+            raise ValueError('--tp-devices needs 2..16 logical ranks')
+        tp = args.output / 'tp-reference.gguf'
+        tp_fixture(tp, args.reference, count)
+        command = [str(args.cache_binary.resolve()), devices, str(tp), str(args.output / 'cache-tp')]
+        run('tp-cache-cold', command + ['cold', 'tp'], env, 0, f'KPACK_TP_CACHE PASS ranks={count}')
+        run('tp-cache-hot', command + ['hot', 'tp'], env, 0, 'hits=42 gpu_shuffle=0')
+        run('tp-cache-forward-rejected', command + ['hot', 'tp-reject'], env, None,
+            'K-pack is load-only; inference is not enabled')
+        manifest_path = args.output / 'cache-tp' / 'manifest.json'
+        changed = json.loads(manifest_path.read_text())
+        for record in changed['tensors']:
+            record['arrangement']['mapping_id'] ^= 1
+        manifest_path.write_text(json.dumps(changed))
+        run('tp-cache-layout-miss', command + ['incompatible', 'tp'], env, 0, 'hits=0 gpu_shuffle=42')
+        partial = command[:-1] + [str(args.output / 'cache-tp-partial')]
+        run('tp-cache-partial-cold', partial + ['cold-partial', 'tp'], env, 0, 'hits=0 gpu_shuffle=42')
+        run('tp-cache-partial-hot', partial + ['hot-partial', 'tp'], env, 0, 'hits=1 gpu_shuffle=41')
+        print(f'KPACK_TP_SUITE PASS formats=6 cases=42 logical_ranks={count} devices={devices}', flush=True)
     print(f'KPACK_LOAD_SUITE PASS formats=5 tensors=10 results={args.output}', flush=True)
 
 

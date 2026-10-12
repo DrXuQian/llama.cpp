@@ -576,6 +576,7 @@ llama_model_loader::llama_model_loader(
         llm_kv = LLM_KV(llm_arch_from_string(arch_name));
 
         files.emplace_back(new llama_file(fname.c_str(), "rb", use_direct_io));
+        source_paths.push_back(fname);
         contexts.emplace_back(ctx);
 
         // Save tensors data offset of the main file.
@@ -621,6 +622,7 @@ llama_model_loader::llama_model_loader(
             // load other splits
             for (idx = 1; idx < n_split; idx++) {
                 const char * fname_split = splits[idx].c_str();
+                source_paths.emplace_back(fname_split);
 
                 struct gguf_init_params split_params = {
                     /*.no_alloc = */ true,
@@ -1202,6 +1204,17 @@ struct ggml_tensor * llama_model_loader::create_tensor(
                         }
                     } else {
                         buft = overrides->buft;
+                        auto * dev          = buft_list->front().first;
+                        auto * override_dev = ggml_backend_buft_get_device(buft);
+                        // Lift custom buffer families; explicit physical defaults keep their old placement.
+                        if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_META && override_dev &&
+                            buft != ggml_backend_dev_buffer_type(override_dev) && !ggml_backend_buft_is_host(buft)) {
+                            buft = ggml_backend_meta_buffer_type(dev, buft);
+                            if (!buft) {
+                                throw std::runtime_error(
+                                    format("tensor %s: incompatible TP buffer override", tensor_name.c_str()));
+                            }
+                        }
                     }
 
                     LLAMA_LOG_DEBUG("tensor %s (%zu MiB %s) buffer type overridden to %s\n",

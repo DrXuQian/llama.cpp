@@ -8,6 +8,7 @@
 #    include <cstring>
 #    include <dlfcn.h>
 #    include <map>
+#    include <iterator>
 
 namespace {
 
@@ -68,7 +69,7 @@ struct buffer_context {
     void *                                      scratch  = nullptr;
     size_t                                      capacity = 0;
     const ggml_tensor *                         pending  = nullptr;
-    size_t                                      received = 0;
+    std::map<size_t, size_t>                    received;
     upload_slot                                 uploads[2];
     unsigned                                    upload_index = 0;
     std::map<const ggml_tensor *, tensor_state> tensors;
@@ -126,6 +127,9 @@ void * get_base(ggml_backend_buffer_t buffer) {
 }
 
 ggml_status init_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor) {
+    if (ggml_nelements(tensor) == 0) {
+        return GGML_STATUS_SUCCESS;
+    }
     tensor_state state;
     if (!ggml_quactlize_can_load(tensor, &state.layout)) {
         GGML_LOG_ERROR("quactlize: unsupported load: %s (%s)\n", tensor->name, ggml_type_name(tensor->type));
@@ -136,13 +140,45 @@ ggml_status init_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor) {
     return GGML_STATUS_SUCCESS;
 }
 
-void set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
+void set_tensor_2d(ggml_backend_buffer_t buffer,
+                   ggml_tensor *         tensor,
+                   const void *          data,
+                   size_t                offset,
+                   size_t                width,
+                   size_t                rows,
+                   size_t                dst_pitch,
+                   size_t                src_pitch) {
     auto * ctx   = static_cast<buffer_context *>(buffer->context);
     auto   found = ctx->tensors.find(tensor);
     GGML_ASSERT(found != ctx->tensors.end() && !found->second.loaded);
-    GGML_ASSERT(data && size && offset <= ggml_nbytes(tensor) && size <= ggml_nbytes(tensor) - offset);
-    // Ordinary loaders may split a tensor into ordered chunks. Interleaved or strided uploads are not supported.
-    GGML_ASSERT((!ctx->pending && offset == 0) || (ctx->pending == tensor && offset == ctx->received));
+    const size_t total = ggml_nbytes(tensor);
+    GGML_ASSERT(data && width && rows && src_pitch >= width && dst_pitch >= width);
+    GGML_ASSERT(offset <= total && width <= total - offset && rows - 1 <= (total - offset - width) / dst_pitch);
+    GGML_ASSERT(rows - 1 <= (SIZE_MAX - width) / src_pitch);
+    GGML_ASSERT(!ctx->pending || ctx->pending == tensor);
+    // Track local byte coverage; segments may arrive in a strided or nonsequential order.
+    const size_t range_rows  = dst_pitch == width ? 1 : rows;
+    const size_t range_width = dst_pitch == width ? width * rows : width;
+    for (size_t row = 0; row < range_rows; ++row) {
+        const size_t begin = offset + row * dst_pitch, end = begin + range_width;
+        auto         next = ctx->received.lower_bound(begin);
+        GGML_ASSERT((next == ctx->received.end() || next->first >= end) &&
+                    (next == ctx->received.begin() || std::prev(next)->second <= begin));
+    }
+    for (size_t row = 0; row < range_rows; ++row) {
+        size_t begin = offset + row * dst_pitch, end = begin + range_width;
+        auto   next = ctx->received.lower_bound(begin);
+        if (next != ctx->received.begin() && std::prev(next)->second == begin) {
+            auto previous = std::prev(next);
+            begin         = previous->first;
+            ctx->received.erase(previous);
+        }
+        if (next != ctx->received.end() && next->first == end) {
+            end = next->second;
+            ctx->received.erase(next);
+        }
+        ctx->received.emplace(begin, end);
+    }
     ggml_cuda_set_device(ctx->device);
     const auto & layout = found->second.layout;
     if (!ctx->pending) {
@@ -152,14 +188,12 @@ void set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void *
             CUDA_CHECK(cudaMalloc(&ctx->scratch, layout.sizes.raw_bytes));
             ctx->capacity = layout.sizes.raw_bytes;
         }
-        ctx->pending  = tensor;
-        ctx->received = 0;
+        ctx->pending = tensor;
     }
-    CUDA_CHECK(cudaMemcpyAsync(static_cast<uint8_t *>(ctx->scratch) + offset, data, size, cudaMemcpyHostToDevice,
-                               ctx->stream));
+    CUDA_CHECK(cudaMemcpy2DAsync(static_cast<uint8_t *>(ctx->scratch) + offset, dst_pitch, data, src_pitch, width, rows,
+                                 cudaMemcpyHostToDevice, ctx->stream));
     CUDA_CHECK(cudaEventRecord(ctx->uploaded, ctx->stream));
-    ctx->received += size;
-    if (ctx->received == layout.sizes.raw_bytes) {
+    if (ctx->received.size() == 1 && ctx->received.begin()->first == 0 && ctx->received.begin()->second == total) {
         auto *    dst = static_cast<uint8_t *>(tensor->data);
         const int rc =
             library().pack(static_cast<const uint8_t *>(ctx->scratch), dst,
@@ -173,10 +207,14 @@ void set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void *
         CUDA_CHECK(cudaEventRecord(found->second.ready, ctx->stream));
         found->second.loaded = true;
         ctx->pending         = nullptr;
-        ctx->received        = 0;
+        ctx->received.clear();
     }
     // The caller may release its host bytes on return. The final GPU pack need not finish yet.
     CUDA_CHECK(cudaEventSynchronize(ctx->uploaded));
+}
+
+void set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
+    set_tensor_2d(buffer, tensor, data, offset, size, 1, size, size);
 }
 
 void clear_buffer(ggml_backend_buffer_t buffer, uint8_t value) {
@@ -190,7 +228,8 @@ void clear_buffer(ggml_backend_buffer_t buffer, uint8_t value) {
 }
 
 const ggml_backend_buffer_i buffer_interface = {
-    free_buffer, get_base, init_tensor, nullptr, set_tensor, nullptr, nullptr, nullptr, nullptr, clear_buffer, nullptr,
+    free_buffer,   get_base, init_tensor, nullptr,      set_tensor, nullptr,
+    set_tensor_2d, nullptr,  nullptr,     clear_buffer, nullptr,
 };
 
 ggml_backend_buffer_t alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {

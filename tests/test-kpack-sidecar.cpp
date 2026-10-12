@@ -1,6 +1,9 @@
 #include "../src/llama-kpack-cache.h"
 #include "../src/llama-mmap.h"
 #include "../ggml/src/ggml-cuda/ncp-quactlize-lib.h"
+#include "../ggml/src/ggml-backend-impl.h"
+#include "ggml-cpp.h"
+#include "ggml-alloc.h"
 
 #include <nlohmann/json.hpp>
 #include <atomic>
@@ -92,11 +95,14 @@ struct fixture {
                 for (size_t i = 0; i < data->size(); ++i) {
                     (*data)[i] = (i * 17 + q) % 256;
                 }
-                jobs.push_back({src, planes, [data](size_t off, size_t bytes, std::string &) {
+                jobs.push_back({src,
+                                planes,
+                                [data](size_t off, size_t bytes, std::string &) {
                                     check(off <= data->size() && bytes <= data->size() - off && bytes <= 4096,
                                           "chunk bounds");
                                     return data->data() + off;
-                                }});
+                                },
+                                {}});
                 inventory.push_back(src);
                 payloads.push_back(data);
             }
@@ -299,10 +305,212 @@ static void test_sync(fixture & f) {
 }
 #endif
 
+static void test_tp_raw_splits() {
+    static ggml_backend_device           devices[GGML_BACKEND_META_MAX_DEVICES]{};
+    static ggml_backend_meta_split_state split{};
+    std::vector<ggml_backend_dev_t>      simple;
+    for (auto & device : devices) {
+        device.iface.get_name = [](ggml_backend_dev_t) {
+            return "test-host";
+        };
+        device.iface.get_description = device.iface.get_name;
+        device.iface.get_buffer_type = [](ggml_backend_dev_t) {
+            return ggml_backend_cpu_buffer_type();
+        };
+        simple.push_back(&device);
+    }
+    size_t cases = 0;
+    for (int q : {0, 1, 8, 10, 11, 12, 13, 14}) {
+        for (int count : {2, 3, 4, 8, 16}) {
+            auto * device = ggml_backend_meta_device(
+                simple.data(), count,
+                [](const ggml_tensor *, void * data) { return *static_cast<ggml_backend_meta_split_state *>(data); },
+                &split);
+            auto * buft = ggml_backend_dev_buffer_type(device);
+            check(ggml_backend_meta_buffer_type_count(buft) == size_t(count), "TP buffer count");
+            for (int axis : {0, 1, 2, 3, 10}) {
+                for (int pattern = 0; pattern < 3; ++pattern) {
+                    split                                  = {};
+                    split.axis                             = static_cast<ggml_backend_meta_split_axis>(axis);
+                    int64_t                           ne[] = {512, 4, 2, 2};
+                    std::vector<std::vector<int64_t>> coordinates(count);
+                    if (axis < GGML_MAX_DIMS) {
+                        const int unit   = axis == 0 ? 512 : 1;
+                        split.n_segments = pattern == 2 ? 2 : 1;
+                        int64_t position = 0;
+                        for (size_t s = 0; s < split.n_segments; ++s) {
+                            split.nr[s] = pattern == 2 && s == 0 ? 2 : 1;
+                            for (int d = 0; d < count; ++d) {
+                                split.ne[s * count + d] = unit * (pattern == 1 ? (d == count - 1 ? 0 : d + 1) : 1);
+                            }
+                            for (size_t r = 0; r < split.nr[s]; ++r) {
+                                for (int d = 0; d < count; ++d) {
+                                    for (int64_t j = 0; j < split.ne[s * count + d]; ++j) {
+                                        coordinates[d].push_back(position++);
+                                    }
+                                }
+                            }
+                        }
+                        ne[axis] = position;
+                    } else {
+                        split.n_segments = split.nr[0] = 1;
+                    }
+                    ggml_context_ptr ctx(ggml_init({ggml_tensor_overhead(), nullptr, true}));
+                    auto *           tensor =
+                        ggml_new_tensor_4d(ctx.get(), static_cast<ggml_type>(q), ne[0], ne[1], ne[2], ne[3]);
+                    ggml_set_param(tensor);
+                    ggml_backend_buffer_ptr buffer(ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft));
+                    check(bool(buffer), "TP raw allocation");
+                    std::vector<uint8_t> raw(ggml_nbytes(tensor));
+                    for (size_t i = 0; i < raw.size(); ++i) {
+                        raw[i] = (i * 11 + i / 17 + i / 256) % 251;
+                    }
+                    // Arbitrary byte boundaries also cover a final one-row strided segment.
+                    const size_t cut = raw.size() / 3 + 1;
+                    ggml_backend_tensor_set(tensor, raw.data() + cut, cut, raw.size() - cut);
+                    ggml_backend_tensor_set(tensor, raw.data(), 0, cut);
+                    for (int d = 0; d < count; ++d) {
+                        auto * local = ggml_backend_meta_tensor_shard(tensor, d, nullptr);
+                        check(local != nullptr, "missing raw shard");
+                        std::vector<uint8_t> got(ggml_nbytes(local)), expected;
+                        if (axis == 10) {
+                            expected = raw;
+                        } else {
+                            const size_t block  = axis == 0 ? ggml_blck_size(tensor->type) : 1;
+                            const size_t stride = tensor->nb[axis];
+                            const size_t chunk  = stride * (tensor->ne[axis] / block);
+                            for (size_t outer = 0; outer < raw.size(); outer += chunk) {
+                                for (size_t x = 0; x < coordinates[d].size(); x += block) {
+                                    const size_t begin = outer + coordinates[d][x] / block * stride;
+                                    expected.insert(expected.end(), raw.begin() + begin, raw.begin() + begin + stride);
+                                }
+                            }
+                        }
+                        if (!got.empty()) {
+                            ggml_backend_tensor_get(local, got.data(), 0, got.size());
+                        }
+                        check(got == expected, "raw GGUF partition differs from coordinate oracle");
+                    }
+                    ++cases;
+                }
+            }
+        }
+    }
+    printf(
+        "KPACK_TP_RAW PASS cases=%zu devices=2,3,4,8,16 axes=K,N,E,3,mirrored "
+        "patterns=even,uneven-empty,segments-repeated\n",
+        cases);
+}
+
+static void test_tp_sidecars(fixture & f) {
+    std::string error;
+    size_t      cases = 0;
+    for (int count : {2, 3, 4, 8}) {
+        for (int axis : {0, 1, 2, 3, 10}) {
+            auto src        = f.inventory[7];  // Q4 grouped
+            src.gguf_index  = 0;
+            src.data_offset = 0;
+            src.k           = 512;
+            src.n           = 256;
+            src.experts     = 2;
+            src.rank        = axis == 3 ? 4 : 3;
+            src.batches     = axis == 3 ? 2 : 1;
+            llama_kpack_partition p;
+            p.count = count;
+            p.axis  = axis;
+            if (axis < 4) {
+                const int64_t unit = axis == 0 ? 512 : axis == 1 ? 256 : 1;
+                p.widths.assign(count, unit);
+                p.repeats = {1};
+                if (axis == 0) {
+                    src.k = unit * count;
+                }
+                if (axis == 1) {
+                    src.n = unit * count;
+                }
+                if (axis == 2) {
+                    src.experts = unit * count;
+                }
+                if (axis == 3) {
+                    src.batches = unit * count;
+                }
+            }
+            src.size_bytes    = ggml_row_size(GGML_TYPE_Q4_K, src.k) * src.n * src.experts * src.batches;
+            const auto source = f.root / ("tp-source-" + std::to_string(cases));
+            {
+                std::ofstream out(source, std::ios::binary);
+                out.seekp(src.size_bytes - 1);
+                out.put(0);
+                check(bool(out), "TP source fixture");
+            }
+            std::vector<llama_kpack_write_job> jobs;
+            for (int d = 0; d < count; ++d) {
+                p.index = d;
+                llama_kpack_source_tensor local;
+                check(llama_kpack_shard_source(src, p, local, error), error);
+                auto planes        = f.jobs[7].planes;
+                planes.low_bytes   = uint64_t(local.k) * local.n * local.experts * local.batches / 2;
+                planes.high_bytes  = 0;
+                planes.units_bytes = local.size_bytes - planes.low_bytes;
+                auto bytes         = std::make_shared<std::vector<uint8_t>>(local.size_bytes, uint8_t(d + 1));
+                jobs.push_back(
+                    {src, planes, [bytes](size_t off, size_t, std::string &) { return bytes->data() + off; }, p});
+            }
+            const auto                    dir = f.root / ("tp-cache-" + std::to_string(cases));
+            llama_kpack_background_writer writer;
+            check(writer.prepare(dir.u8string(), source.u8string(), error), error);
+            check(writer.start(jobs, {src}, 4096, error) && writer.wait(error), error);
+            llama_kpack_sidecar_reader reader;
+            check(reader.open(dir.u8string(), error) && reader.load_unchecked(source.u8string(), {src}, error), error);
+            check(reader.size() == size_t(count) && !reader.find(src.name), "TP cache accepted as unsplit");
+            for (int d = 0; d < count; ++d) {
+                p.index          = d;
+                const auto * rec = reader.find(src.name, p);
+                check(rec && rec->planes.low[0] == d + 1 && rec->planes.units[0] == d + 1, "wrong TP shard bytes");
+                auto wrong = p;
+                ++wrong.count;
+                check(!reader.find(src.name, wrong), "different TP count accepted");
+                if (!p.widths.empty()) {
+                    wrong = p;
+                    ++wrong.widths[0];
+                    check(!reader.find(src.name, wrong), "different split map accepted");
+                    wrong = p;
+                    ++wrong.repeats[0];
+                    check(!reader.find(src.name, wrong), "different repeat map accepted");
+                }
+            }
+            auto wrong = src;
+            ++wrong.batches;
+            check(!reader.load_unchecked(source.u8string(), {wrong}, error), "different source geometry accepted");
+            if (axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
+                auto changed                                = json::parse(std::ifstream(dir / "manifest.json"));
+                changed["tensors"][1]["partition"]["count"] = count + 1;
+                {
+                    std::ofstream out(dir / "manifest.json");
+                    out << changed.dump();
+                }
+                llama_kpack_sidecar_reader mixed;
+                check(!mixed.open(dir.u8string(), error), "mixed split maps accepted");
+                auto invalid = jobs;
+                ++invalid[1].partition.count;
+                llama_kpack_background_writer bad;
+                const auto                    bad_dir = f.root / ("mixed-tp-" + std::to_string(count));
+                check(bad.prepare(bad_dir.u8string(), source.u8string(), error), error);
+                check(bad.start(invalid, {src}, 4096, error) && !bad.wait(error), "mixed split maps published");
+                check(!fs::exists(bad_dir), "invalid TP cache published");
+            }
+            ++cases;
+        }
+    }
+    printf("KPACK_TP_SIDECAR PASS cases=%zu cross_topology=MISS rank4=PASS\n", cases);
+}
+
 int main() try {
     fixture     f;
     std::string error;
     test_cache_directory(f);
+    test_tp_raw_splits();
+    test_tp_sidecars(f);
     test_prefetch_coverage();
 #ifdef LLAMA_KPACK_TEST_FSYNC
     test_sync(f);

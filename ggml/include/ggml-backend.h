@@ -412,6 +412,20 @@ extern "C" {
     GGML_API ggml_backend_dev_t ggml_backend_meta_device(
         ggml_backend_dev_t * devs, size_t n_devs, ggml_backend_meta_get_split_state_t get_split_state, void * get_split_state_ud);
 
+    // Use the same buffer family on each device; NULL means incompatible.
+    GGML_API ggml_backend_buffer_type_t ggml_backend_meta_buffer_type(ggml_backend_dev_t         dev,
+                                                                      ggml_backend_buffer_type_t prototype);
+    GGML_API size_t                     ggml_backend_meta_buffer_type_count(ggml_backend_buffer_type_t buft);
+    GGML_API ggml_backend_buffer_type_t ggml_backend_meta_buffer_type_at(ggml_backend_buffer_type_t buft, size_t index);
+    // Query the placement of a static weight before allocation.
+    GGML_API bool                       ggml_backend_meta_tensor_split(ggml_backend_buffer_type_t             buft,
+                                                                       const struct ggml_tensor *             tensor,
+                                                                       struct ggml_backend_meta_split_state * split);
+    // Borrow an allocated weight shard and its split map. Invalid requests return NULL.
+    GGML_API struct ggml_tensor *       ggml_backend_meta_tensor_shard(const struct ggml_tensor *             tensor,
+                                                                       size_t                                 index,
+                                                                       struct ggml_backend_meta_split_state * split);
+
     //
     // Utils
     //

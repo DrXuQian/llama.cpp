@@ -14,7 +14,7 @@
 // Each source stat identity has its own subdirectory. Empty means unavailable.
 std::string llama_kpack_cache_directory(const std::string & source, std::string & error);
 
-// llama.kpack-cache v1: trusted local bytes, stat identity and tensor metadata.
+// llama.kpack-cache v1/v2: whole tensors; v3 also binds tensor-parallel split maps.
 // There are no payload hashes. Keep the source and cache immutable during use.
 struct llama_kpack_planes {
     const uint8_t * low         = nullptr;
@@ -34,7 +34,29 @@ struct llama_kpack_source_tensor {
     uint64_t    data_offset = 0, size_bytes = 0;
     int32_t     ggml_type = -1, rank = 0;
     int64_t     n = 0, k = 0, experts = 0;
+    int64_t     batches = 1;
 };
+
+struct llama_kpack_partition {
+    int32_t               axis  = 10;
+    uint32_t              count = 0, index = 0;
+    // Logical device order; widths are [segment, device]. Never physical GPU IDs.
+    std::vector<int64_t>  widths;
+    std::vector<uint32_t> repeats;
+
+    bool same_split(const llama_kpack_partition & other) const {
+        return axis == other.axis && count == other.count && widths == other.widths && repeats == other.repeats;
+    }
+
+    bool operator==(const llama_kpack_partition & other) const { return index == other.index && same_split(other); }
+
+    uint32_t key() const { return count ? index + 1 : 0; }
+};
+
+bool llama_kpack_shard_source(const llama_kpack_source_tensor & source,
+                              const llama_kpack_partition &     partition,
+                              llama_kpack_source_tensor &       local,
+                              std::string &                     error);
 
 struct llama_kpack_sidecar_record {
     std::string name;
@@ -49,6 +71,8 @@ struct llama_kpack_sidecar_record {
     } low, high, units;
 
     llama_kpack_planes planes;
+    llama_kpack_source_tensor source;
+    llama_kpack_partition     partition;
 };
 
 class llama_kpack_sidecar_reader {
@@ -60,7 +84,8 @@ public:
                                                       const std::vector<llama_kpack_source_tensor> & inventory,
                                                       std::string &                                  error,
                                                       int                                            loader_fd = -1);
-    const llama_kpack_sidecar_record * find(const std::string & name) const;
+    const llama_kpack_sidecar_record * find(const std::string &           name,
+                                            const llama_kpack_partition & partition = {}) const;
 
     size_t size() const { return records.size(); }
 
@@ -71,7 +96,7 @@ private:
     std::unique_ptr<impl>                   pimpl;
     std::string                             root;
     std::vector<llama_kpack_sidecar_record> records;
-    std::map<std::string, size_t>           by_name;
+    std::map<std::pair<std::string, uint32_t>, size_t> by_name;
 };
 
 class llama_kpack_sidecar_writer {
@@ -90,7 +115,8 @@ public:
                       const read_chunk &                read,
                       size_t                            chunk_bytes,
                       const cancelled &                 cancel,
-                      std::string &                     error);
+                      std::string &                     error,
+                      const llama_kpack_partition &     partition = {});
     void   skip(const std::string & name, const std::string & type_name, const std::string & reason);
     bool   finish(const std::string & model_label,
                   const std::string & source,
@@ -105,7 +131,8 @@ private:
                     const read_chunk &                read,
                     size_t                            chunk_bytes,
                     const cancelled &                 cancel,
-                    std::string &                     error);
+                    std::string &                     error,
+                    const llama_kpack_partition &     partition);
     struct impl;
     std::unique_ptr<impl> pimpl;
 };
@@ -114,6 +141,7 @@ struct llama_kpack_write_job {
     llama_kpack_source_tensor              source;
     llama_kpack_planes                     planes;
     llama_kpack_sidecar_writer::read_chunk read;
+    llama_kpack_partition                  partition;
 };
 
 // Weights and read callbacks must outlive wait()/cancel(). Neither belongs in inference.

@@ -34,6 +34,7 @@ public:
     void                       start();
 
 private:
+    llama_kpack_cache();
     struct impl;
     std::unique_ptr<impl> pimpl;
 };

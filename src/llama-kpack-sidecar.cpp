@@ -3,6 +3,7 @@
 #include "llama-mmap.h"
 
 #include "ggml.h"
+#include "ggml-backend.h"
 
 // Keep file-format tests independent of libllama and device backends.
 extern "C" void ggml_log_internal(enum ggml_log_level level, const char * format, ...);
@@ -277,7 +278,7 @@ bool parse_strict(const std::string & text, json & out, std::string & error) {
     return true;
 }
 
-bool keys_exactly(const json & o, std::initializer_list<const char *> keys, const char * what, std::string & error) {
+bool keys_exactly(const json & o, const std::set<std::string> & keys, const char * what, std::string & error) {
     if (!o.is_object()) {
         error = std::string(what) + " must be an object";
         return false;
@@ -472,9 +473,81 @@ llama_kpack_sidecar_reader::llama_kpack_sidecar_reader() : pimpl(new impl) {}
 
 llama_kpack_sidecar_reader::~llama_kpack_sidecar_reader() = default;
 
-const llama_kpack_sidecar_record * llama_kpack_sidecar_reader::find(const std::string & name) const {
-    auto it = by_name.find(name);
-    return it == by_name.end() ? nullptr : &records[it->second];
+bool llama_kpack_shard_source(const llama_kpack_source_tensor & source,
+                              const llama_kpack_partition &     p,
+                              llama_kpack_source_tensor &       local,
+                              std::string &                     error) {
+    if (!kquant_type_name(source.ggml_type) || source.rank < 2 || source.rank > 4 || source.k <= 0 || source.n <= 0 ||
+        source.batches <= 0 || (source.rank == 2 ? source.experts != 0 : source.experts <= 0) ||
+        (source.rank < 4 && source.batches != 1)) {
+        error = "invalid source geometry";
+        return false;
+    }
+    int64_t       ne[]  = {source.k, source.n, std::max<int64_t>(1, source.experts), source.batches};
+    const int64_t block = ggml_blck_size(static_cast<ggml_type>(source.ggml_type));
+    if (ne[0] % block || ne[0] > INT32_MAX || ne[1] > INT32_MAX || ne[2] > INT32_MAX / ne[3] ||
+        ne[0] > INT64_MAX / ne[1] / ne[2] / ne[3] / 2 ||
+        source.size_bytes !=
+            ggml_row_size(static_cast<ggml_type>(source.ggml_type), ne[0]) * uint64_t(ne[1]) * ne[2] * ne[3]) {
+        error = "source size differs from its GGUF geometry";
+        return false;
+    }
+    if (!p.count) {
+        if (p.index || p.axis != GGML_BACKEND_SPLIT_AXIS_MIRRORED || !p.widths.empty() || !p.repeats.empty()) {
+            error = "invalid unsplit partition";
+            return false;
+        }
+    } else if (p.count > GGML_BACKEND_META_MAX_DEVICES || p.index >= p.count) {
+        error = "invalid partition device index/count";
+        return false;
+    } else if (p.axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
+        if (!p.widths.empty() || !p.repeats.empty()) {
+            error = "mirrored partition has segments";
+            return false;
+        }
+    } else {
+        if (p.axis < 0 || p.axis >= source.rank || p.repeats.empty() || p.repeats.size() > 16 ||
+            p.widths.size() != p.repeats.size() * p.count) {
+            error = "invalid partition axis/segments";
+            return false;
+        }
+        int64_t total = 0, selected = 0;
+        for (size_t s = 0; s < p.repeats.size(); ++s) {
+            if (!p.repeats[s]) {
+                error = "zero partition repeat";
+                return false;
+            }
+            for (size_t d = 0; d < p.count; ++d) {
+                const int64_t width = p.widths[s * p.count + d];
+                if (width < 0 || (p.axis == 0 && width % block) || width > (ne[p.axis] - total) / p.repeats[s]) {
+                    error = "partition extent or block alignment differs";
+                    return false;
+                }
+                total += width * p.repeats[s];
+                if (d == p.index) {
+                    selected += width * p.repeats[s];
+                }
+            }
+        }
+        if (total != ne[p.axis]) {
+            error = "partition does not cover source";
+            return false;
+        }
+        ne[p.axis] = selected;
+    }
+    local            = source;
+    local.k          = ne[0];
+    local.n          = ne[1];
+    local.experts    = source.rank >= 3 ? ne[2] : 0;
+    local.batches    = ne[3];
+    local.size_bytes = ggml_row_size(static_cast<ggml_type>(source.ggml_type), ne[0]) * uint64_t(ne[1]) * ne[2] * ne[3];
+    return true;
+}
+
+const llama_kpack_sidecar_record * llama_kpack_sidecar_reader::find(const std::string &           name,
+                                                                    const llama_kpack_partition & partition) const {
+    auto it = by_name.find({name, partition.key()});
+    return it == by_name.end() || !(records[it->second].partition == partition) ? nullptr : &records[it->second];
 }
 
 bool llama_kpack_sidecar_reader::open(const std::string & dir, std::string & error) try {
@@ -527,10 +600,12 @@ bool llama_kpack_sidecar_reader::open(const std::string & dir, std::string & err
                       "K-pack manifest", error)) {
         return false;
     }
-    if (m["schema"] != KPACK_CACHE_SCHEMA || (m["schema_version"] != 1 && m["schema_version"] != 2)) {
+    if (m["schema"] != KPACK_CACHE_SCHEMA ||
+        (m["schema_version"] != 1 && m["schema_version"] != 2 && m["schema_version"] != 3)) {
         error = "unsupported K-pack cache schema/version";
         return false;
     }
+    const bool partitioned = m["schema_version"] == 3;
     if (m["arrangement_version"] != 2) {
         error = "production K-pack bundles require placed arrangement version 2";
         return false;
@@ -637,10 +712,13 @@ bool llama_kpack_sidecar_reader::open(const std::string & dir, std::string & err
         const json &               r = m["tensors"][i];
         llama_kpack_sidecar_record rec;
         const std::string          where = "tensor record " + std::to_string(i);
-        if (!keys_exactly(r,
-                          {"name", "ggml_type", "type_name", "route_class", "layout_name", "plane_packs", "rank", "n",
-                           "k", "experts", "arrangement_version", "arrangement", "source_tensor", "region", "spans"},
-                          where.c_str(), error)) {
+        auto                       record_keys = std::set<std::string>{
+            "name", "ggml_type", "type_name",           "route_class", "layout_name",   "plane_packs", "rank", "n",
+            "k",    "experts",   "arrangement_version", "arrangement", "source_tensor", "region",      "spans"};
+        if (partitioned) {
+            record_keys.insert("partition");
+        }
+        if (!keys_exactly(r, record_keys, where.c_str(), error)) {
             return false;
         }
         if (!get_string(r["name"], rec.name, "name", error)) {
@@ -763,7 +841,11 @@ bool llama_kpack_sidecar_reader::open(const std::string & dir, std::string & err
             (int64_t) ggml_row_size((ggml_type) rec.ggml_type, rec.k) * rec.n * (grouped ? rec.experts : 1);
 
         const json & s = r["source_tensor"];
-        if (!keys_exactly(s, {"index", "data_offset", "size_bytes"}, "source_tensor", error)) {
+        auto         source_keys = std::set<std::string>{"index", "data_offset", "size_bytes"};
+        if (partitioned) {
+            source_keys.insert({"rank", "n", "k", "experts", "batches"});
+        }
+        if (!keys_exactly(s, source_keys, "source_tensor", error)) {
             return false;
         }
         int64_t sidx, soff, ssize;
@@ -772,8 +854,68 @@ bool llama_kpack_sidecar_reader::open(const std::string & dir, std::string & err
             !get_positive(s["size_bytes"], ssize, "source_tensor.size_bytes", error)) {
             return false;
         }
-        if (ssize != raw_bytes) {
-            error = pre + "source tensor size is not the canonical GGUF size";
+        if (sidx > INT32_MAX) {
+            error = "source index too large";
+            return false;
+        }
+        rec.source = {rec.name,      int32_t(sidx), uint64_t(soff), uint64_t(ssize), rec.ggml_type,
+                      int32_t(rank), rec.n,         rec.k,          rec.experts};
+        if (partitioned) {
+            auto &       p    = rec.partition;
+            const auto & part = r["partition"];
+            if (!keys_exactly(part, {"axis", "count", "index", "widths", "repeats"}, "partition", error)) {
+                return false;
+            }
+            int64_t values[3];
+            for (int j = 0; j < 3; ++j) {
+                if (!get_nonneg(part[j == 0 ? "axis" :
+                                     j == 1 ? "count" :
+                                              "index"],
+                                values[j], "partition", error) ||
+                    values[j] > INT32_MAX) {
+                    error = "invalid partition field";
+                    return false;
+                }
+            }
+            p.axis  = values[0];
+            p.count = values[1];
+            p.index = values[2];
+            if (!part["widths"].is_array() || !part["repeats"].is_array() ||
+                part["widths"].size() > 16 * GGML_BACKEND_META_MAX_DEVICES || part["repeats"].size() > 16) {
+                error = "invalid partition arrays";
+                return false;
+            }
+            for (const auto & value : part["widths"]) {
+                int64_t width;
+                if (!get_nonneg(value, width, "partition width", error)) {
+                    return false;
+                }
+                p.widths.push_back(width);
+            }
+            for (const auto & value : part["repeats"]) {
+                int64_t repeat;
+                if (!get_positive(value, repeat, "partition repeat", error) || repeat > UINT32_MAX) {
+                    error = "invalid partition repeat";
+                    return false;
+                }
+                p.repeats.push_back(repeat);
+            }
+            int64_t source_rank;
+            if (!get_positive(s["rank"], source_rank, "source rank", error) || source_rank > 4 ||
+                !get_positive(s["n"], rec.source.n, "source N", error) ||
+                !get_positive(s["k"], rec.source.k, "source K", error) ||
+                !get_nonneg(s["experts"], rec.source.experts, "source experts", error) ||
+                !get_positive(s["batches"], rec.source.batches, "source batches", error)) {
+                error = "invalid source geometry";
+                return false;
+            }
+            rec.source.rank = source_rank;
+        }
+        llama_kpack_source_tensor local;
+        if (!llama_kpack_shard_source(rec.source, rec.partition, local, error) || local.n != rec.n ||
+            local.k != rec.k || local.experts * local.batches != rec.experts ||
+            local.size_bytes != uint64_t(raw_bytes) || (local.rank >= 3) != grouped) {
+            error = pre + "local shape disagrees with split map: " + error;
             return false;
         }
         const json & rg = r["region"];
@@ -857,13 +999,9 @@ bool llama_kpack_sidecar_reader::open(const std::string & dir, std::string & err
             error = pre + "region size does not cover its spans";
             return false;
         }
-        if ((int64_t) rec.region_size != raw_bytes) {
-            error = pre + "region is not byte-neutral with its GGUF tensor";
-            return false;
-        }
-
         // ordering across records
-        if (by_name.count(rec.name)) {
+        const auto record_key = std::make_pair(rec.name, rec.partition.key());
+        if (by_name.count(record_key)) {
             error = "duplicate tensor name in K-pack manifest: " + rec.name;
             return false;
         }
@@ -871,11 +1009,15 @@ bool llama_kpack_sidecar_reader::open(const std::string & dir, std::string & err
             error = pre + "region is not in canonical manifest order";
             return false;
         }
-        if (sidx <= prev_index) {
+        const bool sibling = !records.empty() && sidx == prev_index && rec.partition.count &&
+                             records.back().name == rec.name && records.back().partition.key() < rec.partition.key() &&
+                             records.back().partition.same_split(rec.partition) &&
+                             m["tensors"][i - 1]["source_tensor"] == s;
+        if (sidx <= prev_index && !sibling) {
             error = "K-pack source tensor indices must be strictly increasing";
             return false;
         }
-        if ((uint64_t) soff < prev_end) {
+        if ((uint64_t) soff < prev_end && !sibling) {
             error = "K-pack source tensor byte ranges must be ordered and disjoint";
             return false;
         }
@@ -891,7 +1033,7 @@ bool llama_kpack_sidecar_reader::open(const std::string & dir, std::string & err
         pl.low_bytes      = rec.low.size;
         pl.high_bytes     = rec.high.size;
         pl.units_bytes    = rec.units.size;
-        by_name[rec.name] = records.size();
+        by_name[record_key] = records.size();
         records.push_back(std::move(rec));
     }
     for (const auto & rec : records) {
@@ -938,11 +1080,10 @@ bool llama_kpack_sidecar_reader::check_source_metadata(const std::vector<llama_k
             return false;
         }
         const auto & t       = *it->second;
-        const json & s       = pimpl->manifest["tensors"][by_name.at(rec.name)]["source_tensor"];
-        const bool   grouped = rec.route_class == "grouped";
-        if (t.gguf_index != s["index"].get<int64_t>() || t.data_offset != s["data_offset"].get<uint64_t>() ||
-            t.size_bytes != s["size_bytes"].get<uint64_t>() || t.ggml_type != rec.ggml_type ||
-            t.rank != (grouped ? 3 : 2) || t.n != rec.n || t.k != rec.k || t.experts != (grouped ? rec.experts : 0)) {
+        const auto & s       = rec.source;
+        if (t.gguf_index != s.gguf_index || t.data_offset != s.data_offset || t.size_bytes != s.size_bytes ||
+            t.ggml_type != s.ggml_type || t.rank != s.rank || t.n != s.n || t.k != s.k || t.experts != s.experts ||
+            t.batches != s.batches) {
             error = "sidecar tensor " + rec.name + ": identity (index/offset/size/type/shape) disagrees with the GGUF";
             return false;
         }
@@ -995,7 +1136,9 @@ struct llama_kpack_sidecar_writer::impl {
     ojson                                         skipped    = ojson::array();
     int64_t                                       prev_index = -1;
     uint64_t                                      prev_end   = 0;
-    std::set<std::string>                         names;
+    std::set<std::pair<std::string, uint32_t>>    names;
+    bool                                          partitioned = false;
+    llama_kpack_partition                         prev_partition;
     mapped_file                                   source;
     std::string                                   source_path;
 
@@ -1140,13 +1283,14 @@ bool llama_kpack_sidecar_writer::add_stream(const llama_kpack_source_tensor & sr
                                             const read_chunk &                read,
                                             size_t                            chunk_bytes,
                                             const cancelled &                 cancel,
-                                            std::string &                     error) {
+                                            std::string &                     error,
+                                            const llama_kpack_partition &     partition) {
     const auto & source = pimpl->source;
     if (!source.file || src.data_offset > source.size || src.size_bytes > source.size - src.data_offset) {
         error = "source range is outside the bound file";
         return false;
     }
-    return add_record(src, planes, read, chunk_bytes, cancel, error);
+    return add_record(src, planes, read, chunk_bytes, cancel, error, partition);
 }
 
 bool llama_kpack_sidecar_writer::add_record(const llama_kpack_source_tensor & src,
@@ -1154,7 +1298,8 @@ bool llama_kpack_sidecar_writer::add_record(const llama_kpack_source_tensor & sr
                                             const read_chunk &                read,
                                             size_t                            chunk_bytes,
                                             const cancelled &                 cancel,
-                                            std::string &                     error) {
+                                            std::string &                     error,
+                                            const llama_kpack_partition &     partition) {
     auto &            I   = *pimpl;
     const std::string pre = src.name + ": ";
     if (!I.file) {
@@ -1170,26 +1315,43 @@ bool llama_kpack_sidecar_writer::add_record(const llama_kpack_source_tensor & sr
         error = pre + "not a K-pack format";
         return false;
     }
-    const bool grouped = src.rank == 3;
-    if (!(src.rank == 2 || src.rank == 3) || (grouped && src.experts <= 0) || (!grouped && src.experts != 0)) {
-        error = pre + "rank/experts disagree";
+    llama_kpack_source_tensor local;
+    if (!llama_kpack_shard_source(src, partition, local, error)) {
         return false;
     }
-    if (src.gguf_index <= I.prev_index) {
+    if (!local.size_bytes) {
+        error = pre + "empty shards have no cache record";
+        return false;
+    }
+    const bool    grouped = local.rank >= 3;
+    const int64_t experts = local.experts * local.batches;
+    ojson         source  = {{"index", src.gguf_index},
+                             {"data_offset", src.data_offset},
+                             {"size_bytes", src.size_bytes},
+                             {"rank", src.rank},
+                             {"n", src.n},
+                             {"k", src.k},
+                             {"experts", src.experts},
+                             {"batches", src.batches}};
+    const bool    sibling = partition.count && !I.tensors.empty() && src.gguf_index == I.prev_index &&
+                         I.tensors.back()["name"] == src.name && I.tensors.back()["source_tensor"] == source &&
+                         I.prev_partition.same_split(partition) &&
+                         I.tensors.back()["partition"]["index"].get<uint32_t>() < partition.index;
+    if (src.gguf_index < 0 || (src.gguf_index <= I.prev_index && !sibling)) {
         error = pre + "records must be added in increasing GGUF index order";
         return false;
     }
-    if (src.data_offset < I.prev_end) {
+    if (src.data_offset < I.prev_end && !sibling) {
         error = pre + "source byte ranges must be ascending and disjoint";
         return false;
     }
-    if (!I.names.insert(src.name).second) {
+    if (!I.names.insert({src.name, partition.key()}).second) {
         error = pre + "duplicate tensor";
         return false;
     }
 
     geometry g;
-    if (!derive_geometry(src.n, src.k, src.experts, grouped, planes.bits, planes.high_bits,
+    if (!derive_geometry(local.n, local.k, experts, grouped, planes.bits, planes.high_bits,
                          (int64_t) planes.units_bytes, g, error)) {
         error = pre + error;
         return false;
@@ -1198,8 +1360,8 @@ bool llama_kpack_sidecar_writer::add_record(const llama_kpack_source_tensor & sr
         error = pre + "plane sizes disagree with the arrangement";
         return false;
     }
-    const uint64_t raw_bytes = ggml_row_size((ggml_type) src.ggml_type, src.k) * (uint64_t) src.n * (uint64_t) g.e1;
-    if (src.size_bytes != raw_bytes) {
+    const uint64_t raw_bytes = ggml_row_size((ggml_type) src.ggml_type, local.k) * (uint64_t) local.n * (uint64_t) g.e1;
+    if (local.size_bytes != raw_bytes) {
         error = pre + "source size is not the canonical GGUF size";
         return false;
     }
@@ -1269,18 +1431,24 @@ bool llama_kpack_sidecar_writer::add_record(const llama_kpack_source_tensor & sr
         {"route_class", grouped ? "grouped" : "dense"},
         {"layout_name", layout_name_for(src.ggml_type)},
         {"plane_packs", ojson{{"low", 16 / planes.bits}, {"high", planes.high_bits ? 16 / planes.high_bits : 0}}},
-        {"rank", src.rank},
-        {"n", src.n},
-        {"k", src.k},
-        {"experts", grouped ? ojson(src.experts) : ojson(nullptr)},
+        {"rank", grouped ? 3 : 2},
+        {"n", local.n},
+        {"k", local.k},
+        {"experts", grouped ? ojson(experts) : ojson(nullptr)},
         {"arrangement_version", 2},
         {"arrangement", arr},
-        {"source_tensor",
-         ojson{{"index", src.gguf_index}, {"data_offset", src.data_offset}, {"size_bytes", src.size_bytes}}},
+        {"source_tensor", source},
+        {"partition", ojson{{"axis", partition.axis},
+                            {"count", partition.count},
+                            {"index", partition.index},
+                            {"widths", partition.widths},
+                            {"repeats", partition.repeats}}},
         {"region", ojson{{"offset_bytes", region_offset}, {"size_bytes", region_size}}},
         {"spans", spans},
     };
     I.tensors.push_back(std::move(rec));
+    I.partitioned |= partition.count > 0 || src.rank == 4;
+    I.prev_partition = partition;
     I.prev_index = src.gguf_index;
     I.prev_end   = src.data_offset + src.size_bytes;
     return true;
@@ -1358,9 +1526,17 @@ bool llama_kpack_sidecar_writer::finish(const std::string & model_label,
         return false;
     }
 
+    if (!I.partitioned) {
+        for (auto & record : I.tensors) {
+            record.erase("partition");
+            for (const char * key : {"rank", "n", "k", "experts", "batches"}) {
+                record["source_tensor"].erase(key);
+            }
+        }
+    }
     ojson manifest = ojson{
         {"schema", KPACK_CACHE_SCHEMA},
-        {"schema_version", 1},
+        {"schema_version", I.partitioned ? 3 : 1},
         {"arrangement_version", 2},
         {"model", model_label},
         {"source", ojson{{"format", "gguf"}, {"size_bytes", src_size}, {"identity", identity}}},
@@ -1459,14 +1635,17 @@ bool llama_kpack_background_writer::start(std::vector<llama_kpack_write_job>    
         return false;
     }
     std::sort(jobs.begin(), jobs.end(), [](const llama_kpack_write_job & a, const llama_kpack_write_job & b) {
-        return a.source.gguf_index < b.source.gguf_index;
+        return std::make_pair(a.source.gguf_index, a.partition.key()) <
+               std::make_pair(b.source.gguf_index, b.partition.key());
     });
     std::set<std::string> names;
+    std::set<std::pair<std::string, uint32_t>> snapshots;
     for (const auto & job : jobs) {
-        if (!job.read || !names.insert(job.source.name).second) {
+        if (!job.read || !snapshots.insert({job.source.name, job.partition.key()}).second) {
             error = "invalid or duplicate snapshot";
             return false;
         }
+        names.insert(job.source.name);
     }
     for (const auto & src : inventory) {
         if (!names.count(src.name)) {
@@ -1483,7 +1662,8 @@ bool llama_kpack_background_writer::start(std::vector<llama_kpack_write_job>    
             size_t     copied = 0, completed = 0;
             try {
                 for (const auto & job : jobs) {
-                    if (!I.writer.add_stream(job.source, job.planes, job.read, chunk_bytes, cancel, I.error)) {
+                    if (!I.writer.add_stream(job.source, job.planes, job.read, chunk_bytes, cancel, I.error,
+                                             job.partition)) {
                         I.writer.abort();
                         return;
                     }
