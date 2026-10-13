@@ -48,7 +48,6 @@ const pack_library & library() {
 }
 
 struct dense_library {
-    void *                                      handle    = nullptr;
     decltype(&quactlize_ppu_dense_supported_v1) supported = nullptr;
     decltype(&quactlize_ppu_dense_create_v1)    create    = nullptr;
     decltype(&quactlize_ppu_dense_prepare_v1)   prepare   = nullptr;
@@ -57,15 +56,14 @@ struct dense_library {
     decltype(&quactlize_ppu_dense_error_v1)     error     = nullptr;
 
     dense_library() {
-        const char * path = getenv("QUACTLIZE_PPU_DENSE_LIBRARY");
-        handle            = dlopen(path && *path ? path : "libquactlize_ppu_dense.so", RTLD_NOW | RTLD_LOCAL);
+        void * handle = library().handle;
         if (!handle) {
-            GGML_ABORT("quactlize: dense runtime unavailable: %s", dlerror());
+            GGML_ABORT("quactlize: pack library is unavailable for dense compute");
         }
 #    define QZ_DENSE_BIND(field)                                                                       \
         field = reinterpret_cast<decltype(field)>(dlsym(handle, "quactlize_ppu_dense_" #field "_v1")); \
         if (!field) {                                                                                  \
-            GGML_ABORT("quactlize: dense runtime missing " #field "_v1");                              \
+            GGML_ABORT("quactlize: pack library missing dense " #field "_v1");                         \
         }
         QZ_DENSE_BIND(supported);
         QZ_DENSE_BIND(create);

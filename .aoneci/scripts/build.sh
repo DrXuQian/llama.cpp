@@ -182,15 +182,10 @@ mv -f "${NCP_LIB_DIR}/build/libncp_fa.so" "${LLAMA_CI_DIR}/build-ci/bin/"
 mv -f "${NCP_LIB_DIR}/build/libquactlize_ppu_pack.so" "${LLAMA_CI_DIR}/build-ci/bin/"
 echo "    installed libncp_moe.so, libncp_fa.so, libquactlize_ppu_pack.so  -> build-ci/bin/"
 
-# The dense consumer is optional until the pinned ncp_flash_lib provides it.
-if [ -f "${NCP_LIB_DIR}/build/libquactlize_ppu_dense.so" ]; then
-    mv -f "${NCP_LIB_DIR}/build/libquactlize_ppu_dense.so" "${LLAMA_CI_DIR}/build-ci/bin/"
-    if [ -d "${NCP_LIB_DIR}/build/quactlize-runtime" ]; then
-        cp -RL "${NCP_LIB_DIR}/build/quactlize-runtime" "${LLAMA_CI_DIR}/build-ci/bin/"
-    fi
-    echo "    installed Quactlize dense runtime (automatic K-pack weights; GGML_QUACTLIZE_DENSE=0 disables it)"
-else
-    echo "WARNING: dense defaults to enabled but libquactlize_ppu_dense.so is missing; install the ncp provider before inference, or explicitly set GGML_QUACTLIZE_DENSE=0" >&2
+# The pack library also exports dense compute; JIT assets stay beside it.
+if [ -d "${NCP_LIB_DIR}/build/quactlize-runtime" ]; then
+    cp -RL "${NCP_LIB_DIR}/build/quactlize-runtime" "${LLAMA_CI_DIR}/build-ci/bin/"
+    echo "    installed quactlize-runtime -> build-ci/bin/"
 fi
 
 
