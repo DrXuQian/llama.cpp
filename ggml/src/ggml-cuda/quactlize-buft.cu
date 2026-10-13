@@ -24,7 +24,7 @@ struct pack_library {
 
     pack_library() {
         const char * path = getenv("QUACTLIZE_PPU_PACK_LIBRARY");
-        handle            = dlopen(path && *path ? path : "libquactlize_ppu_pack.so", RTLD_NOW | RTLD_LOCAL);
+        handle            = dlopen(path && *path ? path : "libquactlize_ppu.so", RTLD_NOW | RTLD_LOCAL);
         if (!handle) {
             GGML_LOG_WARN("quactlize: packer unavailable: %s\n", dlerror());
             return;

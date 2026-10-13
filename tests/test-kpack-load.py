@@ -25,7 +25,7 @@ def main():
     parser.add_argument('--binary', type=Path, required=True)
     parser.add_argument('--cache-binary', type=Path, help='also test background persistence and cross-process hits')
     parser.add_argument('--packer', type=Path, default=os.environ.get('QUACTLIZE_PPU_PACK_LIBRARY'),
-                        help='GPU pack library; defaults to QUACTLIZE_PPU_PACK_LIBRARY or the library beside --binary')
+                        help='Quactlize library; defaults to QUACTLIZE_PPU_PACK_LIBRARY or the library beside --binary')
     parser.add_argument('--output', type=Path,
                         help='new directory; default: temporary kpack-load-* directory, removed on success')
     parser.add_argument('--backend', default='CUDA0')
@@ -33,7 +33,7 @@ def main():
                         help='comma-separated TP devices; default: two logical ranks on --backend')
     args = parser.parse_args()
     if args.packer is None:
-        args.packer = args.binary.resolve().parent / 'libquactlize_ppu_pack.so'
+        args.packer = args.binary.resolve().parent / 'libquactlize_ppu.so'
     if args.reference is None:
         args.reference = args.binary.resolve().parent / 'quactlize' / 'gguf_kpack.py'
     for path in (args.binary, args.packer, args.reference):

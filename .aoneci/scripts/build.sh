@@ -111,29 +111,12 @@ else
 fi
 
 # --- 3. Build ncp_flash_lib (FA + MoE + Quactlize; GDN off) ---
-# Keep the existing FA/MoE configuration and only add the Quactlize target.
+# ncp_flash_lib owns the component build configuration.
 echo "==> [3/5] Building ncp_flash_lib (FA + MoE + Quactlize)..."
-TORCH_DIR=$(python -c 'import torch,os;print(os.path.join(os.path.dirname(torch.__file__),"share/cmake/Torch"))' 2>/dev/null || echo "")
-if [ -z "$TORCH_DIR" ]; then
-    echo "ERROR: torch not found -- MoE needs torch headers at build time" >&2
-    exit 1
-fi
-echo "    torch found: ${TORCH_DIR}"
-
-cmake -S . -B build \
-    -DCMAKE_BUILD_TYPE=Release \
-    -DCMAKE_CUDA_COMPILER="${PPU_NVCC}" \
-    -DCMAKE_CUDA_ARCHITECTURES=OFF \
-    -DNCP_BUILD_FA=ON \
-    -DNCP_BUILD_MOE=ON \
-    -DNCP_BUILD_GDN=OFF \
-    -DNCP_BUILD_QUACTLIZE=ON \
-    -DTorch_DIR="${TORCH_DIR}" \
-    -DNCP_FA_HGCC_ARCH="-arch=ppu_10"
-cmake --build build -j"${JOBS}"
+bash "${NCP_LIB_DIR}/build.sh" fa moe quactlize
 
 # Runtime libraries must load on boxes without torch.
-for so in libncp_fa.so libncp_moe.so libquactlize_ppu_pack.so; do
+for so in libncp_fa.so libncp_moe.so libquactlize_ppu.so; do
     if [ -f "build/${so}" ] && ldd "build/${so}" 2>/dev/null | grep -qi torch; then
         echo "    WARNING: ${so} links libtorch -- will fail on boxes without torch"
     fi
@@ -142,13 +125,17 @@ done
 # --- 4. Check the libraries ---
 # llama.cpp decides at COMPILE time which .so it dlopens (the -DGGML_NCP_* flags below) and looks for them next to its
 # own binaries at runtime. Those flags are stated explicitly, NOT derived from which .so happen to exist: a leftover
-# libncp_gdn.so from an earlier run must not switch the GDN hook on. Warn (don't abort): a missing .so is reported
-# here up front instead of a `mv: cannot stat` at the end of a full compile.
-for so in libncp_fa.so libncp_moe.so libquactlize_ppu_pack.so; do
+# libncp_gdn.so from an earlier run must not switch the GDN hook on. Keep the FA/MoE warnings; Quactlize requires
+# both the public library and its private runtime directory before the llama.cpp build starts.
+for so in libncp_fa.so libncp_moe.so libquactlize_ppu.so; do
     if [ ! -f "${NCP_LIB_DIR}/build/${so}" ]; then
         echo "WARNING: ${NCP_LIB_DIR}/build/${so} was not built" >&2
     fi
 done
+if [ ! -f "${NCP_LIB_DIR}/build/libquactlize_ppu.so" ] || [ ! -d "${NCP_LIB_DIR}/build/quactlize-runtime" ]; then
+    echo "ERROR: ${NCP_LIB_DIR}/build must contain libquactlize_ppu.so and quactlize-runtime/ -- rebuild the complete Quactlize package" >&2
+    exit 1
+fi
 echo "==> [4/5] FA + MoE + Quactlize libraries built (GDN stays off, K-pack dense is enabled by default)"
 
 # --- 5. Build llama.cpp, then drop the .so next to the test binaries ---
@@ -179,14 +166,12 @@ cmake --build build-ci -j"${JOBS}"
 # copied: one copy of the .so, so there is never a question of which one is being loaded. A re-run relinks it.
 mv -f "${NCP_LIB_DIR}/build/libncp_moe.so" "${LLAMA_CI_DIR}/build-ci/bin/"
 mv -f "${NCP_LIB_DIR}/build/libncp_fa.so" "${LLAMA_CI_DIR}/build-ci/bin/"
-mv -f "${NCP_LIB_DIR}/build/libquactlize_ppu_pack.so" "${LLAMA_CI_DIR}/build-ci/bin/"
-echo "    installed libncp_moe.so, libncp_fa.so, libquactlize_ppu_pack.so  -> build-ci/bin/"
+mv -f "${NCP_LIB_DIR}/build/libquactlize_ppu.so" "${LLAMA_CI_DIR}/build-ci/bin/"
+echo "    installed libncp_moe.so, libncp_fa.so, libquactlize_ppu.so  -> build-ci/bin/"
 
-# The pack library also exports dense compute; JIT assets stay beside it.
-if [ -d "${NCP_LIB_DIR}/build/quactlize-runtime" ]; then
-    cp -RL "${NCP_LIB_DIR}/build/quactlize-runtime" "${LLAMA_CI_DIR}/build-ci/bin/"
-    echo "    installed quactlize-runtime -> build-ci/bin/"
-fi
+# Keep the complete private runtime beside the public library.
+cp -RL "${NCP_LIB_DIR}/build/quactlize-runtime" "${LLAMA_CI_DIR}/build-ci/bin/"
+echo "    installed quactlize-runtime -> build-ci/bin/"
 
 
 # The .so finds its own JIT include tree at bin/deep_gemm/include through dladdr, the way deep_gemm/__init__.py uses
@@ -233,12 +218,12 @@ echo ""
 echo "========================================"
 echo "BUILD COMPLETE"
 echo "========================================"
-echo "  NCP hooks     : FA + MoE + Quactlize load-only (libraries + deep_gemm/ + quactlize/ in build-ci/bin)"
+echo "  NCP hooks     : FA + MoE + Quactlize dense (libraries + deep_gemm/ + quactlize-runtime/ + quactlize/ in build-ci/bin)"
 echo "  test binaries : ${LLAMA_CI_DIR}/build-ci/bin/"
 echo "========================================"
 echo ""
 echo "No GGML_NCP_*_LIB to export -- the \$ORIGIN runpath finds the .so in build-ci/bin."
-echo "Replacing it? Put the new .so there; the loader warns and falls back to the inline kernels when it is missing."
+echo "Replacing Quactlize? Install libquactlize_ppu.so and quactlize-runtime/ together; enabled K-pack dense does not fall back when the library is missing."
 echo ""
 echo "Before running tests manually (not via run_tests.sh), source the runtime env first:"
 echo "  source ${SCRIPT_DIR}/config.sh"

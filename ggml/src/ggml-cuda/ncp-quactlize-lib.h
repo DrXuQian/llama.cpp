@@ -1,7 +1,7 @@
 #pragma once
-// C ABI of the Quactlize packer and dense runtime in one library, built in the ncp_flash_lib repo. Only the subset
+// C ABI of the Quactlize packer and dense runtime in one library, installed through ncp_flash_lib. Only the subset
 // quactlize-buft.cu dlsym's is mirrored here, so llama.cpp needs no include path into ncp_flash_lib -- the same model
-// as ncp-moe-lib.h. Source of truth: third_party/quactlize/quactlize/packing/api.h and
+// as ncp-moe-lib.h. Source of truth: quactlize/packing/api.h, quactlize/dense/api.h and
 // quactlize/include/quactlize_ppu_config.h.
 //
 // These must stay byte-identical to what the library exports: the struct layouts are passed across the dlopen
@@ -55,7 +55,7 @@ int quactlize_ppu_prepare_fully_quantized_dev_for_arrangement_v2(
     const quactlize_ppu_placed_arrangement_v2 * arrangement,
     void *                                      stream);
 
-// Additive consumer ABI in libquactlize_ppu_pack.so, built by ncp_flash_lib.
+// Public consumer ABI in libquactlize_ppu.so, built by Quactlize and installed by ncp_flash_lib.
 // A[M,K] and C[M,N] use F32 storage; strides count elements. W[N,K] uses the
 // canonical planes below. No activation quantization to int8 or clipping.
 typedef struct {
