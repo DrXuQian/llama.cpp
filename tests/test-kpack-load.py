@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
-"""Compare the actual buffer's GPU shuffle with offline reference GGUF bytes."""
+"""Test K-pack loading or dense compute through the actual ggml CUDA backend."""
 
 import argparse
 import importlib.util
 import json
+import math
 import os
 from pathlib import Path
 import resource
+import re
 import shutil
 import subprocess
 import sys
@@ -14,8 +16,6 @@ import tempfile
 
 GGUF_PY = str(Path(__file__).resolve().parents[1] / 'gguf-py')
 sys.path.insert(0, GGUF_PY)
-import gguf
-import numpy as np
 
 
 def main():
@@ -23,11 +23,13 @@ def main():
     parser.add_argument('--reference', type=Path,
                         help='offline gguf_kpack.py; defaults to quactlize/gguf_kpack.py beside --binary')
     parser.add_argument('--binary', type=Path, required=True)
+    parser.add_argument('--compute', choices=('gemv', 'gemm', 'contract'),
+                        help='independent compute suite; needs no GGUF fixture, Python reference, numpy or torch')
     parser.add_argument('--cache-binary', type=Path, help='also test background persistence and cross-process hits')
     parser.add_argument('--packer', type=Path, default=os.environ.get('QUACTLIZE_PPU_PACK_LIBRARY'),
                         help='Quactlize library; defaults to QUACTLIZE_PPU_PACK_LIBRARY or the library beside --binary')
     parser.add_argument('--output', type=Path,
-                        help='new directory; default: temporary kpack-load-* directory, removed on success')
+                        help='new directory; default: temporary kpack-* directory, removed on success')
     parser.add_argument('--backend', default='CUDA0')
     parser.add_argument('--tp-devices', default=os.environ.get('KPACK_TP_DEVICES'),
                         help='comma-separated TP devices; default: two logical ranks on --backend')
@@ -36,24 +38,108 @@ def main():
         args.packer = args.binary.resolve().parent / 'libquactlize_ppu.so'
     if args.reference is None:
         args.reference = args.binary.resolve().parent / 'quactlize' / 'gguf_kpack.py'
-    for path in (args.binary, args.packer, args.reference):
+    for path in (args.binary, args.packer) + (() if args.compute else (args.reference,)):
         if not path.is_file():
             parser.error(f'missing {path}')
     if args.cache_binary is not None and not args.cache_binary.is_file():
         parser.error(f'missing {args.cache_binary}')
     temporary = args.output is None
     if temporary:
-        args.output = Path(tempfile.mkdtemp(prefix='kpack-load-', dir=Path.cwd()))
+        args.output = Path(tempfile.mkdtemp(prefix=f'kpack-{args.compute or "load"}-', dir=Path.cwd()))
     else:
         try:
             args.output.mkdir(parents=True, exist_ok=False)
         except FileExistsError:
             parser.error(f'--output must be a new directory, {args.output} already exists')
     args.output = args.output.resolve()
-    run_suite(args)
+    if args.compute:
+        run_compute_suite(args)
+    else:
+        run_suite(args)
     if temporary:
         shutil.rmtree(args.output)
         print(f'KPACK_LOAD_CLEANUP removed={args.output}', flush=True)
+
+
+def compute_points(suite, qtype):
+    if suite == 'contract':
+        return set()
+    shapes = ((256, 512), (768, 1536), (1024, 5120), (512, 1024 if qtype in (11, 14) else 768))
+    rows = ((range(1, 9), (1, 3, 7), (1, 8), (3,)) if suite == 'gemv' else
+            ((9, 15, 16, 17, 31, 32, 33, 127, 128, 129), (17, 33, 129), (16, 128), (17,)))
+    return {(m, n, k) for (n, k), ms in zip(shapes, rows) for m in ms}
+
+
+def check_compute_log(text, suite, qtype):
+    points = compute_points(suite, qtype)
+    marker = f'KPACK_DENSE PASS suite={suite} cases={len(points) or 1} formats=1 storage=F32 grouped=DISABLED'
+    if text.count(marker) != 1:
+        raise RuntimeError('missing/duplicate complete-suite marker')
+    if suite == 'contract':
+        if f'KPACK_DENSE_CONTRACT q={qtype} unaligned=REJECTED tail=ADMITTED grouped=REJECTED status=PASS' not in text:
+            raise RuntimeError('missing admission/rejection checks')
+        return
+    observed = re.findall(rf'^KPACK_DENSE suite={suite} q={qtype} m=(\d+) n=(\d+) k=(\d+) '
+                          r'replays=6 streams=2 weights=2 relative=(\S+) status=PASS$', text, re.MULTILINE)
+    if len(observed) != len(points) or {tuple(map(int, p[:3])) for p in observed} != points:
+        raise RuntimeError('incomplete/duplicate GEMM/GEMV numerical coverage')
+    for *_, relative in observed:
+        value = float(relative)
+        if not math.isfinite(value) or not 0 <= value < .02:
+            raise RuntimeError('invalid numerical error in a PASS record')
+    plans = re.findall(rf'\[quactlize-dense\] tensor=(dense-online|dense-cached) device=\d+ q={qtype} '
+                       r'm=(\d+) n=(\d+) k=(\d+) route=[0-3] policy=\d+ split=[1-9]\d* '
+                       r'compute=[01] workspace=\d+ config=\S+', text)
+    for weight in ('dense-online', 'dense-cached'):
+        selected = {tuple(map(int, p[1:])) for p in plans if p[0] == weight}
+        if selected != points:
+            raise RuntimeError(f'{weight}: missing actual Quactlize plan evidence')
+
+
+def run_compute_suite(args):
+    env = os.environ | {'QUACTLIZE_PPU_PACK_LIBRARY': str(args.packer.resolve()), 'GGML_QUACTLIZE_DENSE': '1'}
+    command = [str(args.binary.resolve()), '-b', args.backend, '--dense', '--suite', args.compute]
+    resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+    failures = []
+
+    def run(name, argv, environment, rejected=None):
+        log = args.output / (name + '.log')
+        print(f'KPACK_COMPUTE_START suite={args.compute} case={name} log={log}', flush=True)
+        with log.open('x') as out:
+            with subprocess.Popen(argv, env=environment, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                  text=True, errors='replace') as process:
+                for line in process.stdout:
+                    out.write(line)
+                    out.flush()
+                    if line.startswith(('KPACK_DENSE', 'KPACK_JIT')) or '[quactlize-dense]' in line:
+                        print(line, end='', flush=True)
+                rc = process.wait()
+        text = log.read_text(errors='replace')
+        if (rc != 0 if rejected is None else rc == 0 or rejected not in text):
+            raise RuntimeError(f'{name}: unexpected rc={rc} or rejection marker; see {log}')
+        return text
+
+    for qtype in (8, 10, 11, 12, 13, 14):
+        try:
+            text = run(f'q{qtype}', command + ['--qtype', str(qtype)], env)
+            check_compute_log(text, args.compute, qtype)
+        except (OSError, RuntimeError, ValueError) as error:
+            failures.append(str(error))
+            print(f'KPACK_COMPUTE_FAIL q={qtype} error={error} remaining_continue=1', flush=True)
+    if args.compute == 'contract':
+        for name, extra, changes, marker in (
+            ('grouped-rejected', ['--reject-grouped'], {}, 'unsupported packed operation MUL_MAT_ID'),
+            ('disabled', [], {'GGML_QUACTLIZE_DENSE': '0'}, 'aligned shape was rejected'),
+            ('missing-library', [], {'QUACTLIZE_PPU_PACK_LIBRARY': str(args.output / 'missing.so')}, 'packer is unavailable'),
+        ):
+            try:
+                run(name, command + ['--qtype', '12'] + extra, env | changes, marker)
+            except (OSError, RuntimeError) as error:
+                failures.append(str(error))
+                print(f'KPACK_COMPUTE_FAIL case={name} error={error} remaining_continue=1', flush=True)
+    if failures:
+        raise RuntimeError(f'{args.compute}: {len(failures)} failed checks; results={args.output}')
+    print(f'KPACK_COMPUTE_SUITE PASS suite={args.compute} formats=6 results={args.output}', flush=True)
 
 
 def q8_fixture(path):
@@ -175,6 +261,10 @@ def tp_fixture(path, reference, count):
 
 
 def run_suite(args):
+    global gguf, np
+    import gguf
+    import numpy as np
+
     print(f'KPACK_LOAD_START results={args.output}', flush=True)
     source, packed = args.output / 'source.gguf', args.output / 'reference.gguf'
     writer = gguf.GGUFWriter(source, 'llama')

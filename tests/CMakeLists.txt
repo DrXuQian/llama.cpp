@@ -313,6 +313,13 @@ if (GGML_NCP_QUACTLIZE)
         COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/test-kpack-load.py"
             --binary $<TARGET_FILE:test-kpack-load> --cache-binary $<TARGET_FILE:test-kpack-cache>)
     set_tests_properties(test-kpack-load PROPERTIES LABELS "ppu;kpack" TIMEOUT 600 RUN_SERIAL TRUE)
+    foreach(suite gemv gemm contract)
+        add_test(NAME test-kpack-${suite}
+            COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/test-kpack-load.py"
+                --binary $<TARGET_FILE:test-kpack-load> --compute ${suite})
+        set_tests_properties(test-kpack-${suite} PROPERTIES LABELS "ppu;kpack;compute" TIMEOUT 5400 RUN_SERIAL TRUE)
+    endforeach()
+    set_tests_properties(test-kpack-contract PROPERTIES TIMEOUT 120)
 endif()
 
 # NCP external kernel .so vs ggml's inline kernels. Needs at least one hook compiled in to have anything to compare;
