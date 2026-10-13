@@ -182,6 +182,15 @@ mv -f "${NCP_LIB_DIR}/build/libncp_fa.so" "${LLAMA_CI_DIR}/build-ci/bin/"
 mv -f "${NCP_LIB_DIR}/build/libquactlize_ppu_pack.so" "${LLAMA_CI_DIR}/build-ci/bin/"
 echo "    installed libncp_moe.so, libncp_fa.so, libquactlize_ppu_pack.so  -> build-ci/bin/"
 
+# The dense consumer is optional until the pinned ncp_flash_lib provides it.
+if [ -f "${NCP_LIB_DIR}/build/libquactlize_ppu_dense.so" ]; then
+    mv -f "${NCP_LIB_DIR}/build/libquactlize_ppu_dense.so" "${LLAMA_CI_DIR}/build-ci/bin/"
+    if [ -d "${NCP_LIB_DIR}/build/quactlize-runtime" ]; then
+        cp -RL "${NCP_LIB_DIR}/build/quactlize-runtime" "${LLAMA_CI_DIR}/build-ci/bin/"
+    fi
+    echo "    installed Quactlize dense runtime (enable with GGML_QUACTLIZE_DENSE=1 and explicit K-pack overrides)"
+fi
+
 
 # The .so finds its own JIT include tree at bin/deep_gemm/include through dladdr, the way deep_gemm/__init__.py uses
 # dirname(__file__) -- so nothing has to export DG_LIBRARY_ROOT, here or on a target box. Warm cubins are not shipped; the .so picks up

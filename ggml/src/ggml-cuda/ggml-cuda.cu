@@ -1697,6 +1697,11 @@ static bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
                                           const ggml_tensor * ffn_gate_bias = nullptr,
                                           const ggml_tensor * ffn_up_scale = nullptr,
                                           const ggml_tensor * ffn_gate_scale = nullptr) {
+#ifdef GGML_NCP_QUACTLIZE
+    if (ggml_quactlize_tensor_is_kpack(ffn_up->src[0]) || ggml_quactlize_tensor_is_kpack(ffn_gate->src[0])) {
+        return false;
+    }
+#endif
     const bool has_bias = ffn_up_bias != nullptr || ffn_gate_bias != nullptr;
     const bool has_scale = ffn_up_scale != nullptr || ffn_gate_scale != nullptr;
 
@@ -1831,6 +1836,11 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_f(const ggml_tensor * tensor) {
 }
 
 static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
+#ifdef GGML_NCP_QUACTLIZE
+    if (ggml_quactlize_tensor_is_kpack(tensor->src[0])) {
+        return false;
+    }
+#endif
     ggml_tensor *       src0 = tensor->src[0];
     ggml_tensor *       src1 = tensor->src[1];
     const ggml_tensor * dst  = tensor;
@@ -1860,6 +1870,12 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
 }
 
 static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+#ifdef GGML_NCP_QUACTLIZE
+    if (ggml_quactlize_tensor_is_kpack(src0)) {
+        ggml_quactlize_mul_mat(ctx, dst);
+        return;
+    }
+#endif
     GGML_TENSOR_BINARY_OP_LOCALS
 
     const int32_t hint = ggml_get_op_params_i32(dst, 1);
@@ -4383,12 +4399,12 @@ static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, co
 static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
 
-#ifdef GGML_NCP_QUACTLIZE
-    // Check before graph fusion or capture can bypass individual operator entries.
-    ggml_quactlize_assert_no_compute(cgraph);
-#endif
-
     ggml_cuda_set_device(cuda_ctx->device);
+
+#ifdef GGML_NCP_QUACTLIZE
+    // Admit packed operations and prepare plans before fusion or capture.
+    ggml_quactlize_prepare_graph(*cuda_ctx, cgraph);
+#endif
 
     bool use_cuda_graph             = false;
     bool cuda_graph_update_required = false;
@@ -5011,9 +5027,9 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
 #ifdef GGML_NCP_QUACTLIZE
     for (const ggml_tensor * src : op->src) {
         if (src && src->buffer && ggml_cuda_buft_is_quactlize(src->buffer->buft)) {
-            // Load-time placement only. graph_compute rejects all packed-weight execution.
             return src == op->src[0] && src->buffer->buft->device == dev &&
-                   (op->op == GGML_OP_MUL_MAT || op->op == GGML_OP_MUL_MAT_ID) && ggml_quactlize_can_load(src, nullptr);
+                   (ggml_quactlize_dense_enabled() ? ggml_quactlize_can_compute(op) :
+                    ((op->op == GGML_OP_MUL_MAT || op->op == GGML_OP_MUL_MAT_ID) && ggml_quactlize_can_load(src, nullptr)));
         }
     }
 #endif

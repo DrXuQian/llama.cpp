@@ -190,6 +190,7 @@ def run_suite(args):
     writer.close()
     reference = args.reference.resolve()
     env = os.environ | {'QUACTLIZE_PPU_PACK_LIBRARY': str(args.packer.resolve()),
+                        'GGML_QUACTLIZE_DENSE': '0',
                         'PYTHONPATH': GGUF_PY + os.pathsep + os.environ.get('PYTHONPATH', '')}
     subprocess.run([sys.executable, str(reference), 'pack', str(source), str(packed)], check=True, env=env)
     subprocess.run([sys.executable, str(reference), 'verify', str(packed), '--source', str(source)], check=True, env=env)

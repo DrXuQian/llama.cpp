@@ -4,6 +4,7 @@
 #    include "ggml-backend-impl.h"
 
 #    include <atomic>
+#    include <cinttypes>
 #    include <climits>
 #    include <cstring>
 #    include <dlfcn.h>
@@ -46,10 +47,83 @@ const pack_library & library() {
     return lib;
 }
 
-struct tensor_state {
+struct dense_library {
+    void *                                      handle    = nullptr;
+    decltype(&quactlize_ppu_dense_supported_v1) supported = nullptr;
+    decltype(&quactlize_ppu_dense_create_v1)    create    = nullptr;
+    decltype(&quactlize_ppu_dense_prepare_v1)   prepare   = nullptr;
+    decltype(&quactlize_ppu_dense_run_v1)       run       = nullptr;
+    decltype(&quactlize_ppu_dense_destroy_v1)   destroy   = nullptr;
+    decltype(&quactlize_ppu_dense_error_v1)     error     = nullptr;
+
+    dense_library() {
+        const char * path = getenv("QUACTLIZE_PPU_DENSE_LIBRARY");
+        handle            = dlopen(path && *path ? path : "libquactlize_ppu_dense.so", RTLD_NOW | RTLD_LOCAL);
+        if (!handle) {
+            GGML_ABORT("quactlize: dense runtime unavailable: %s", dlerror());
+        }
+#    define QZ_DENSE_BIND(field)                                                                       \
+        field = reinterpret_cast<decltype(field)>(dlsym(handle, "quactlize_ppu_dense_" #field "_v1")); \
+        if (!field) {                                                                                  \
+            GGML_ABORT("quactlize: dense runtime missing " #field "_v1");                              \
+        }
+        QZ_DENSE_BIND(supported);
+        QZ_DENSE_BIND(create);
+        QZ_DENSE_BIND(prepare);
+        QZ_DENSE_BIND(run);
+        QZ_DENSE_BIND(destroy);
+        QZ_DENSE_BIND(error);
+#    undef QZ_DENSE_BIND
+    }
+};
+
+const dense_library & dense_api() {
+    static const dense_library api;
+    return api;
+}
+
+struct dense_plan {
+    void *                           handle = nullptr;
+    quactlize_ppu_dense_plan_info_v1 info{};
+};
+
+using dense_key = std::array<int64_t, 3>;
+
+bool dense_params(const ggml_tensor * op, quactlize_ppu_dense_params_v1 & params) {
+    if (!op || op->op != GGML_OP_MUL_MAT || op->type != GGML_TYPE_F32 || !ggml_is_contiguous(op)) {
+        return false;
+    }
+    const auto *                 weight = op->src[0];
+    const auto *                 input  = op->src[1];
     ggml_quactlize_packed_layout layout{};
-    bool                         loaded = false;
-    cudaEvent_t                  ready  = nullptr;
+    if (!weight || !input || weight->ne[2] != 1 || weight->ne[3] != 1 || input->type != GGML_TYPE_F32 ||
+        !ggml_is_contiguous(input) || input->ne[0] != weight->ne[0] || op->ne[0] != weight->ne[1] ||
+        !ggml_quactlize_can_load(weight, &layout)) {
+        return false;
+    }
+    const int64_t rows = ggml_nelements(input) / input->ne[0];
+    if (rows <= 0 || rows > INT_MAX || ggml_nelements(op) / op->ne[0] != rows) {
+        return false;
+    }
+    params = {1,
+              sizeof(params),
+              int32_t(weight->type),
+              int32_t(weight->ne[1]),
+              int32_t(weight->ne[0]),
+              int32_t(rows),
+              int64_t(input->nb[1] / sizeof(float)),
+              int64_t(op->nb[1] / sizeof(float)),
+              layout.arrangement,
+              layout.sizes};
+    return true;
+}
+
+struct tensor_state {
+    ggml_quactlize_packed_layout    layout{};
+    bool                            loaded        = false;
+    cudaEvent_t                     ready         = nullptr;
+    bool                            compute_ready = false;
+    std::map<dense_key, dense_plan> plans;
 };
 
 constexpr size_t cache_chunk_bytes = 8 * 1024 * 1024;
@@ -62,17 +136,19 @@ struct upload_slot {
 
 struct buffer_context {
     int                                         device;
-    void *                                      data     = nullptr;
-    cudaStream_t                                stream   = nullptr;
+    void *                                      data        = nullptr;
+    cudaStream_t                                stream      = nullptr;
     cudaStream_t                                copy_stream = nullptr;
-    cudaEvent_t                                 uploaded = nullptr;
-    void *                                      scratch  = nullptr;
-    size_t                                      capacity = 0;
-    const ggml_tensor *                         pending  = nullptr;
+    cudaEvent_t                                 uploaded    = nullptr;
+    void *                                      scratch     = nullptr;
+    size_t                                      capacity    = 0;
+    const ggml_tensor *                         pending     = nullptr;
     std::map<size_t, size_t>                    received;
     upload_slot                                 uploads[2];
     unsigned                                    upload_index = 0;
     std::map<const ggml_tensor *, tensor_state> tensors;
+    std::mutex                                  compute_mutex;
+    void *                                      compute = nullptr;
 };
 
 struct buft_context {
@@ -101,6 +177,11 @@ void free_buffer(ggml_backend_buffer_t buffer) {
     ggml_cuda_set_device(ctx->device);
     CUDA_CHECK(cudaStreamSynchronize(ctx->stream));
     CUDA_CHECK(cudaStreamSynchronize(ctx->copy_stream));
+    if (ctx->compute) {
+        // Compute plans reference these weights and may be captured on other streams.
+        CUDA_CHECK(cudaDeviceSynchronize());
+        dense_api().destroy(ctx->compute);
+    }
     for (const auto & item : ctx->tensors) {
         if (item.second.ready) {
             CUDA_CHECK(cudaEventDestroy(item.second.ready));
@@ -440,21 +521,125 @@ bool ggml_quactlize_copy_range_wait(ggml_backend_event_t completion) {
     return rc == cudaSuccess;
 }
 
-void ggml_quactlize_assert_no_compute(const ggml_cgraph * graph) {
+bool ggml_quactlize_dense_enabled() {
+    static const bool enabled = [] {
+        const char * value = getenv("GGML_QUACTLIZE_DENSE");
+        if (!value || !*value || strcmp(value, "0") == 0) {
+            return false;
+        }
+        if (strcmp(value, "1") != 0) {
+            GGML_ABORT("GGML_QUACTLIZE_DENSE must be 0 or 1");
+        }
+        return true;
+    }();
+    return enabled;
+}
+
+bool ggml_quactlize_can_compute(const ggml_tensor * op) {
+    quactlize_ppu_dense_params_v1 params{};
+    return ggml_quactlize_dense_enabled() && dense_params(op, params) && dense_api().supported(&params) == 1;
+}
+
+void ggml_quactlize_prepare_graph(ggml_backend_cuda_context & cuda_ctx, const ggml_cgraph * graph) {
     if (!buffer_type_exposed.load(std::memory_order_acquire)) {
         return;
     }
     for (int i = 0; i < graph->n_nodes; ++i) {
         const auto * node = graph->nodes[i];
+        if (node->op == GGML_OP_NONE) {
+            continue;
+        }
         if (packed_source(node)) {
             GGML_ABORT("quactlize: K-pack is load-only; inference is not enabled (%s)", node->name);
         }
+        bool dense = false;
         for (const auto * src : node->src) {
             if (packed_source(src)) {
-                GGML_ABORT("quactlize: K-pack is load-only; inference is not enabled (%s reads %s)", node->name,
-                           src->name);
+                if (!ggml_quactlize_dense_enabled()) {
+                    GGML_ABORT("quactlize: K-pack is load-only; inference is not enabled (%s reads %s)", node->name,
+                               src->name);
+                }
+                if (src != node->src[0] || !ggml_quactlize_can_compute(node)) {
+                    GGML_ABORT("quactlize: unsupported packed operation %s (%s reads %s)", ggml_op_name(node->op),
+                               node->name, src->name);
+                }
+                dense = true;
             }
         }
+        if (!dense) {
+            continue;
+        }
+        const auto * weight = node->src[0];
+        auto *       ctx    = static_cast<buffer_context *>(weight->buffer->context);
+        GGML_ASSERT(ctx->device == cuda_ctx.device);
+        std::lock_guard<std::mutex> lock(ctx->compute_mutex);
+        auto                        found = ctx->tensors.find(weight);
+        GGML_ASSERT(found != ctx->tensors.end() && found->second.loaded);
+        auto &                        state = found->second;
+        quactlize_ppu_dense_params_v1 params{};
+        GGML_ASSERT(dense_params(node, params));
+        const dense_key key{params.m, params.input_stride, params.output_stride};
+        if (state.plans.count(key)) {
+            continue;
+        }
+        cudaStreamCaptureStatus capture;
+        CUDA_CHECK(cudaStreamIsCapturing(cuda_ctx.stream(), &capture));
+        GGML_ASSERT(capture == cudaStreamCaptureStatusNone);
+        // Retire the one-time upload before capture; no event wait is inserted in replay.
+        if (!state.compute_ready) {
+            CUDA_CHECK(cudaEventSynchronize(state.ready));
+            state.compute_ready = true;
+        }
+        const auto & api = dense_api();
+        if (!ctx->compute && (api.create(ctx->device, &ctx->compute) || !ctx->compute)) {
+            GGML_ABORT("quactlize: dense context: %s", api.error());
+        }
+        const auto * low   = static_cast<const uint8_t *>(weight->data);
+        const auto & sizes = state.layout.sizes;
+        dense_plan   plan;
+        plan.info.version = 1;
+        plan.info.size    = sizeof(plan.info);
+        if (api.prepare(ctx->compute, &params, low, sizes.high_bytes ? low + sizes.low_bytes : nullptr,
+                        low + sizes.low_bytes + sizes.high_bytes, &plan.handle, &plan.info)) {
+            GGML_ABORT("quactlize: dense prepare %s: %s", weight->name, api.error());
+        }
+        if (!plan.handle || plan.info.version != 1 || plan.info.size != sizeof(plan.info) ||
+            plan.info.workspace_bytes > SIZE_MAX || plan.info.route < 0 || plan.info.route > 3 || plan.info.split < 1 ||
+            plan.info.compute_type < 0 || plan.info.compute_type > 1 || !plan.info.config[0] ||
+            !memchr(plan.info.config, '\0', sizeof(plan.info.config))) {
+            GGML_ABORT("quactlize: invalid dense plan ABI for %s", weight->name);
+        }
+        state.plans.emplace(key, plan);
+        GGML_LOG_INFO(
+            "[quactlize-dense] tensor=%s device=%d q=%d m=%d n=%d k=%d route=%d policy=%d split=%d "
+            "compute=%d workspace=%" PRIu64 " config=%s\n",
+            weight->name, ctx->device, params.qtype, params.m, params.n, params.k, plan.info.route, plan.info.policy,
+            plan.info.split, plan.info.compute_type, plan.info.workspace_bytes, plan.info.config);
+    }
+}
+
+void ggml_quactlize_mul_mat(ggml_backend_cuda_context & cuda_ctx, ggml_tensor * dst) {
+    quactlize_ppu_dense_params_v1 params{};
+    GGML_ASSERT(ggml_quactlize_dense_enabled() && dense_params(dst, params));
+    auto * ctx = static_cast<buffer_context *>(dst->src[0]->buffer->context);
+    GGML_ASSERT(ctx->device == cuda_ctx.device);
+    dense_plan plan;
+    {
+        std::lock_guard<std::mutex> lock(ctx->compute_mutex);
+        const auto                  tensor = ctx->tensors.find(dst->src[0]);
+        GGML_ASSERT(tensor != ctx->tensors.end() && tensor->second.compute_ready);
+        const auto found = tensor->second.plans.find({params.m, params.input_stride, params.output_stride});
+        GGML_ASSERT(found != tensor->second.plans.end());
+        plan = found->second;
+    }
+    ggml_cuda_pool_alloc<uint8_t> workspace(cuda_ctx.pool());
+    if (plan.info.workspace_bytes) {
+        workspace.alloc(plan.info.workspace_bytes);
+    }
+    const auto & api = dense_api();
+    if (api.run(plan.handle, static_cast<const float *>(dst->src[1]->data), static_cast<float *>(dst->data),
+                workspace.get(), plan.info.workspace_bytes, cuda_ctx.stream())) {
+        GGML_ABORT("quactlize: dense run %s: %s", dst->name, api.error());
     }
 }
 #endif
