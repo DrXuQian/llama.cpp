@@ -524,15 +524,41 @@ bool ggml_quactlize_copy_range_wait(ggml_backend_event_t completion) {
 bool ggml_quactlize_dense_enabled() {
     static const bool enabled = [] {
         const char * value = getenv("GGML_QUACTLIZE_DENSE");
-        if (!value || !*value || strcmp(value, "0") == 0) {
+        if (!value || !*value || strcmp(value, "1") == 0) {
+            return true;
+        }
+        if (strcmp(value, "0") == 0) {
             return false;
         }
-        if (strcmp(value, "1") != 0) {
-            GGML_ABORT("GGML_QUACTLIZE_DENSE must be 0 or 1");
-        }
-        return true;
+        GGML_ABORT("GGML_QUACTLIZE_DENSE must be 0 or 1");
     }();
     return enabled;
+}
+
+ggml_backend_buffer_type_t ggml_cuda_quactlize_weight_buft(ggml_backend_dev_t  dev,
+                                                           const ggml_tensor * weight,
+                                                           ggml_op             op) {
+    if (!ggml_quactlize_dense_enabled() || op != GGML_OP_MUL_MAT || !weight || weight->ne[2] != 1 ||
+        weight->ne[3] != 1 ||
+        (weight->type != GGML_TYPE_Q8_0 && (weight->type < GGML_TYPE_Q2_K || weight->type > GGML_TYPE_Q6_K))) {
+        return nullptr;
+    }
+    if (!library().handle) {
+        GGML_ABORT("quactlize: packer unavailable for automatic dense placement");
+    }
+    ggml_quactlize_packed_layout layout{};
+    if (!ggml_quactlize_can_load(weight, &layout)) {
+        return nullptr;
+    }
+    quactlize_ppu_dense_params_v1 params{
+        1, sizeof(params), int32_t(weight->type), int32_t(weight->ne[1]), int32_t(weight->ne[0]),
+        0, weight->ne[0],  weight->ne[1],         layout.arrangement,     layout.sizes};
+    const auto & api       = dense_api();
+    const int    supported = api.supported(&params);
+    if (supported < 0 || supported > 1) {
+        GGML_ABORT("quactlize: dense weight admission %s: %s", weight->name, api.error());
+    }
+    return supported ? ggml_cuda_quactlize_extra_bufts(dev)[0] : nullptr;
 }
 
 bool ggml_quactlize_can_compute(const ggml_tensor * op) {

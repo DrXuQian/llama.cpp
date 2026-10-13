@@ -77,6 +77,8 @@ typedef struct {
 
 // Pure host admission including canonical layout/sizes: 1=supported, 0=unsupported, negative=invalid ABI.
 // Must not allocate, JIT, query the current device or dereference device data.
+// m=0 asks whether this weight supports every positive M (including decode and prefill), not an empty GEMM.
+// Automatic placement requires this guarantee: no raw-GGUF copy remains after packing.
 int quactlize_ppu_dense_supported_v1(const quactlize_ppu_dense_params_v1 * params);
 // Device is the process-local CUDA ordinal. Returns 0 and a non-NULL context on success.
 int quactlize_ppu_dense_create_v1(int device, void ** context);

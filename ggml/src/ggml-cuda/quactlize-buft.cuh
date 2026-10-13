@@ -11,6 +11,9 @@ struct ggml_quactlize_packed_layout {
 struct ggml_backend_cuda_context;
 
 ggml_backend_buffer_type_t * ggml_cuda_quactlize_extra_bufts(ggml_backend_dev_t dev);
+ggml_backend_buffer_type_t   ggml_cuda_quactlize_weight_buft(ggml_backend_dev_t  dev,
+                                                             const ggml_tensor * weight,
+                                                             ggml_op             op);
 bool                         ggml_cuda_buft_is_quactlize(ggml_backend_buffer_type_t buft);
 bool                         ggml_quactlize_can_load(const ggml_tensor * tensor, ggml_quactlize_packed_layout * layout);
 bool                         ggml_quactlize_dense_enabled();

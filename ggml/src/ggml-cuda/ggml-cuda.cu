@@ -5657,7 +5657,10 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t 
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
 #ifdef GGML_NCP_QUACTLIZE
-    // Explicit selection only; do not expose load-only buffers to automatic placement.
+    if (strcmp(name, "ggml_backend_dev_get_weight_buft") == 0) {
+        return (void *) ggml_cuda_quactlize_weight_buft;
+    }
+    // Explicit overrides remain available for load-only tests when dense is disabled.
     if (strcmp(name, "ggml_backend_dev_get_override_bufts") == 0) {
         return (void *) ggml_cuda_quactlize_extra_bufts;
     }

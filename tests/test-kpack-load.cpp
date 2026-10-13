@@ -30,9 +30,11 @@ static bool test_kpack_load(ggml_backend_t backend, const char * fixture, bool r
         }
     };
     try {
-        auto * dev   = ggml_backend_get_device(backend);
-        auto * reg   = ggml_backend_dev_backend_reg(dev);
-        auto   extra = reinterpret_cast<ggml_backend_dev_get_extra_bufts_t>(
+        auto * dev       = ggml_backend_get_device(backend);
+        auto * reg       = ggml_backend_dev_backend_reg(dev);
+        auto   preferred = reinterpret_cast<ggml_backend_dev_get_weight_buft_t>(
+            ggml_backend_reg_get_proc_address(reg, "ggml_backend_dev_get_weight_buft"));
+        auto extra = reinterpret_cast<ggml_backend_dev_get_extra_bufts_t>(
             ggml_backend_reg_get_proc_address(reg, "ggml_backend_dev_get_override_bufts"));
         auto query = reinterpret_cast<decltype(&ggml_quactlize_can_load)>(
             ggml_backend_reg_get_proc_address(reg, "ggml_quactlize_can_load"));
@@ -63,6 +65,7 @@ static bool test_kpack_load(ggml_backend_t backend, const char * fixture, bool r
                     "unpaired metadata accepted");
             auto * weight = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_Q4_K, 512, 256);
             require(!query(ggml_view_tensor(ctx.get(), weight), nullptr), "weight view accepted");
+            require(!preferred || !preferred(dev, weight, GGML_OP_MUL_MAT), "disabled dense selected K-pack");
         }
         ggml_context *                                      metadata = nullptr;
         std::unique_ptr<gguf_context, decltype(&gguf_free)> file(gguf_init_from_file(fixture, {true, &metadata}),
@@ -170,9 +173,11 @@ static bool test_kpack_dense(ggml_backend_t backend, bool reject_grouped) {
         }
     };
     try {
-        auto * dev   = ggml_backend_get_device(backend);
-        auto * reg   = ggml_backend_dev_backend_reg(dev);
-        auto   extra = reinterpret_cast<ggml_backend_dev_get_extra_bufts_t>(
+        auto * dev       = ggml_backend_get_device(backend);
+        auto * reg       = ggml_backend_dev_backend_reg(dev);
+        auto   preferred = reinterpret_cast<ggml_backend_dev_get_weight_buft_t>(
+            ggml_backend_reg_get_proc_address(reg, "ggml_backend_dev_get_weight_buft"));
+        auto extra = reinterpret_cast<ggml_backend_dev_get_extra_bufts_t>(
             ggml_backend_reg_get_proc_address(reg, "ggml_backend_dev_get_override_bufts"));
         auto read = reinterpret_cast<decltype(&ggml_quactlize_read_packed)>(
             ggml_backend_reg_get_proc_address(reg, "ggml_quactlize_read_packed"));
@@ -180,7 +185,7 @@ static bool test_kpack_dense(ggml_backend_t backend, bool reject_grouped) {
             ggml_backend_reg_get_proc_address(reg, "ggml_quactlize_set_packed"));
         auto query = reinterpret_cast<decltype(&ggml_quactlize_can_load)>(
             ggml_backend_reg_get_proc_address(reg, "ggml_quactlize_can_load"));
-        require(extra && read && install && query, "packed buffer API is unavailable");
+        require(extra && read && install && query && preferred, "packed buffer API is unavailable");
         auto ** bufts = extra(dev);
         require(bufts && bufts[0], "packer is unavailable");
         int cases = 0;
@@ -192,7 +197,12 @@ static bool test_kpack_dense(ggml_backend_t backend, bool reject_grouped) {
             auto *           cached = ggml_new_tensor_2d(weights.get(), type, k, n);
             ggml_set_name(weight, "dense-online");
             ggml_set_name(cached, "dense-cached");
-            ggml_backend_buffer_ptr packed(ggml_backend_alloc_ctx_tensors_from_buft(weights.get(), bufts[0]));
+            auto * buft = preferred(dev, weight, GGML_OP_MUL_MAT);
+            require(buft == bufts[0], "default dense weight placement is not K-pack");
+            require(!preferred(dev, weight, GGML_OP_MUL_MAT_ID), "grouped weight was selected automatically");
+            require(!preferred(dev, weight, GGML_OP_GET_ROWS), "embedding weight was selected automatically");
+            require(!preferred(dev, weight, GGML_OP_NONE), "weight with no known consumer was selected automatically");
+            ggml_backend_buffer_ptr packed(ggml_backend_alloc_ctx_tensors_from_buft(weights.get(), buft));
             require(packed != nullptr, "packed allocation failed");
             std::vector<float> source(n * k), decoded(n * k);
             for (size_t i = 0; i < source.size(); ++i) {
@@ -301,8 +311,8 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    if (dense) {
-        setenv("GGML_QUACTLIZE_DENSE", "1", 1);
+    if (!dense) {
+        setenv("GGML_QUACTLIZE_DENSE", "0", 1);
     }
 
     ggml_backend_load_all();

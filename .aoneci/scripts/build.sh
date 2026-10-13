@@ -149,7 +149,7 @@ for so in libncp_fa.so libncp_moe.so libquactlize_ppu_pack.so; do
         echo "WARNING: ${NCP_LIB_DIR}/build/${so} was not built" >&2
     fi
 done
-echo "==> [4/5] FA + MoE + Quactlize pack libraries built (GDN stays off, K-pack inference stays disabled)"
+echo "==> [4/5] FA + MoE + Quactlize libraries built (GDN stays off, K-pack dense is enabled by default)"
 
 # --- 5. Build llama.cpp, then drop the .so next to the test binaries ---
 echo "==> [5/5] Building llama.cpp..."
@@ -188,7 +188,9 @@ if [ -f "${NCP_LIB_DIR}/build/libquactlize_ppu_dense.so" ]; then
     if [ -d "${NCP_LIB_DIR}/build/quactlize-runtime" ]; then
         cp -RL "${NCP_LIB_DIR}/build/quactlize-runtime" "${LLAMA_CI_DIR}/build-ci/bin/"
     fi
-    echo "    installed Quactlize dense runtime (enable with GGML_QUACTLIZE_DENSE=1 and explicit K-pack overrides)"
+    echo "    installed Quactlize dense runtime (automatic K-pack weights; GGML_QUACTLIZE_DENSE=0 disables it)"
+else
+    echo "WARNING: dense defaults to enabled but libquactlize_ppu_dense.so is missing; install the ncp provider before inference, or explicitly set GGML_QUACTLIZE_DENSE=0" >&2
 fi
 
 
