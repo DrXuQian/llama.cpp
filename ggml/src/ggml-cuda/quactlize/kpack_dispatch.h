@@ -13,22 +13,23 @@ extern "C" {
 enum { QKS_OK = 0, QKS_MISS = 1, QKS_INVALID = 2, QKS_BINDING = 3, QKS_RUNTIME = 4 };
 
 enum {
-    QKS_RECENT                    = 1,
-    QKS_HISTORICAL                = 2,
-    QKS_PREDICTED                 = 3,
-    QKS_DEVICE_BOUNDS             = 4,
-    QKS_MEASURED_GROUPED          = 5,
-    QKS_Q8_INITIAL                = 6,
-    QKS_DECODE_MEASURED           = 7,
-    QKS_COMPONENT_MEASURED        = 8,
-    QKS_SMALLM_EXACT              = 9,
-    QKS_SMALLM_BUCKET             = 10,
-    QKS_COMPUTE_INITIAL           = 11,
-    QKS_MATCHED_EXACT             = 12,
-    QKS_MATCHED_BUCKET            = 13,
-    QKS_MATCHED_ROUTER            = 14,
-    QKS_Q8_VECTOR_MEASURED        = 15,
-    QKS_DECODE_COMPONENT_MEASURED = 18
+    QKS_RECENT                     = 1,
+    QKS_HISTORICAL                 = 2,
+    QKS_PREDICTED                  = 3,
+    QKS_DEVICE_BOUNDS              = 4,
+    QKS_MEASURED_GROUPED           = 5,
+    QKS_Q8_INITIAL                 = 6,
+    QKS_DECODE_MEASURED            = 7,
+    QKS_COMPONENT_MEASURED         = 8,
+    QKS_SMALLM_EXACT               = 9,
+    QKS_SMALLM_BUCKET              = 10,
+    QKS_COMPUTE_INITIAL            = 11,
+    QKS_MATCHED_EXACT              = 12,
+    QKS_MATCHED_BUCKET             = 13,
+    QKS_MATCHED_ROUTER             = 14,
+    QKS_Q8_VECTOR_MEASURED         = 15,
+    QKS_DECODE_COMPONENT_MEASURED  = 18,
+    QKS_PREFILL_COMPONENT_MEASURED = 19
 };
 
 // Additive Q8_0/W8A16 intake capability, without a device/context or JIT.
@@ -113,6 +114,25 @@ int quactlize_kpack_dispatch_prefill_v1(qks_request_v1 const*, uint32_t mask,
 // donor costs, not relabeled BF16 measurements. No small-M full expansion.
 int quactlize_kpack_dispatch_prefill_compute_v1(qks_request_v1 const*, uint32_t mask,
     int32_t compute_type, qks_prefill_choice_v1*);
+
+// Exact confirmed component selection. MISS is out of domain; BINDING means
+// the known winner's helper/provider is missing, never a silent old fallback.
+typedef struct {
+    uint32_t              version, size;
+    qks_prefill_choice_v1 base;
+    int32_t               policy, compute_type, channels;
+} qks_prefill_choice_v2;
+
+int quactlize_kpack_dispatch_prefill_v2(const qks_request_v1 *,
+                                        uint32_t mask,
+                                        int32_t  compute_type,
+                                        int32_t  channels,
+                                        qks_prefill_choice_v2 *);
+int quactlize_kpack_dispatch_query_prefill_v1(void *,
+                                              const qks_request_v1 *,
+                                              int32_t compute_type,
+                                              int32_t channels,
+                                              qks_choice_v1 *);
 
 // One runtime per device/context. root contains the exact modules packaged
 // with this host library. open/query/prepare belong outside graph capture.

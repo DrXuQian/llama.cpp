@@ -479,8 +479,18 @@ Plan & prepare(ggml_backend_cuda_context & ctx, const ggml_tensor * weight,
     } else {
         qks_request_v1 r{1, sizeof(r), art.qtype, ids ? QK_GROUPED_FQ : QK_DENSE_FQ,
             p->rows, int(art.n), int(art.k), int(art.experts), int(tokens), art.arrangement.mapping_id};
+        bool           confirmed_prefill = false;
+        const int      channels          = ids ? int(input->ne[1]) : 1;
         p->dense_io = !ids && tokens <= 8 && owner.api->query_dense_io && owner.api->prepare_dense_io;
-        auto query_tc = [&](bool decode = false) {
+        auto query_tc                    = [&](bool decode = false) {
+            if (confirmed_prefill) {
+                int rc = owner.api->query_prefill(owner.runtime, &r, p->compute, channels, &p->choice);
+                if (rc != QKS_OK) {
+                    GGML_ABORT("[quactlize] %s: confirmed prefill materialization failed: %s", weight->name,
+                                                  owner.api->error());
+                }
+                return rc;
+            }
             if (p->compute == QK_COMPUTE_BF16)
                 return owner.api->query_compute(owner.runtime, &r, p->compute, p->dense_io ? QKD_F32 : 0,
                     int(decode), &p->choice);
@@ -490,7 +500,8 @@ Plan & prepare(ggml_backend_cuda_context & ctx, const ggml_tensor * weight,
                             owner.api->query(owner.runtime, &r, &p->choice);
         };
         int status = p->table_tc ? QKS_OK : QKS_MISS;
-        if (!p->table_tc && p->compute == QK_COMPUTE_F16 && mode == RouteMode::Auto && art.qtype == GGML_TYPE_Q4_K && owner.api->query_decode) {
+        if (!p->table_tc && tokens <= 8 && p->compute == QK_COMPUTE_F16 && mode == RouteMode::Auto &&
+            art.qtype == GGML_TYPE_Q4_K && owner.api->query_decode) {
             status = query_tc(true);
             if (status != QKS_OK && status != QKS_MISS)
                 GGML_ABORT("[quactlize] %s: decode TC selection: %s", weight->name, owner.api->error());
@@ -502,8 +513,22 @@ Plan & prepare(ggml_backend_cuda_context & ctx, const ggml_tensor * weight,
             if (owner.api->prefill_choice) {
                 unsigned mask=prefill_mask(owner.api,ids!=nullptr);
                 if (p->compute==QK_COMPUTE_BF16 && !owner.api->dequant_compute) mask=1;
-                int rc=p->compute==QK_COMPUTE_BF16 ? owner.api->prefill_compute(&r,mask,p->compute,&prefill) :
-                    owner.api->prefill_choice(&r,mask,&prefill);
+                int rc = QKS_MISS;
+                if (owner.api->prefill_confirmed) {
+                    qks_prefill_choice_v2 decision{};
+                    rc = owner.api->prefill_confirmed(&r, mask, p->compute, channels, &decision);
+                    if (rc == QKS_OK) {
+                        prefill           = decision.base;
+                        confirmed_prefill = true;
+                    } else if (rc == QKS_BINDING) {
+                        GGML_ABORT("[quactlize] %s: confirmed prefill requires an unavailable helper/provider",
+                                   weight->name);
+                    }
+                }
+                if (rc == QKS_MISS) {
+                    rc = p->compute == QK_COMPUTE_BF16 ? owner.api->prefill_compute(&r, mask, p->compute, &prefill) :
+                                                         owner.api->prefill_choice(&r, mask, &prefill);
+                }
                 if (rc!=QKS_OK && rc!=QKS_MISS) GGML_ABORT("[quactlize] prefill policy query failed rc=%d",rc);
                 if (rc==QKS_OK) prefill_choice=prefill.route;
             } else if (p->compute==QK_COMPUTE_F16) prefill_choice=ggml_quactlize_prefill_route(r);
@@ -537,16 +562,30 @@ Plan & prepare(ggml_backend_cuda_context & ctx, const ggml_tensor * weight,
                 GGML_ABORT("[quactlize] %s: full-BF16 prepare: %s",weight->name,owner.api->full_error());
             const char * image=owner.api->full_image(p->full_handle);
             GGML_ASSERT(image && !strchr(image,'\n') && !strchr(image,'"'));
-            GGML_LOG_INFO("[quactlize-plan] tensor=%s op=%s route=full-bf16 q=%d rows=%d n=%" PRId64 " k=%" PRId64 " experts=%" PRId64 " dequant=%d knot_tokens=%d predicted=%d workspace=%" PRIu64 " cost_scope=ISOLATED_COMPONENT_SUM\n",
-                weight->name,ids ? "grouped":"dense",art.qtype,p->rows,art.n,art.k,art.experts,prefill.dequant_config,prefill.measured_tokens,prefill.predicted,bytes);
+            GGML_LOG_INFO("[quactlize-plan] tensor=%s op=%s route=full-bf16 q=%d rows=%d n=%" PRId64 " k=%" PRId64
+                          " experts=%" PRId64 " dequant=%d knot_tokens=%d predicted=%d workspace=%" PRIu64
+                          " cost_scope=ISOLATED_COMPONENT_SUM policy=%d channels=%d\n",
+                          weight->name, ids ? "grouped" : "dense", art.qtype, p->rows, art.n, art.k, art.experts,
+                          prefill.dequant_config, prefill.measured_tokens, prefill.predicted, bytes,
+                          confirmed_prefill ? QKS_PREFILL_COMPONENT_MEASURED : QKS_COMPONENT_MEASURED, channels);
             GGML_LOG_INFO("[quactlize-prefill-image] tensor=%s rows=%d provider=%s image=\"%s\"\n",
                 weight->name,p->rows,ids ? "deepgemm":"cublas",image);
             return save_plan();
         }
         if (prefill_choice==1 && owner.api->prefill_choice) p->sf_config=prefill.dequant_config;
-        if (p->compute==QK_COMPUTE_BF16 && p->sf_config>=0 && p->sf_config!=4 && p->sf_config!=5) p->sf_config=0;
-        if (p->compute==QK_COMPUTE_BF16 && prefill_choice>=0)
-            GGML_LOG_INFO("[quactlize-prefill] tensor=%s route=%d proposal=F16_COMPONENT_TRANSFER bf16_measured=0\n",weight->name,prefill_choice);
+        if (!confirmed_prefill && p->compute == QK_COMPUTE_BF16 && p->sf_config >= 0 && p->sf_config != 4 &&
+            p->sf_config != 5) {
+            p->sf_config = 0;
+        }
+        if (confirmed_prefill) {
+            GGML_LOG_INFO(
+                "[quactlize-prefill] tensor=%s route=%d dequant=%d policy=19 activation=%s channels=%d "
+                "cost_scope=CONFIRMED_COMPONENT_SUM_MODEL_AB_PENDING\n",
+                weight->name, prefill_choice, prefill.dequant_config, compute_name(p->compute), channels);
+        } else if (p->compute == QK_COMPUTE_BF16 && prefill_choice >= 0) {
+            GGML_LOG_INFO("[quactlize-prefill] tensor=%s route=%d proposal=F16_COMPONENT_TRANSFER bf16_measured=0\n",
+                          weight->name, prefill_choice);
+        }
         if (art.qtype == GGML_TYPE_Q8_0) {
             r.route = ids ? QK_GROUPED_SF : QK_DENSE_SF;
             if (!p->table_tc) status = query_tc();
@@ -654,9 +693,12 @@ Plan & prepare(ggml_backend_cuda_context & ctx, const ggml_tensor * weight,
                     weight->name,int(p->indexed),int(p->indexed));
             }
             GGML_LOG_INFO("[quactlize-plan] tensor=%s op=%s route=%s q=%d rows=%d n=%" PRId64 " k=%" PRId64
-                " parent=%s build=%s algorithm=%d split=%d grid=%d policy=%d prefill_choice=%d activation=%s scale_resident=%d\n", weight->name, ids ? "grouped" : "dense",
-                p->sf ? "sf" : "fq", art.qtype, p->rows, art.n, art.k, p->choice.parent, p->choice.build_key,
-                p->choice.algorithm, p->choice.split, p->choice.grid, p->choice.policy, prefill_choice, compute_name(p->compute), int(p->scale_resident));
+                          " parent=%s build=%s algorithm=%d split=%d grid=%d policy=%d prefill_choice=%d activation=%s "
+                          "scale_resident=%d dequant=%d channels=%d experts=%" PRId64 "\n",
+                          weight->name, ids ? "grouped" : "dense", p->sf ? "sf" : "fq", art.qtype, p->rows, art.n,
+                          art.k, p->choice.parent, p->choice.build_key, p->choice.algorithm, p->choice.split,
+                          p->choice.grid, p->choice.policy, prefill_choice, compute_name(p->compute),
+                          int(p->scale_resident), p->sf_config, channels, art.experts);
             if (p->dense_io)
                 GGML_LOG_INFO("[quactlize-adapter] tensor=%s dense_io=FP32 standalone_adapters=0\n", weight->name);
         }

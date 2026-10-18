@@ -826,7 +826,7 @@ int main(int argc, char ** argv) {
         adapter = (root / "ggml/src/ggml-cuda/quactlize-execution.cu").read_text()
         body = "bool apply_matched(" + adapter.split("bool apply_matched(", 1)[1].split("const char * matched_name", 1)[0]
         self.assertLess(adapter.index("owner.api->query_smallm_matched(owner.runtime"), adapter.index("if (!p->matched)"))
-        self.assertIn("if (!p->table_tc && p->compute == QK_COMPUTE_F16", adapter)
+        self.assertRegex(adapter, r"if \(!p->table_tc && tokens <= 8 && p->compute == QK_COMPUTE_F16")
         self.assertIn("sizes = p->smallm.sizes;", adapter)
         with tempfile.TemporaryDirectory() as tmp:
             source, binary = Path(tmp) / "matched.cpp", Path(tmp) / "matched"
@@ -893,6 +893,21 @@ int main() {
                         selection(line, bad, ["dense"])
                 with self.assertRaises(ValueError):
                     selection(lines[2].replace(label, "INITIAL_COMPUTE"), manifest)
+
+    def test_confirmed_prefill_is_not_a_decode_or_cross_precision_label(self):
+        for op, compute, rows, experts in (("dense", "f16", 128, 1), ("grouped", "bf16", 1024, 256)):
+            module = dict(key="a"*64, parent=dict(symbol="confirmed", qtype=12, route="sf-"+op),
+                          identity=dict(compute_type=compute))
+            manifest = dict(modules=[module], compute_contract=True, prefill_confirmed=dict(path="prefill-confirmed.json"))
+            text = (f"[quactlize-plan] tensor=w op={op} route=sf q=12 rows={rows} n=512 k=2048 "
+                    f"parent=confirmed build={'a'*64} split=1 grid=72 policy=19 channels=1 experts={experts} "
+                    f"activation={'FP16' if compute=='f16' else 'BF16'}")
+            self.assertTrue(selection(text, manifest, [op])["fully_selected"])
+            for bad in (text.replace(f"rows={rows}", "rows=8"), text.replace("channels=1", "channels=8"),
+                        text.replace("q=12", "q=8"), text.replace("route=sf", "route=gemv")):
+                with self.assertRaises(ValueError): selection(bad, manifest, [op])
+            with self.assertRaisesRegex(ValueError, "unbound confirmed"):
+                selection(text, dict(manifest, prefill_confirmed=None), [op])
 
     def test_abba(self):
         arms = []

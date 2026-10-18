@@ -119,6 +119,11 @@ const ggml_quactlize_execution_api * ggml_quactlize_execution_library() {
         }
         result.prefill_choice = reinterpret_cast<decltype(result.prefill_choice)>(
             dlsym(host,"quactlize_kpack_dispatch_prefill_v1"));
+        result.prefill_confirmed =
+            reinterpret_cast<decltype(result.prefill_confirmed)>(dlsym(host, "quactlize_kpack_dispatch_prefill_v2"));
+        if (result.prefill_confirmed) {
+            QZ_BIND(query_prefill, host, "quactlize_kpack_dispatch_query_prefill_v1");
+        }
         const std::string prefill_path = directory + "/libquactlize_ppu_prefill.so";
         if (access(prefill_path.c_str(), F_OK) == 0) {
             void * prefill = dlopen(prefill_path.c_str(), RTLD_NOW | RTLD_LOCAL);

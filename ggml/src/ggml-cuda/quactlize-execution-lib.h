@@ -39,6 +39,8 @@ struct ggml_quactlize_execution_api {
     decltype(&quactlize_kpack_dispatch_prepare_dense_io_v1) prepare_dense_io;
     decltype(&quactlize_kpack_dispatch_prefill_v1) prefill_choice;
     decltype(&quactlize_kpack_dispatch_prefill_compute_v1) prefill_compute;
+    decltype(&quactlize_kpack_dispatch_prefill_v2)            prefill_confirmed;
+    decltype(&quactlize_kpack_dispatch_query_prefill_v1)      query_prefill;
     decltype(&quactlize_kpack_dequant_v1) dequant;
     decltype(&quactlize_kpack_dequant_v2) dequant_compute;
     decltype(&quactlize_kpack_prefill_query_v1) full_query;

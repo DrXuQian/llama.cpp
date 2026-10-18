@@ -284,6 +284,15 @@ def selection(text, manifest, expected_ops=None):
                     "unbound Q8 vector replacement")
         if r.get("policy") == "18":
             require(manifest.get("component_decode"), "unbound component decode replacement")
+        confirmed_prefill = r.get("policy") == "19"
+        if confirmed_prefill:
+            require(manifest.get("prefill_confirmed") and int(r.get("q", 0)) in range(10, 15) and
+                    r["route"] in ("fq", "sf", "full-bf16") and
+                    r.get("channels") == "1" and r.get("experts") == ("1" if r["op"] == "dense" else "256") and
+                    (r["route"] == "full-bf16" or r.get("activation") == ("FP16" if r["op"] == "dense" else "BF16")) and
+                    (int(r.get("rows", 0)) in (128, 512, 1024, 2048, 4096) if r["op"] == "dense" else
+                     int(r.get("rows", 0)) in (1024, 4096, 8192, 16384, 32768)),
+                    "unbound confirmed prefill policy")
         if r["route"] == "full-bf16":
             require(manifest.get("prefill") and int(r.get("q",0)) in range(10,15)
                     and int(r.get("n",0))>0 and int(r.get("k",0))>0
@@ -325,7 +334,7 @@ def selection(text, manifest, expected_ops=None):
             require(r.get("activation", "FP16") == ("BF16" if compute == "bf16" else "FP16"),
                     "selected module compute type differs from caller")
             if compute == "bf16":
-                require(manifest.get("compute_contract") and (matched or r.get("policy") == "11"),
+                require(manifest.get("compute_contract") and (matched or confirmed_prefill or r.get("policy") == "11"),
                         "BF16 proposal relabeled as FP16 measurement")
             require(
                 int(r["q"]) == p["qtype"] and p["route"] == r["route"] + "-" + r["op"],
