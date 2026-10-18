@@ -10,15 +10,26 @@
 extern "C" {
 #endif
 
-enum { QKS_OK = 0, QKS_MISS = 1, QKS_INVALID = 2, QKS_BINDING = 3,
-       QKS_RUNTIME = 4 };
-enum { QKS_RECENT = 1, QKS_HISTORICAL = 2, QKS_PREDICTED = 3,
-       QKS_DEVICE_BOUNDS = 4, QKS_MEASURED_GROUPED = 5, QKS_Q8_INITIAL = 6,
-       QKS_DECODE_MEASURED = 7, QKS_COMPONENT_MEASURED = 8,
-       QKS_SMALLM_EXACT = 9, QKS_SMALLM_BUCKET = 10,
-       QKS_COMPUTE_INITIAL = 11, QKS_MATCHED_EXACT = 12,
-       QKS_MATCHED_BUCKET = 13, QKS_MATCHED_ROUTER = 14,
-       QKS_Q8_VECTOR_MEASURED = 15 };
+enum { QKS_OK = 0, QKS_MISS = 1, QKS_INVALID = 2, QKS_BINDING = 3, QKS_RUNTIME = 4 };
+
+enum {
+    QKS_RECENT                    = 1,
+    QKS_HISTORICAL                = 2,
+    QKS_PREDICTED                 = 3,
+    QKS_DEVICE_BOUNDS             = 4,
+    QKS_MEASURED_GROUPED          = 5,
+    QKS_Q8_INITIAL                = 6,
+    QKS_DECODE_MEASURED           = 7,
+    QKS_COMPONENT_MEASURED        = 8,
+    QKS_SMALLM_EXACT              = 9,
+    QKS_SMALLM_BUCKET             = 10,
+    QKS_COMPUTE_INITIAL           = 11,
+    QKS_MATCHED_EXACT             = 12,
+    QKS_MATCHED_BUCKET            = 13,
+    QKS_MATCHED_ROUTER            = 14,
+    QKS_Q8_VECTOR_MEASURED        = 15,
+    QKS_DECODE_COMPONENT_MEASURED = 18
+};
 
 // Additive Q8_0/W8A16 intake capability, without a device/context or JIT.
 // Returns 1 for supported weight geometry and SF route (1=dense,3=grouped).
@@ -79,6 +90,9 @@ typedef struct {
 } qks_smallm_choice_v2;
 int quactlize_kpack_dispatch_query_smallm_v3(void* runtime,qkg_simt_call_v2 const*,
     quactlize_ppu_placed_arrangement_v2 const*,qks_smallm_choice_v2*);
+int quactlize_kpack_dispatch_smallm_dequant_v1(const qkg_simt_call_v2 *,
+                                               const quactlize_ppu_placed_arrangement_v2 *,
+                                               int32_t * config);
 
 typedef struct {
     uint32_t version, size;

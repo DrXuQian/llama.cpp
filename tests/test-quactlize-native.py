@@ -840,7 +840,7 @@ struct Plan {
 };
 ''' + body + '''
 int main() {
-  for(int compute:{0,1}) for(int policy:{12,13,14}) for(int kind:{0,1,2}) {
+  for(int compute:{0,1}) for(int policy:{12,13,14,18}) for(int kind:{0,1,2}) {
     Plan p;p.compute=compute;
     qks_smallm_choice_v2 m{2,sizeof(m)};m.compute_type=compute;
     auto& b=m.base;b.version=1;b.size=sizeof(b);b.kind=kind;b.policy=policy;
@@ -853,11 +853,12 @@ int main() {
     assert(p.reuse==(kind==1) && p.q4_decode==(kind==2));assert(!memcmp(&p.smallm,&b,sizeof(b)));
     if(kind==0) assert(!memcmp(&p.choice,&b.tc,sizeof(b.tc)));
     if(kind==2) assert(!memcmp(&p.q4_config,&m.q4,sizeof(m.q4)));
-    for(int fault=0;fault<7;++fault) {
+    for(int fault=0;fault<9;++fault) {
       auto bad=m;Plan rejected;rejected.compute=compute;
       if(fault==0) bad.version=1;if(fault==1) --bad.size;if(fault==2) bad.compute_type=1-compute;
       if(fault==3) bad.base.version=2;if(fault==4) --bad.base.size;
       if(fault==5) bad.base.kind=3;if(fault==6) bad.base.policy=11;
+      if(fault==7) bad.base.policy=16;if(fault==8) bad.base.policy=17;
       assert(!apply_matched(rejected,bad) && !rejected.matched);
     }
   }

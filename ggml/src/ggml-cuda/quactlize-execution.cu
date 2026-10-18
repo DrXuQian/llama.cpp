@@ -95,8 +95,12 @@ struct Plan {
 bool apply_matched(Plan & p, const qks_smallm_choice_v2 & selected) {
     const auto & c = selected.base;
     if (selected.version != 2 || selected.size != sizeof(selected) || selected.compute_type != p.compute ||
-        c.version != 1 || c.size != sizeof(c) || c.policy < QKS_MATCHED_EXACT || c.policy > QKS_Q8_VECTOR_MEASURED ||
-        c.kind < QKS_SMALLM_TC || c.kind > QKS_SMALLM_Q4) return false;
+        c.version != 1 || c.size != sizeof(c) ||
+        ((c.policy < QKS_MATCHED_EXACT || c.policy > QKS_Q8_VECTOR_MEASURED) &&
+         c.policy != QKS_DECODE_COMPONENT_MEASURED) ||
+        c.kind < QKS_SMALLM_TC || c.kind > QKS_SMALLM_Q4) {
+        return false;
+    }
     if (c.policy == QKS_Q8_VECTOR_MEASURED && (c.kind != QKS_SMALLM_SIMT || c.simt.variant < 4 || c.simt.variant > 5)) return false;
     if (c.kind == QKS_SMALLM_TC && (c.tc.version != 1 || c.tc.size != sizeof(c.tc) || !c.tc.ticket || c.tc.policy != c.policy)) return false;
     if (c.kind == QKS_SMALLM_SIMT && (c.simt.version != 1 || c.simt.size != sizeof(c.simt))) return false;
@@ -115,6 +119,9 @@ const char * matched_name(int policy) {
     if (policy == QKS_MATCHED_EXACT) return "MATCHED_EXACT";
     if (policy == QKS_MATCHED_BUCKET) return "MATCHED_BUCKET_PREDICTED";
     if (policy == QKS_Q8_VECTOR_MEASURED) return "Q8_VECTOR_MEASURED";
+    if (policy == QKS_DECODE_COMPONENT_MEASURED) {
+        return "DECODE_COMPONENT_MEASURED";
+    }
     return "MATCHED_ROUTER_MINIMAX";
 }
 struct Scratch { void * pointer = nullptr; size_t capacity = 0; };
@@ -363,6 +370,13 @@ Plan & prepare(ggml_backend_cuda_context & ctx, const ggml_tensor * weight,
             if (rc == QKS_OK) {
                 if (!apply_matched(*p, selected))
                     GGML_ABORT("[quactlize] %s: invalid matched decode identity", weight->name);
+                if (owner.api->smallm_dequant) {
+                    if (owner.api->smallm_dequant(&typed, &art.arrangement, &p->sf_config) != QKS_OK) {
+                        GGML_ABORT("[quactlize] %s: matched metadata selection failed", weight->name);
+                    }
+                } else if (p->smallm.policy == QKS_DECODE_COMPONENT_MEASURED) {
+                    GGML_ABORT("[quactlize] %s: component policy requires matched metadata API", weight->name);
+                }
                 GGML_LOG_INFO("[quactlize-decode] tensor=%s table=%s kind=%d source=%dx%dx%d activation=%s\n",
                     weight->name, matched_name(p->smallm.policy), p->smallm.kind,
                     p->smallm.source_tokens, p->smallm.source_n, p->smallm.source_k, compute_name(p->compute));

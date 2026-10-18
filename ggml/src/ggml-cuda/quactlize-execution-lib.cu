@@ -43,6 +43,8 @@ const ggml_quactlize_execution_api * ggml_quactlize_execution_library() {
             dlsym(host, "quactlize_kpack_dispatch_query_smallm_v1"));
         result.query_smallm_matched = reinterpret_cast<decltype(result.query_smallm_matched)>(
             dlsym(host, "quactlize_kpack_dispatch_query_smallm_v3"));
+        result.smallm_dequant = reinterpret_cast<decltype(result.smallm_dequant)>(
+            dlsym(host, "quactlize_kpack_dispatch_smallm_dequant_v1"));
         if (result.query_smallm) {
             QZ_BIND(simt_query, device, "quactlize_kpack_simt_query_v1");
             QZ_BIND(simt_run, device, "quactlize_kpack_simt_run_v1");

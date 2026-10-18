@@ -273,7 +273,7 @@ def selection(text, manifest, expected_ops=None):
             and r.get("route") in ("fq", "sf", "gemv", "gemv-q4-s1", "full-bf16"),
             "invalid plan receipt",
         )
-        matched_labels = {"12": "MATCHED_EXACT", "13": "MATCHED_BUCKET_PREDICTED", "14": "MATCHED_ROUTER_MINIMAX", "15": "Q8_VECTOR_MEASURED"}
+        matched_labels = {"12": "MATCHED_EXACT", "13": "MATCHED_BUCKET_PREDICTED", "14": "MATCHED_ROUTER_MINIMAX", "15": "Q8_VECTOR_MEASURED", "18": "DECODE_COMPONENT_MEASURED"}
         matched = r.get("policy") in matched_labels
         if matched:
             require(manifest.get("smallm_matched_policy") and r.get("activation") in ("FP16", "BF16"),
@@ -282,6 +282,8 @@ def selection(text, manifest, expected_ops=None):
             require(manifest.get("q8_vector_policy") and r.get("q") == "8" and
                     r.get("reader") == "simt-q8-vector" and r.get("variant") in ("4", "5"),
                     "unbound Q8 vector replacement")
+        if r.get("policy") == "18":
+            require(manifest.get("component_decode"), "unbound component decode replacement")
         if r["route"] == "full-bf16":
             require(manifest.get("prefill") and int(r.get("q",0)) in range(10,15)
                     and int(r.get("n",0))>0 and int(r.get("k",0))>0
