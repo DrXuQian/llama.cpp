@@ -203,6 +203,12 @@ static void test_dense_empty(ggml_backend_t backend, ggml_tensor * weight, bool 
             ggml_set_output(live);
             ggml_build_forward_expand(graph, live);
         }
+        ggml_backend_buffer_ptr empty_storage;
+        if (!mixed) {
+            // A zero-byte scheduler arena has NULL data and cannot be initialized twice.
+            empty_storage.reset(ggml_backend_alloc_ctx_tensors(ctx.get(), backend));
+            dense_require(empty_storage != nullptr, "empty graph storage allocation failed");
+        }
         ggml_backend_sched_ptr sched(
             ggml_backend_sched_new(backends, nullptr, 2, GGML_DEFAULT_GRAPH_SIZE, false, true));
         dense_require(sched && ggml_backend_sched_alloc_graph(sched.get(), graph), "empty graph allocation failed");
