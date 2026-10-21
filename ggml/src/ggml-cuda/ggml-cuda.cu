@@ -1698,7 +1698,8 @@ static bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
                                           const ggml_tensor * ffn_up_scale = nullptr,
                                           const ggml_tensor * ffn_gate_scale = nullptr) {
 #ifdef GGML_NCP_QUACTLIZE
-    if (ggml_quactlize_tensor_is_kpack(ffn_up->src[0]) || ggml_quactlize_tensor_is_kpack(ffn_gate->src[0])) {
+    if (ggml_quactlize_tensor_is_kpack(ffn_up->src[0]) || ggml_quactlize_is_alias(ffn_up->src[0]) ||
+        ggml_quactlize_tensor_is_kpack(ffn_gate->src[0]) || ggml_quactlize_is_alias(ffn_gate->src[0])) {
         return false;
     }
 #endif
@@ -1837,7 +1838,7 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_f(const ggml_tensor * tensor) {
 
 static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
 #ifdef GGML_NCP_QUACTLIZE
-    if (ggml_quactlize_tensor_is_kpack(tensor->src[0])) {
+    if (ggml_quactlize_tensor_is_kpack(tensor->src[0]) || ggml_quactlize_is_alias(tensor->src[0])) {
         return false;
     }
 #endif
@@ -1871,7 +1872,7 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
 
 static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
 #ifdef GGML_NCP_QUACTLIZE
-    if (ggml_quactlize_tensor_is_kpack(src0)) {
+    if (ggml_quactlize_tensor_is_kpack(src0) || ggml_quactlize_is_alias(src0)) {
         ggml_quactlize_mul_mat(ctx, dst);
         return;
     }
@@ -5026,10 +5027,17 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
 
 #ifdef GGML_NCP_QUACTLIZE
     for (const ggml_tensor * src : op->src) {
-        if (src && src->buffer && ggml_cuda_buft_is_quactlize(src->buffer->buft)) {
-            return src == op->src[0] && src->buffer->buft->device == dev &&
-                   (ggml_quactlize_dense_enabled() ? ggml_quactlize_can_compute(op) :
-                    ((op->op == GGML_OP_MUL_MAT || op->op == GGML_OP_MUL_MAT_ID) && ggml_quactlize_can_load(src, nullptr)));
+        const ggml_tensor * source = src;
+        while (source && source->view_src) {
+            source = source->view_src;
+        }
+        if (source && source->buffer && ggml_cuda_buft_is_quactlize(source->buffer->buft)) {
+            return src == op->src[0] && source->buffer->buft->device == dev &&
+                   (ggml_quactlize_is_alias(op) ||
+                    (ggml_quactlize_dense_enabled() ? ggml_quactlize_can_compute(op) :
+                                                      ((op->op == GGML_OP_MUL_MAT || op->op == GGML_OP_MUL_MAT_ID) &&
+                                                       (src == source || ggml_quactlize_is_alias(src)) &&
+                                                       ggml_quactlize_can_load(source, nullptr))));
         }
     }
 #endif

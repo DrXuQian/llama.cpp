@@ -78,9 +78,16 @@ def check_compute_log(text, suite, qtype):
     if suite == 'contract':
         if f'KPACK_DENSE_CONTRACT q={qtype} unaligned=REJECTED tail=ADMITTED grouped=REJECTED status=PASS' not in text:
             raise RuntimeError('missing admission/rejection checks')
+        for source in ('OWNER', 'ALIAS'):
+            empty = (f'KPACK_DENSE_EMPTY q={qtype} source={source} graphs=2 replays=3 '
+                     'scheduler=PASS weight_upload=NONE status=PASS')
+            if text.count(empty) != 1:
+                raise RuntimeError('missing/duplicate empty-output scheduler checks')
+        if 'KPACK_JIT' in text or '[quactlize-dense]' in text:
+            raise RuntimeError('empty-output contract test prepared a compute kernel')
         return
     observed = re.findall(rf'^KPACK_DENSE suite={suite} q={qtype} m=(\d+) n=(\d+) k=(\d+) '
-                          r'replays=6 streams=2 weights=2 relative=(\S+) status=PASS$', text, re.MULTILINE)
+                          r'replays=6 streams=2 weights=2 aliases=FULL relative=(\S+) status=PASS$', text, re.MULTILINE)
     if len(observed) != len(points) or {tuple(map(int, p[:3])) for p in observed} != points:
         raise RuntimeError('incomplete/duplicate GEMM/GEMV numerical coverage')
     for *_, relative in observed:
@@ -90,10 +97,12 @@ def check_compute_log(text, suite, qtype):
     plans = re.findall(rf'\[quactlize-dense\] tensor=(dense-online|dense-cached) device=\d+ q={qtype} '
                        r'm=(\d+) n=(\d+) k=(\d+) route=[0-3] policy=\d+ split=[1-9]\d* '
                        r'compute=[01] workspace=\d+ config=\S+', text)
+    if len(plans) != text.count('[quactlize-dense]'):
+        raise RuntimeError('unexpected plan owner: full aliases must not prepare a separate plan')
     for weight in ('dense-online', 'dense-cached'):
         selected = {tuple(map(int, p[1:])) for p in plans if p[0] == weight}
-        if selected != points:
-            raise RuntimeError(f'{weight}: missing actual Quactlize plan evidence')
+        if selected != points or sum(p[0] == weight for p in plans) != len(points):
+            raise RuntimeError(f'{weight}: missing or duplicated Quactlize plans (aliases must share the owner plan)')
 
 
 def run_compute_suite(args):

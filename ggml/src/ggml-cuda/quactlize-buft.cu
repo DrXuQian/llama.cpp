@@ -87,11 +87,33 @@ struct dense_plan {
 
 using dense_key = std::array<int64_t, 3>;
 
+const ggml_tensor * weight_owner(const ggml_tensor * tensor) {
+    while (tensor && tensor->view_src) {
+        switch (tensor->op) {
+            case GGML_OP_NONE:
+            case GGML_OP_VIEW:
+            case GGML_OP_RESHAPE:
+            case GGML_OP_PERMUTE:
+            case GGML_OP_TRANSPOSE:
+                break;
+            default:
+                return nullptr;
+        }
+        const auto * source = tensor->view_src;
+        if (tensor->view_offs != 0 || !ggml_are_same_layout(tensor, source) ||
+            (tensor->buffer && tensor->buffer != source->buffer) || (tensor->data && tensor->data != source->data)) {
+            return nullptr;
+        }
+        tensor = source;
+    }
+    return tensor;
+}
+
 bool dense_params(const ggml_tensor * op, quactlize_ppu_dense_params_v1 & params) {
     if (!op || op->op != GGML_OP_MUL_MAT || op->type != GGML_TYPE_F32 || !ggml_is_contiguous(op)) {
         return false;
     }
-    const auto *                 weight = op->src[0];
+    const auto *                 weight = weight_owner(op->src[0]);
     const auto *                 input  = op->src[1];
     ggml_quactlize_packed_layout layout{};
     if (!weight || !input || weight->ne[2] != 1 || weight->ne[3] != 1 || input->type != GGML_TYPE_F32 ||
@@ -100,7 +122,7 @@ bool dense_params(const ggml_tensor * op, quactlize_ppu_dense_params_v1 & params
         return false;
     }
     const int64_t rows = ggml_nelements(input) / input->ne[0];
-    if (rows <= 0 || rows > INT_MAX || ggml_nelements(op) / op->ne[0] != rows) {
+    if (rows < 0 || rows > INT_MAX || ggml_nelements(op) / op->ne[0] != rows) {
         return false;
     }
     params = {1,
@@ -206,6 +228,16 @@ void * get_base(ggml_backend_buffer_t buffer) {
 }
 
 ggml_status init_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor) {
+    auto * ctx = static_cast<buffer_context *>(buffer->context);
+    if (tensor->view_src) {
+        const auto * owner = weight_owner(tensor);
+        if (owner && owner->buffer == buffer && ctx->tensors.count(owner)) {
+            // The owner alone holds upload events and compute plans.
+            return GGML_STATUS_SUCCESS;
+        }
+        GGML_LOG_ERROR("quactlize: unsupported weight view: %s\n", tensor->name);
+        return GGML_STATUS_FAILED;
+    }
     if (ggml_nelements(tensor) == 0) {
         return GGML_STATUS_SUCCESS;
     }
@@ -214,7 +246,6 @@ ggml_status init_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor) {
         GGML_LOG_ERROR("quactlize: unsupported load: %s (%s)\n", tensor->name, ggml_type_name(tensor->type));
         return GGML_STATUS_FAILED;
     }
-    auto * ctx = static_cast<buffer_context *>(buffer->context);
     ctx->tensors.emplace(tensor, state);
     return GGML_STATUS_SUCCESS;
 }
@@ -376,6 +407,11 @@ bool ggml_quactlize_can_load(const ggml_tensor * tensor, ggml_quactlize_packed_l
 
 bool ggml_cuda_buft_is_quactlize(ggml_backend_buffer_type_t buft) {
     return buft && buft->iface.get_name == buffer_name;
+}
+
+bool ggml_quactlize_is_alias(const ggml_tensor * tensor) {
+    const auto * owner = weight_owner(tensor);
+    return tensor && tensor->view_src && owner && owner->buffer && ggml_cuda_buft_is_quactlize(owner->buffer->buft);
 }
 
 ggml_backend_buffer_type_t * ggml_cuda_quactlize_extra_bufts(ggml_backend_dev_t dev) {
@@ -573,6 +609,10 @@ void ggml_quactlize_prepare_graph(ggml_backend_cuda_context & cuda_ctx, const gg
         if (node->op == GGML_OP_NONE) {
             continue;
         }
+        if (ggml_quactlize_is_alias(node)) {
+            GGML_ASSERT(static_cast<buffer_context *>(weight_owner(node)->buffer->context)->device == cuda_ctx.device);
+            continue;
+        }
         if (packed_source(node)) {
             GGML_ABORT("quactlize: K-pack is load-only; inference is not enabled (%s)", node->name);
         }
@@ -590,10 +630,11 @@ void ggml_quactlize_prepare_graph(ggml_backend_cuda_context & cuda_ctx, const gg
                 dense = true;
             }
         }
-        if (!dense) {
+        // Empty outputs stay on this backend, but need no compute plan.
+        if (!dense || ggml_is_empty(node)) {
             continue;
         }
-        const auto * weight = node->src[0];
+        const auto * weight = weight_owner(node->src[0]);
         auto *       ctx    = static_cast<buffer_context *>(weight->buffer->context);
         GGML_ASSERT(ctx->device == cuda_ctx.device);
         std::lock_guard<std::mutex> lock(ctx->compute_mutex);
@@ -645,12 +686,13 @@ void ggml_quactlize_prepare_graph(ggml_backend_cuda_context & cuda_ctx, const gg
 void ggml_quactlize_mul_mat(ggml_backend_cuda_context & cuda_ctx, ggml_tensor * dst) {
     quactlize_ppu_dense_params_v1 params{};
     GGML_ASSERT(ggml_quactlize_dense_enabled() && dense_params(dst, params));
-    auto * ctx = static_cast<buffer_context *>(dst->src[0]->buffer->context);
+    const auto * weight = weight_owner(dst->src[0]);
+    auto *       ctx    = static_cast<buffer_context *>(weight->buffer->context);
     GGML_ASSERT(ctx->device == cuda_ctx.device);
     dense_plan plan;
     {
         std::lock_guard<std::mutex> lock(ctx->compute_mutex);
-        const auto                  tensor = ctx->tensors.find(dst->src[0]);
+        const auto                  tensor = ctx->tensors.find(weight);
         GGML_ASSERT(tensor != ctx->tensors.end() && tensor->second.compute_ready);
         const auto found = tensor->second.plans.find({params.m, params.input_stride, params.output_stride});
         GGML_ASSERT(found != tensor->second.plans.end());

@@ -146,11 +146,16 @@ static bool test_kpack_load(ggml_backend_t backend, const char * fixture, bool r
                 require(observed == expected, "online/offline packed bytes differ");
                 require(!install(t, &layout, expected.data(), expected.size()), "duplicate upload accepted");
             }
+            auto * alias = ggml_view_3d(ctx.get(), tensors[0], k, n, experts, tensors[0]->nb[1], tensors[0]->nb[2], 0);
+            require(ggml_backend_view_init(alias) == GGML_STATUS_SUCCESS && alias->buffer == tensors[0]->buffer &&
+                        alias->data == tensors[0]->data && ggml_backend_supports_op(backend, alias),
+                    "load-only packed alias rejected");
+            require(!install(alias, &layout, expected.data(), expected.size()), "alias accepted a packed upload");
             printf("KPACK_LOAD q=%d n=%d k=%d experts=%d whole=PASS chunked=PASS offline=PASS\n", qtype, n, k, experts);
             ++tested;
             if (reject_forward) {
                 auto * act   = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, k, 1, experts);
-                auto * out   = ggml_mul_mat(ctx.get(), tensors[0], act);
+                auto * out   = ggml_mul_mat(ctx.get(), alias, act);
                 auto * graph = ggml_new_graph(ctx.get());
                 ggml_build_forward_expand(graph, out);
                 // The load-only guard must run before allocation-dependent launch or fusion logic.
@@ -170,6 +175,60 @@ static void dense_require(bool ok, const char * message) {
     if (!ok) {
         throw std::runtime_error(message);
     }
+}
+
+static void test_dense_empty(ggml_backend_t backend, ggml_tensor * weight, bool alias) {
+    ggml_backend_ptr cpu(ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr));
+    dense_require(cpu != nullptr, "CPU backend is unavailable for the scheduler test");
+    ggml_backend_t backends[] = {backend, cpu.get()};
+    for (bool mixed : {false, true}) {
+        ggml_context_ptr ctx(ggml_init({ggml_tensor_overhead() * 10 + ggml_graph_overhead(), nullptr, true}));
+        dense_require(ctx != nullptr, "empty graph context allocation failed");
+        auto * input  = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, weight->ne[0], 3);
+        auto * ids    = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I32, 0);
+        auto * source = weight;
+        if (alias) {
+            source = ggml_view_2d(ctx.get(), source, weight->ne[0], weight->ne[1], weight->nb[1], 0);
+            source = ggml_view_2d(ctx.get(), source, weight->ne[0], weight->ne[1], weight->nb[1], 0);
+        }
+        auto * empty = ggml_mul_mat(ctx.get(), source, ggml_get_rows(ctx.get(), input, ids));
+        ggml_set_input(input);
+        ggml_set_input(ids);
+        ggml_set_output(empty);
+        dense_require(ggml_is_empty(empty) && ggml_backend_supports_op(backend, empty), "empty dense op rejected");
+        auto * graph = ggml_new_graph(ctx.get());
+        ggml_build_forward_expand(graph, empty);
+        auto * live = mixed ? ggml_scale(ctx.get(), input, 2.0f) : nullptr;
+        if (live) {
+            ggml_set_output(live);
+            ggml_build_forward_expand(graph, live);
+        }
+        ggml_backend_sched_ptr sched(
+            ggml_backend_sched_new(backends, nullptr, 2, GGML_DEFAULT_GRAPH_SIZE, false, true));
+        dense_require(sched && ggml_backend_sched_alloc_graph(sched.get(), graph), "empty graph allocation failed");
+        dense_require(source->buffer == weight->buffer && source->data == weight->data, "weight alias was copied");
+        dense_require(ggml_backend_sched_get_tensor_backend(sched.get(), empty) == backend &&
+                          ggml_backend_sched_get_n_splits(sched.get()) == 1,
+                      "empty dense op caused a backend copy");
+        std::vector<float> values(ggml_nelements(input)), observed(values.size());
+        for (int replay = 0; replay < 3; ++replay) {
+            for (size_t i = 0; i < values.size(); ++i) {
+                values[i] = float(int(i % 17) - 8 + replay);
+            }
+            ggml_backend_tensor_set(input, values.data(), 0, ggml_nbytes(input));
+            // The weight is deliberately not uploaded: a no-op must not prepare or read it.
+            dense_require(ggml_backend_sched_graph_compute(sched.get(), graph) == GGML_STATUS_SUCCESS,
+                          "empty dense scheduled graph failed");
+            if (live) {
+                ggml_backend_tensor_get(live, observed.data(), 0, ggml_nbytes(live));
+                for (size_t i = 0; i < values.size(); ++i) {
+                    dense_require(observed[i] == 2.0f * values[i], "empty op suppressed a nonempty graph branch");
+                }
+            }
+        }
+    }
+    printf("KPACK_DENSE_EMPTY q=%d source=%s graphs=2 replays=3 scheduler=PASS weight_upload=NONE status=PASS\n",
+           weight->type, alias ? "ALIAS" : "OWNER");
 }
 
 static double check_dense_output(const std::vector<float> &  actual,
@@ -282,7 +341,7 @@ static bool test_kpack_dense(ggml_backend_t backend, const std::string & suite, 
                     auto *    weight = ggml_new_tensor_2d(ctx.get(), type, k, 256);
                     require(!preferred(dev, weight, GGML_OP_MUL_MAT), "unsupported K selected K-pack");
                 }
-                auto * weight = ggml_new_tensor_2d(ctx.get(), type, 512, 256);
+                auto * weight = ggml_new_tensor_2d(ctx.get(), type, 1024, 512);
                 require(preferred(dev, weight, GGML_OP_MUL_MAT) == bufts[0], "aligned shape was rejected");
                 const int min_k   = type == GGML_TYPE_Q3_K || type == GGML_TYPE_Q6_K ? 512 : 256;
                 auto *    minimum = ggml_new_tensor_2d(ctx.get(), type, min_k, 256);
@@ -300,11 +359,31 @@ static bool test_kpack_dense(ggml_backend_t backend, const std::string & suite, 
                                                             ggml_backend_buffer_get_base(packed.get())) ==
                                       GGML_STATUS_SUCCESS,
                         "packed allocation failed");
-                auto * input = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, 512, 3);
+                auto * input = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, 1024, 3);
                 auto * mm    = ggml_mul_mat(ctx.get(), weight, input);
                 require(ggml_backend_supports_op(backend, mm), "M=3 tail was rejected");
+                auto * alias = ggml_view_tensor(ctx.get(), weight);
+                require(ggml_backend_supports_op(backend, ggml_mul_mat(ctx.get(), alias, input)),
+                        "uninitialized full alias was rejected");
+                require(ggml_backend_view_init(alias) == GGML_STATUS_SUCCESS && alias->data == weight->data &&
+                            alias->buffer == weight->buffer,
+                        "full alias did not reuse the resident buffer");
+                for (auto * unsupported : {
+                         ggml_view_2d(ctx.get(), weight, 1024, 256, weight->nb[1], 0),
+                         ggml_view_2d(ctx.get(), weight, 1024, 256, weight->nb[1], 256 * weight->nb[1]),
+                         ggml_view_2d(ctx.get(), weight, 512, 512, weight->nb[1], 0),
+                         ggml_view_2d(ctx.get(), weight, 512, 512, weight->nb[1], ggml_row_size(type, 512)),
+                         ggml_reshape_2d(ctx.get(), weight, 512, 1024),
+                         ggml_transpose(ctx.get(), weight),
+                     }) {
+                    require(!ggml_backend_supports_op(backend, unsupported), "weight slice or transpose admitted");
+                    require(ggml_backend_view_init(unsupported) == GGML_STATUS_FAILED,
+                            "weight slice or transpose initialized");
+                }
+                test_dense_empty(backend, weight, false);
+                test_dense_empty(backend, weight, true);
                 auto * ids     = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_I32, 1, 3);
-                auto * indexed = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, 512, 1, 3);
+                auto * indexed = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, 1024, 1, 3);
                 auto * grouped = ggml_mul_mat_id(ctx.get(), weight, indexed, ids);
                 require(!ggml_backend_supports_op(backend, grouped), "grouped operation admitted by dense MR");
                 if (reject_grouped) {
@@ -314,11 +393,11 @@ static bool test_kpack_dense(ggml_backend_t backend, const std::string & suite, 
                     throw std::runtime_error("grouped packed forward did not abort");
                 }
                 for (auto storage : {GGML_TYPE_F16, GGML_TYPE_BF16}) {
-                    auto * narrow = ggml_new_tensor_2d(ctx.get(), storage, 512, 3);
+                    auto * narrow = ggml_new_tensor_2d(ctx.get(), storage, 1024, 3);
                     require(!ggml_backend_supports_op(backend, ggml_mul_mat(ctx.get(), weight, narrow)),
                             "unsupported activation storage admitted");
                 }
-                auto * strided = ggml_view_2d(ctx.get(), input, 512, 2, 1024 * sizeof(float), 0);
+                auto * strided = ggml_view_2d(ctx.get(), input, 1024, 2, 2048 * sizeof(float), 0);
                 require(!ggml_backend_supports_op(backend, ggml_mul_mat(ctx.get(), weight, strided)),
                         "noncontiguous input admitted");
                 for (auto unsupported : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_Q4_0}) {
@@ -383,26 +462,36 @@ static bool test_kpack_dense(ggml_backend_t backend, const std::string & suite, 
                     for (auto * source_weight : {weight, cached}) {
                         ggml_context_ptr        contexts[2];
                         ggml_backend_buffer_ptr buffers[2];
-                        ggml_tensor *           input[2], *bias[2], *mm[2], *output[2];
+                        ggml_tensor *           input[2], *bias[2], *mm[2], *output[2], *source[2];
                         ggml_cgraph *           graphs[2];
                         for (int lane = 0; lane < 2; ++lane) {
                             contexts[lane].reset(
                                 ggml_init({ggml_tensor_overhead() * 8 + ggml_graph_overhead(), nullptr, true}));
                             auto * ctx = contexts[lane].get();
                             require(ctx != nullptr, "context allocation failed");
+                            source[lane] = source_weight;
+                            if (lane) {
+                                source[lane] = ggml_view_2d(ctx, source[lane], k, n, source_weight->nb[1], 0);
+                                source[lane] = ggml_view_2d(ctx, source[lane], k, n, source_weight->nb[1], 0);
+                            }
                             input[lane]  = m == 6 ? ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, 2, 3) :
                                                     ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, m);
-                            mm[lane]     = ggml_mul_mat(ctx, source_weight, input[lane]);
+                            mm[lane]     = ggml_mul_mat(ctx, source[lane], input[lane]);
                             bias[lane]   = ggml_dup_tensor(ctx, mm[lane]);
                             output[lane] = ggml_add(ctx, mm[lane], bias[lane]);
-                            // Keep both results observable, even if the backend has a MUL_MAT+ADD fusion.
-                            ggml_set_output(mm[lane]);
+                            // The alias lane leaves MUL_MAT+ADD eligible for fusion to check the packed guard.
+                            if (!lane) {
+                                ggml_set_output(mm[lane]);
+                            }
                             ggml_set_output(output[lane]);
                             graphs[lane] = ggml_new_graph(ctx);
                             ggml_build_forward_expand(graphs[lane], output[lane]);
                             buffers[lane].reset(ggml_backend_alloc_ctx_tensors(ctx, backends[lane]));
                             require(buffers[lane] && ggml_backend_supports_op(backends[lane], mm[lane]),
                                     "dense operation not admitted");
+                            require(source[lane]->buffer == source_weight->buffer &&
+                                        source[lane]->data == source_weight->data,
+                                    "dense alias did not reuse the resident buffer");
                         }
                         require(input[0]->data != input[1]->data && mm[0]->data != mm[1]->data,
                                 "dynamic-address fixture aliases");
@@ -438,6 +527,9 @@ static bool test_kpack_dense(ggml_backend_t backend, const std::string & suite, 
                             for (int lane = 0; lane < 2; ++lane) {
                                 const float sign = lane ? -1.0f : 1.0f;
                                 for (bool with_bias : {false, true}) {
+                                    if (lane && !with_bias) {
+                                        continue;
+                                    }
                                     ggml_backend_tensor_get(with_bias ? output[lane] : mm[lane], actual.data(), 0,
                                                             actual.size() * sizeof(float));
                                     worst = std::max(worst, check_dense_output(actual, expected[replay], n, m, sign,
@@ -450,7 +542,8 @@ static bool test_kpack_dense(ggml_backend_t backend, const std::string & suite, 
                         }
                     }
                     printf(
-                        "KPACK_DENSE suite=%s q=%d m=%d n=%d k=%d replays=6 streams=2 weights=2 relative=%.8g "
+                        "KPACK_DENSE suite=%s q=%d m=%d n=%d k=%d replays=6 streams=2 weights=2 aliases=FULL "
+                        "relative=%.8g "
                         "status=PASS\n",
                         suite.c_str(), type, m, n, k, worst);
                     ++cases;
