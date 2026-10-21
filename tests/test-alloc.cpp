@@ -548,6 +548,54 @@ static void test_buffer_size_zero() {
     GGML_ASSERT(backend_b.context->allocated_total() == 0);
 }
 
+static void test_empty_tensor_buffer() {
+    for (int empty_buffer_id : {0, 1}) {
+        for (bool mixed : {false, true}) {
+            dummy_backend              backend_a = dummy_backend_init(SIZE_MAX);
+            dummy_backend              backend_b = dummy_backend_init(SIZE_MAX);
+            ggml_backend_buffer_type_t bufts[]   = {&backend_a.buffer_type, &backend_b.buffer_type};
+            ggml_gallocr_ptr           galloc(ggml_gallocr_new_n(bufts, 2));
+
+            // Reuse the allocator with fresh tensors as well as the same graph.
+            for (int iteration = 0; iteration < 2; ++iteration) {
+                auto [ctx, graph, ctx_ptr] = make_context();
+                auto * empty               = make_input_1d(ctx, 0);
+                auto * view                = ggml_view_1d(ctx, empty, 0, 0);
+                auto * out                 = ggml_scale(ctx, view, 2.0f);
+                ggml_set_output(out);
+                ggml_build_forward_expand(graph, out);
+                if (mixed) {
+                    auto * live = ggml_scale(ctx, make_input_1d(ctx, 4), 2.0f);
+                    ggml_set_output(live);
+                    ggml_build_forward_expand(graph, live);
+                }
+
+                std::vector<int> leaf_buffer_ids(graph->n_leafs);
+                std::vector<int> node_buffer_ids(graph->n_nodes);
+                for (int i = 0; i < graph->n_leafs; ++i) {
+                    leaf_buffer_ids[i] = ggml_is_empty(graph->leafs[i]) ? empty_buffer_id : 1 - empty_buffer_id;
+                }
+                for (int i = 0; i < graph->n_nodes; ++i) {
+                    node_buffer_ids[i] = ggml_is_empty(graph->nodes[i]) ? empty_buffer_id : 1 - empty_buffer_id;
+                }
+                GGML_ASSERT(
+                    ggml_gallocr_reserve_n(galloc.get(), graph, node_buffer_ids.data(), leaf_buffer_ids.data()));
+                for (int replay = 0; replay < 3; ++replay) {
+                    GGML_ASSERT(ggml_gallocr_alloc_graph(galloc.get(), graph));
+                    check_all_allocated(graph);
+                    check_no_overlap(graph);
+                    check_max_size(ctx);
+                    GGML_ASSERT(empty->buffer != nullptr && empty->data != nullptr);
+                    GGML_ASSERT(view->buffer == empty->buffer && view->data == empty->data);
+                    GGML_ASSERT(ggml_gallocr_get_buffer_size(galloc.get(), empty_buffer_id) ==
+                                ggml_backend_buft_get_alignment(bufts[empty_buffer_id]));
+                    GGML_ASSERT(ggml_gallocr_get_buffer_size(galloc.get(), 1 - empty_buffer_id) == (mixed ? 16 : 0));
+                }
+            }
+        }
+    }
+}
+
 // Test re-using gallocr for a different graph. The new graph has the same
 // total size, but one of the chunks is larger, so reallocation is required.
 static void test_reallocation() {
@@ -603,6 +651,7 @@ int main() {
     run("test_prefer_already_allocated_memory", test_prefer_already_allocated_memory);
     run("test_multiple_buffer_types", test_multiple_buffer_types);
     run("test_buffer_size_zero", test_buffer_size_zero);
+    run("test_empty_tensor_buffer", test_empty_tensor_buffer);
     run("test_reallocation", test_reallocation);
     return 0;
 }

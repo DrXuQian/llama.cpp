@@ -301,7 +301,8 @@ static struct buffer_address ggml_dyn_tallocr_alloc(struct ggml_dyn_tallocr * al
     }
 #endif
 
-    chunk->max_size = MAX(chunk->max_size, addr.offset + size);
+    // Empty tensors still need a non-NULL base for initialization and views.
+    chunk->max_size = MAX(chunk->max_size, MAX(alloc->alignment, addr.offset + size));
 
     return addr;
 
