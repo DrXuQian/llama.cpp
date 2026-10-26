@@ -8,6 +8,8 @@
 #include "gguf.h"
 
 #include "../ggml/src/ggml-cuda/quactlize-buft.cuh"
+#include "../src/llama-model-loader.h"
+#include "../src/llama-model.h"
 
 #include <nlohmann/json.hpp>
 
@@ -301,6 +303,112 @@ static void dense_fixture(const std::vector<float> & decoded,
     }
 }
 
+static void test_dense_tp_metadata() {
+    ggml_context_ptr ctx(ggml_init({ggml_tensor_overhead() * 2, nullptr, true}));
+    gguf_context_ptr gguf(gguf_init_empty());
+    gguf_set_val_str(gguf.get(), "general.architecture", "qwen35moe");
+    auto * qkv = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_Q8_0, 512, 2048);
+    auto * out = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_Q8_0, 1024, 512);
+    ggml_set_name(qkv, "blk.0.attn_qkv.weight");
+    ggml_set_name(out, "blk.0.ssm_out.weight");
+    gguf_add_tensor(gguf.get(), qkv);
+    gguf_add_tensor(gguf.get(), out);
+    const auto close_file = [](FILE * fp) {
+        if (fp) {
+            fclose(fp);
+        }
+    };
+    std::unique_ptr<FILE, decltype(close_file)> file(tmpfile(), close_file);
+    const size_t bytes = gguf_get_meta_size(gguf.get()) + gguf_get_tensor_offset(gguf.get(), 1) + ggml_nbytes(out);
+    if (!file || !gguf_write_to_file_ptr(gguf.get(), file.get(), true) ||
+        fseek(file.get(), long(bytes - 1), SEEK_SET) || fputc(0, file.get()) == EOF || fflush(file.get())) {
+        throw std::runtime_error("TP metadata fixture write failed");
+    }
+    rewind(file.get());
+    std::vector<std::string> splits;
+    llama_model_loader loader(nullptr, nullptr, nullptr, "", splits, file.get(), LLAMA_LOAD_MODE_NONE, false, true,
+                              false, nullptr, nullptr);
+    auto               params = llama_model_default_params();
+    params.n_gpu_layers       = 0;
+    std::unique_ptr<llama_model> model(llama_model_create(LLM_ARCH_QWEN35MOE, params));
+    auto &                       hp = model->hparams;
+    hp.n_layer_all                  = 1;
+    hp.is_recr_impl[0]              = true;
+    hp.n_embd                       = 512;
+    hp.ssm_d_state                  = 128;
+    hp.ssm_n_group                  = 4;
+    hp.ssm_dt_rank                  = 8;
+    for (size_t count : {2, 4}) {
+        for (const auto * name : {qkv->name, out->name}) {
+            const auto *                               weight = loader.require_tensor_meta(name);
+            llama_meta_device_get_split_state_userdata data{count, model.get(), &loader};
+            model->tensors_by_name.clear();
+            const auto early       = llama_meta_device_get_split_state(weight, &data);
+            model->tensors_by_name = {{qkv->name, loader.require_tensor_meta(qkv->name)},
+                                      {out->name, loader.require_tensor_meta(out->name)}};
+            data.loader            = nullptr;
+            const auto late        = llama_meta_device_get_split_state(weight, &data);
+            if (early.axis != late.axis || early.n_segments != late.n_segments ||
+                memcmp(early.ne, late.ne, sizeof(early.ne)) != 0 || memcmp(early.nr, late.nr, sizeof(early.nr)) != 0) {
+                throw std::runtime_error("TP split changed between placement and allocation");
+            }
+        }
+    }
+    // This fixture intentionally lacks embedding weights; a failed load must release the borrowed loader.
+    bool failed = false;
+    try {
+        model->load_tensors(loader);
+    } catch (const std::exception &) {
+        failed = true;
+    }
+    if (!failed || model->get_split_state_ud.loader != nullptr) {
+        throw std::runtime_error("TP metadata loader retained after failed model load");
+    }
+    puts("KPACK_DENSE_TP_METADATA PASS early_late=IDENTICAL loader_lifetime=SCOPED");
+}
+
+static void test_dense_tp_admission(ggml_backend_dev_t dev, ggml_type type, ggml_backend_buffer_type_t packed) {
+    static ggml_backend_meta_split_state split{};
+    for (int count : {2, 4}) {
+        // Admission only: logical ranks share one device; no collective is launched.
+        std::vector<ggml_backend_dev_t> devices(count, dev);
+        auto *                          meta = ggml_backend_meta_device(
+            devices.data(), devices.size(),
+            [](const ggml_tensor *, void * data) { return *static_cast<ggml_backend_meta_split_state *>(data); },
+            &split);
+        for (int axis : {0, 1, 10}) {
+            split = {static_cast<ggml_backend_meta_split_axis>(axis), {}, {1}, 1};
+            for (int rank = 0; rank < count; ++rank) {
+                split.ne[rank] = 512;
+            }
+            ggml_context_ptr ctx(ggml_init({ggml_tensor_overhead(), nullptr, true}));
+            auto *           weight =
+                ggml_new_tensor_2d(ctx.get(), type, axis == 0 ? 512 * count : 512, axis == 1 ? 512 * count : 512);
+            auto * selected = ggml_backend_meta_device_get_weight_buft(meta, weight, GGML_OP_MUL_MAT);
+            if (!selected || ggml_backend_meta_buffer_type_count(selected) != size_t(count)) {
+                throw std::runtime_error("automatic TP dense storage was not selected");
+            }
+            for (int rank = 0; rank < count; ++rank) {
+                if (ggml_backend_meta_buffer_type_at(selected, rank) != packed) {
+                    throw std::runtime_error("TP rank uses a different buffer family");
+                }
+            }
+            if (ggml_backend_meta_device_get_weight_buft(meta, weight, GGML_OP_MUL_MAT_ID)) {
+                throw std::runtime_error("TP grouped consumer selected as dense");
+            }
+            if (axis == 1) {
+                split.ne[0] -= 128;
+                split.ne[1] += 128;
+                if (ggml_backend_meta_device_get_weight_buft(meta, weight, GGML_OP_MUL_MAT)) {
+                    throw std::runtime_error("TP admitted globally aligned but locally unaligned N");
+                }
+            }
+        }
+    }
+    printf("KPACK_DENSE_TP_ADMISSION q=%d logical_ranks=2,4 axes=K,N,mirrored grouped=REJECTED status=PASS\n",
+           int(type));
+}
+
 static bool test_kpack_dense(ggml_backend_t backend, const std::string & suite, int qtype, bool reject_grouped) {
     auto require = [](bool ok, const char * message) {
         if (!ok) {
@@ -349,6 +457,8 @@ static bool test_kpack_dense(ggml_backend_t backend, const std::string & suite, 
                 const int min_k   = type == GGML_TYPE_Q3_K || type == GGML_TYPE_Q6_K ? 512 : 256;
                 auto *    minimum = ggml_new_tensor_2d(ctx.get(), type, min_k, 256);
                 require(preferred(dev, minimum, GGML_OP_MUL_MAT) == bufts[0], "minimum aligned K was rejected");
+                test_dense_tp_metadata();
+                test_dense_tp_admission(dev, type, bufts[0]);
                 require(!preferred(dev, ggml_view_tensor(ctx.get(), weight), GGML_OP_MUL_MAT),
                         "weight view selected K-pack");
                 auto * experts = ggml_new_tensor_3d(ctx.get(), type, 512, 256, 2);

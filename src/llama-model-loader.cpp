@@ -1071,10 +1071,13 @@ static ggml_backend_buffer_type_t select_weight_buft(const llama_hparams & hpara
         ggml_backend_dev_t cur_dev = cur.first;
         ggml_backend_buffer_type_t cur_buft = cur.second;
         auto *                     reg      = ggml_backend_dev_backend_reg(cur_dev);
-        if (reg && cur_buft == ggml_backend_dev_buffer_type(cur_dev)) {
-            auto preferred = (ggml_backend_dev_get_weight_buft_t) ggml_backend_reg_get_proc_address(
-                reg, "ggml_backend_dev_get_weight_buft");
-            auto * weight_buft = preferred ? preferred(cur_dev, tensor, op) : nullptr;
+        if (cur_buft == ggml_backend_dev_buffer_type(cur_dev)) {
+            auto   preferred   = reg ? (ggml_backend_dev_get_weight_buft_t) ggml_backend_reg_get_proc_address(
+                                       reg, "ggml_backend_dev_get_weight_buft") :
+                                       nullptr;
+            auto * weight_buft = ggml_backend_dev_type(cur_dev) == GGML_BACKEND_DEVICE_TYPE_META ?
+                                     ggml_backend_meta_device_get_weight_buft(cur_dev, tensor, op) :
+                                     (preferred ? preferred(cur_dev, tensor, op) : nullptr);
             if (weight_buft && weight_buft_supported(hparams, tensor, op, weight_buft, cur_dev)) {
                 return weight_buft;
             }

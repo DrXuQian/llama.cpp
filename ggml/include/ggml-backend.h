@@ -419,6 +419,10 @@ extern "C" {
     // Use the same buffer family on each device; NULL means incompatible.
     GGML_API ggml_backend_buffer_type_t ggml_backend_meta_buffer_type(ggml_backend_dev_t         dev,
                                                                       ggml_backend_buffer_type_t prototype);
+    // Query preferred storage on every nonempty shard; NULL keeps the normal buffer order.
+    GGML_API ggml_backend_buffer_type_t ggml_backend_meta_device_get_weight_buft(ggml_backend_dev_t         dev,
+                                                                                 const struct ggml_tensor * weight,
+                                                                                 enum ggml_op               op);
     GGML_API size_t                     ggml_backend_meta_buffer_type_count(ggml_backend_buffer_type_t buft);
     GGML_API ggml_backend_buffer_type_t ggml_backend_meta_buffer_type_at(ggml_backend_buffer_type_t buft, size_t index);
     // Query the placement of a static weight before allocation.

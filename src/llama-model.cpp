@@ -370,6 +370,10 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     const std::string tensor_name = tensor->name;
     const bool is_dsv4 = ud->model->arch == LLM_ARCH_DEEPSEEK4 ||
         (ud->model->arch == LLM_ARCH_DFLASH && hparams.dsv4_hc_mult > 0);
+    auto get_tensor = [&](const std::string & name) -> const ggml_tensor * {
+        const auto * result = ud->model->get_tensor(name.c_str());
+        return result || !ud->loader ? result : ud->loader->get_tensor_meta(name.c_str());
+    };
 
     static const std::regex pattern_q_weight        ("blk\\.\\d*\\.attn_q.weight");
     static const std::regex pattern_kv_weight       ("blk\\.\\d*\\.attn_(k|v).weight");
@@ -455,10 +459,10 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             il = 0;
             rotation = hparams.n_layer() % ud->n_devices;
         }
-        const ggml_tensor * tensor_axis_0 = suffix.empty() ? tensor : ud->model->get_tensor((prefix + suffix).c_str());
+        const ggml_tensor * tensor_axis_0 = suffix.empty() ? tensor : get_tensor(prefix + suffix);
         if (tensor_axis_0 == nullptr) {
             GGML_ASSERT(!suffix_fallback.empty());
-            tensor_axis_0 = ud->model->get_tensor((prefix + suffix_fallback).c_str());
+            tensor_axis_0 = get_tensor(prefix + suffix_fallback);
         }
         GGML_ASSERT(tensor_axis_0 != nullptr);
         return {axis, tensor_axis_0, il, rotation};
@@ -569,7 +573,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1);
         }
         if (std::regex_match(tensor_name, pattern_output_bias)) {
-            const ggml_tensor * output_weight = ud->model->get_tensor("output.weight");
+            const ggml_tensor * output_weight = get_tensor("output.weight");
             GGML_ASSERT(output_weight != nullptr);
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0);
         }
@@ -1391,7 +1395,15 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
     const bool use_mmap_buffer = true;
 
-    this->ml = &ml; // to be used by create_tensor() and load_arch_tensors()
+    this->ml = &ml;  // to be used by create_tensor() and load_arch_tensors()
+
+    struct split_metadata_scope {
+        llama_meta_device_get_split_state_userdata & data;
+
+        ~split_metadata_scope() { data.loader = nullptr; }
+    } split_metadata{get_split_state_ud};
+
+    get_split_state_ud.loader = &ml;
 
     if (ml.use_mmap && params.load_mode == LLAMA_LOAD_MODE_AUTO) {
         for (const auto & dev : devices) {

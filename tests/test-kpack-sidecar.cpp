@@ -305,6 +305,189 @@ static void test_sync(fixture & f) {
 }
 #endif
 
+struct tp_weight_device {
+    ggml_backend_device        device{};
+    ggml_backend_buffer_type   normal{}, packed{}, other{};
+    ggml_backend_buffer_type_t extras[3]{};
+    ggml_tensor                observed{};
+    bool                       enabled = true, alternate = false, supported = true;
+    size_t                     calls = 0;
+};
+
+static ggml_backend_buffer_type_t tp_weight_preferred(ggml_backend_dev_t dev, const ggml_tensor * weight, ggml_op op) {
+    auto & state = *static_cast<tp_weight_device *>(dev->context);
+    ++state.calls;
+    state.observed = *weight;
+    if (!state.enabled || op != GGML_OP_MUL_MAT || weight->ne[2] != 1 || weight->ne[3] != 1 || weight->ne[0] % 512 ||
+        weight->ne[1] % 256 ||
+        (weight->type != GGML_TYPE_Q8_0 && (weight->type < GGML_TYPE_Q2_K || weight->type > GGML_TYPE_Q6_K))) {
+        return nullptr;
+    }
+    check(weight->buffer == nullptr && weight->data == nullptr && ggml_is_contiguous(weight), "TP admission metadata");
+    return state.alternate ? &state.other : &state.packed;
+}
+
+static void test_tp_weight_selection(
+    ggml_backend_dev_get_weight_buft_t preferred = ggml_backend_meta_device_get_weight_buft) {
+    static tp_weight_device              states[GGML_BACKEND_META_MAX_DEVICES];
+    static ggml_backend_meta_split_state split{};
+    static ggml_backend_reg              reg{};
+    reg.api_version            = GGML_BACKEND_API_VERSION;
+    reg.iface.get_proc_address = [](ggml_backend_reg_t, const char * name) -> void * {
+        if (strcmp(name, "ggml_backend_dev_get_weight_buft") == 0) {
+            return reinterpret_cast<void *>(tp_weight_preferred);
+        }
+        if (strcmp(name, "ggml_backend_dev_get_override_bufts") == 0) {
+            return reinterpret_cast<void *>(+[](ggml_backend_dev_t dev) -> ggml_backend_buffer_type_t * {
+                return static_cast<tp_weight_device *>(dev->context)->extras;
+            });
+        }
+        return nullptr;
+    };
+    std::vector<ggml_backend_dev_t> devices;
+    for (auto & state : states) {
+        state.device.context        = &state;
+        state.device.reg            = &reg;
+        state.device.iface.get_name = [](ggml_backend_dev_t) {
+            return "tp-weight-host";
+        };
+        state.device.iface.get_description = state.device.iface.get_name;
+        state.device.iface.get_type        = [](ggml_backend_dev_t) {
+            return GGML_BACKEND_DEVICE_TYPE_GPU;
+        };
+        state.device.iface.get_buffer_type = [](ggml_backend_dev_t dev) {
+            return &static_cast<tp_weight_device *>(dev->context)->normal;
+        };
+        state.device.iface.supports_buft = [](ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
+            return buft->device == dev && static_cast<tp_weight_device *>(dev->context)->supported;
+        };
+        state.device.iface.supports_op = [](ggml_backend_dev_t, const ggml_tensor *) {
+            return true;
+        };
+        for (auto * buft : {&state.normal, &state.packed, &state.other}) {
+            *buft        = *ggml_backend_cpu_buffer_type();
+            buft->device = &state.device;
+        }
+        state.packed.iface.get_name = [](ggml_backend_buffer_type_t) {
+            return "preferred-host";
+        };
+        state.other.iface.get_name = [](ggml_backend_buffer_type_t) {
+            return "other-host";
+        };
+        state.extras[0] = &state.packed;
+        state.extras[1] = &state.other;
+        devices.push_back(&state.device);
+    }
+    size_t cases = 0;
+    for (int count : {2, 3, 4, 8, 16}) {
+        auto * dev = ggml_backend_meta_device(
+            devices.data(), count,
+            [](const ggml_tensor *, void * data) { return *static_cast<ggml_backend_meta_split_state *>(data); },
+            &split);
+        check(ggml_backend_dev_backend_reg(dev) == nullptr, "test must exercise registry-less Meta");
+        for (int q : {8, 10, 11, 12, 13, 14}) {
+            for (int axis : {0, 1, 10}) {
+                for (int pattern = 0; pattern < (axis == 10 ? 1 : 3); ++pattern) {
+                    split            = {};
+                    split.axis       = static_cast<ggml_backend_meta_split_axis>(axis);
+                    split.n_segments = pattern == 2 ? 2 : 1;
+                    int64_t ne[4]    = {512, 256, 1, 1};
+                    int64_t total    = 0;
+                    for (size_t s = 0; s < split.n_segments; ++s) {
+                        split.nr[s] = pattern == 2 && s == 0 ? 2 : 1;
+                        for (int rank = 0; rank < count; ++rank) {
+                            const int factor           = pattern == 1 ? (rank == count - 1 ? 0 : rank + 1) : 1;
+                            split.ne[s * count + rank] = (axis == 0 ? 512 : 256) * factor;
+                            total += split.ne[s * count + rank] * split.nr[s];
+                        }
+                    }
+                    if (axis != 10) {
+                        ne[axis] = total;
+                    }
+                    ggml_context_ptr ctx(ggml_init({ggml_tensor_overhead(), nullptr, true}));
+                    auto *           weight = ggml_new_tensor(ctx.get(), static_cast<ggml_type>(q), 4, ne);
+                    ggml_set_name(weight, "tp-auto-weight");
+                    ggml_set_param(weight);
+                    const auto original = *weight;
+                    for (auto & state : states) {
+                        state.calls = 0;
+                    }
+                    auto * selected = preferred(dev, weight, GGML_OP_MUL_MAT);
+                    check(selected && selected != ggml_backend_dev_buffer_type(dev),
+                          "automatic TP storage not selected");
+                    check(memcmp(weight, &original, sizeof(original)) == 0, "admission changed source metadata");
+                    ggml_backend_buffer_ptr buffer(ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), selected));
+                    check(bool(buffer), "selected TP allocation");
+                    for (int rank = 0; rank < count; ++rank) {
+                        const auto * local = ggml_backend_meta_tensor_shard(weight, rank, nullptr);
+                        check(local && ggml_backend_meta_buffer_type_at(selected, rank) == &states[rank].packed,
+                              "selected family differs by rank");
+                        if (ggml_nelements(local) == 0) {
+                            check(states[rank].calls == 0, "empty shard queried for compute");
+                        } else {
+                            const auto & observed = states[rank].observed;
+                            check(states[rank].calls == 1 && memcmp(local->ne, observed.ne, sizeof(local->ne)) == 0 &&
+                                      memcmp(local->nb, observed.nb, sizeof(local->nb)) == 0,
+                                  "queried geometry differs from allocated shard");
+                        }
+                    }
+                    ++cases;
+                }
+            }
+        }
+    }
+    auto * dev = ggml_backend_meta_device(
+        devices.data(), 2,
+        [](const ggml_tensor *, void * data) { return *static_cast<ggml_backend_meta_split_state *>(data); }, &split);
+    split = {GGML_BACKEND_SPLIT_AXIS_0, {512, 512}, {1}, 1};
+    ggml_context_ptr ctx(ggml_init({ggml_tensor_overhead() * 3, nullptr, true}));
+    auto *           weight = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_Q4_K, 1024, 256);
+    auto             query  = [&] {
+        return preferred(dev, weight, GGML_OP_MUL_MAT);
+    };
+    check(query() != nullptr, "valid TP control");
+    for (int rank : {0, 1}) {
+        states[rank].enabled = false;
+        check(!query(), "disabled rank selected packed storage");
+        states[rank].enabled    = true;
+        states[rank].device.reg = nullptr;
+        check(!query(), "missing rank registry selected packed storage");
+        states[rank].device.reg = &reg;
+        states[rank].supported  = false;
+        check(!query(), "unsupported rank buffer selected packed storage");
+        states[rank].supported = true;
+    }
+    states[1].alternate = true;
+    check(!query(), "different per-rank buffer families accepted");
+    states[1].alternate = false;
+    split.ne[0]         = 256;
+    split.ne[1]         = 768;
+    check(!query(), "globally supported but locally unsupported K accepted");
+    split.ne[0] = 128;
+    split.ne[1] = 896;
+    check(!query(), "GGUF block split accepted");
+    split.ne[0] = 512;
+    split.ne[1] = 256;
+    check(!query(), "incomplete split map accepted");
+    split.ne[1] = 512;
+    split.nr[0] = 0;
+    check(!query(), "zero segment repetition accepted");
+    split.nr[0]      = 1;
+    split.n_segments = 17;
+    check(!query(), "oversized split map accepted");
+    split.n_segments = 1;
+    split.axis       = GGML_BACKEND_SPLIT_AXIS_PARTIAL;
+    check(!query(), "partial static weight accepted");
+    split.axis = GGML_BACKEND_SPLIT_AXIS_0;
+    check(!preferred(dev, weight, GGML_OP_MUL_MAT_ID), "grouped automatic placement enabled");
+    auto * bf16 = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_BF16, 1024, 256);
+    check(!preferred(dev, bf16, GGML_OP_MUL_MAT), "BF16 native control selected packed storage");
+    auto * view = ggml_view_tensor(ctx.get(), weight);
+    check(!preferred(dev, view, GGML_OP_MUL_MAT), "weight view accepted");
+    check(query() != nullptr, "negative tests changed valid admission");
+    printf("KPACK_TP_AUTO_HOST PASS cases=%zu devices=2,3,4,8,16 actual_shards=MATCH fallbacks=PASS\n", cases);
+}
+
 static void test_tp_raw_splits() {
     static ggml_backend_device           devices[GGML_BACKEND_META_MAX_DEVICES]{};
     static ggml_backend_meta_split_state split{};
@@ -521,6 +704,7 @@ int main() try {
     fixture     f;
     std::string error;
     test_cache_directory(f);
+    test_tp_weight_selection();
     test_tp_raw_splits();
     test_tp_sidecars(f);
     test_prefetch_coverage();

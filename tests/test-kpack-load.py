@@ -76,6 +76,12 @@ def check_compute_log(text, suite, qtype):
     if text.count(marker) != 1:
         raise RuntimeError('missing/duplicate complete-suite marker')
     if suite == 'contract':
+        if text.count('KPACK_DENSE_TP_METADATA PASS early_late=IDENTICAL loader_lifetime=SCOPED') != 1:
+            raise RuntimeError('missing/duplicate TP metadata lifetime checks')
+        tp = (f'KPACK_DENSE_TP_ADMISSION q={qtype} logical_ranks=2,4 '
+              'axes=K,N,mirrored grouped=REJECTED status=PASS')
+        if text.count(tp) != 1:
+            raise RuntimeError('missing/duplicate TP automatic admission checks')
         if f'KPACK_DENSE_CONTRACT q={qtype} unaligned=REJECTED tail=ADMITTED grouped=REJECTED status=PASS' not in text:
             raise RuntimeError('missing admission/rejection checks')
         for source in ('OWNER', 'ALIAS'):
