@@ -82,6 +82,10 @@ def check_compute_log(text, suite, qtype):
               'axes=K,N,mirrored grouped=REJECTED status=PASS')
         if text.count(tp) != 1:
             raise RuntimeError('missing/duplicate TP automatic admission checks')
+        tp_empty = (f'KPACK_DENSE_TP_EMPTY q={qtype} logical_ranks=2,4 '
+                    'replays=3 weight_upload=NONE status=PASS')
+        if text.count(tp_empty) != 1:
+            raise RuntimeError('missing/duplicate TP empty-output checks')
         if f'KPACK_DENSE_CONTRACT q={qtype} unaligned=REJECTED tail=ADMITTED grouped=REJECTED status=PASS' not in text:
             raise RuntimeError('missing admission/rejection checks')
         for source in ('OWNER', 'ALIAS'):

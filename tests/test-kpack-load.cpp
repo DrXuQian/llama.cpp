@@ -236,6 +236,62 @@ static void test_dense_empty(ggml_backend_t backend, ggml_tensor * weight, bool 
            weight->type, alias ? "ALIAS" : "OWNER");
 }
 
+static void test_dense_tp_empty(ggml_backend_t backend, ggml_type type, ggml_backend_buffer_type_t packed) {
+    auto *                               dev = ggml_backend_get_device(backend);
+    static ggml_backend_meta_split_state split{};
+    for (int count : {2, 4}) {
+        std::vector<ggml_backend_dev_t> devices(count, dev);
+        auto *                          meta = ggml_backend_meta_device(
+            devices.data(), devices.size(),
+            [](const ggml_tensor * t, void *) {
+                if (strcmp(t->name, "tp-empty-weight") == 0) {
+                    return split;
+                }
+                return ggml_backend_meta_split_state{GGML_BACKEND_SPLIT_AXIS_MIRRORED, {}, {1}, 1};
+            },
+            nullptr);
+        split = {GGML_BACKEND_SPLIT_AXIS_1, {}, {1}, 1};
+        for (int rank = 0; rank < count; ++rank) {
+            split.ne[rank] = 256;
+        }
+        ggml_context_ptr weights(ggml_init({ggml_tensor_overhead(), nullptr, true}));
+        auto *           weight = ggml_new_tensor_2d(weights.get(), type, 512, 256 * count);
+        ggml_set_name(weight, "tp-empty-weight");
+        ggml_set_param(weight);
+        auto * buft = ggml_backend_meta_buffer_type(meta, packed);
+        dense_require(buft != nullptr, "TP empty weight buffer unavailable");
+        ggml_backend_buffer_ptr wb(ggml_backend_alloc_ctx_tensors_from_buft(weights.get(), buft));
+        dense_require(wb != nullptr, "TP empty weight allocation failed");
+        ggml_backend_buffer_set_usage(wb.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+        ggml_context_ptr ctx(
+            ggml_init({ggml_tensor_overhead() * 8 + ggml_graph_overhead() * (count + 1), nullptr, true}));
+        auto * input = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, 512, 3);
+        auto * ids   = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I32, 0);
+        ggml_set_input(input);
+        ggml_set_input(ids);
+        auto * empty = ggml_mul_mat(ctx.get(), weight, ggml_get_rows(ctx.get(), input, ids));
+        ggml_set_output(empty);
+        auto * graph = ggml_new_graph(ctx.get());
+        ggml_build_forward_expand(graph, empty);
+        ggml_gallocr_ptr alloc(ggml_gallocr_new(ggml_backend_dev_buffer_type(meta)));
+        dense_require(ggml_gallocr_alloc_graph(alloc.get(), graph), "TP empty graph allocation failed");
+        for (int rank = 0; rank < count; ++rank) {
+            auto * local = ggml_backend_meta_tensor_shard(empty, rank, nullptr);
+            dense_require(local && ggml_is_empty(local) && local->ne[0] == weight->ne[1] && local->src[0]->ne[1] == 256,
+                          "TP empty fixture lost global/local width mismatch");
+            dense_require(ggml_backend_supports_op(backend, local), "TP empty dense op rejected");
+            auto * local_graph = ggml_new_graph(ctx.get());
+            ggml_build_forward_expand(local_graph, local);
+            // Empty local graphs need no collective or weight upload. Test each rank on the same device.
+            for (int replay = 0; replay < 3; ++replay) {
+                dense_require(ggml_backend_graph_compute(backend, local_graph) == GGML_STATUS_SUCCESS,
+                              "TP empty dense forward failed");
+            }
+        }
+    }
+    printf("KPACK_DENSE_TP_EMPTY q=%d logical_ranks=2,4 replays=3 weight_upload=NONE status=PASS\n", int(type));
+}
+
 static double check_dense_output(const std::vector<float> &  actual,
                                  const std::vector<double> & expected,
                                  int                         n,
@@ -475,6 +531,20 @@ static bool test_kpack_dense(ggml_backend_t backend, const std::string & suite, 
                 auto * input = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, 1024, 3);
                 auto * mm    = ggml_mul_mat(ctx.get(), weight, input);
                 require(ggml_backend_supports_op(backend, mm), "M=3 tail was rejected");
+                ggml_tensor wrong = *mm;
+                wrong.ne[0] *= 2;
+                for (int d = 1; d < GGML_MAX_DIMS; ++d) {
+                    wrong.nb[d] *= 2;
+                }
+                require(!ggml_backend_supports_op(backend, &wrong), "nonempty mismatched N admitted");
+                ggml_tensor wrong_input = *input;
+                wrong_input.ne[0] /= 2;
+                for (int d = 1; d < GGML_MAX_DIMS; ++d) {
+                    wrong_input.nb[d] /= 2;
+                }
+                wrong        = *mm;
+                wrong.src[1] = &wrong_input;
+                require(!ggml_backend_supports_op(backend, &wrong), "nonempty mismatched K admitted");
                 auto * alias = ggml_view_tensor(ctx.get(), weight);
                 require(ggml_backend_supports_op(backend, ggml_mul_mat(ctx.get(), alias, input)),
                         "uninitialized full alias was rejected");
@@ -495,6 +565,7 @@ static bool test_kpack_dense(ggml_backend_t backend, const std::string & suite, 
                 }
                 test_dense_empty(backend, weight, false);
                 test_dense_empty(backend, weight, true);
+                test_dense_tp_empty(backend, type, bufts[0]);
                 auto * ids     = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_I32, 1, 3);
                 auto * indexed = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, 1024, 1, 3);
                 auto * grouped = ggml_mul_mat_id(ctx.get(), weight, indexed, ids);

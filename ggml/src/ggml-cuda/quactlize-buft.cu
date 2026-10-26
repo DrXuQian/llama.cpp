@@ -117,12 +117,13 @@ bool dense_params(const ggml_tensor * op, quactlize_ppu_dense_params_v1 & params
     const auto *                 input  = op->src[1];
     ggml_quactlize_packed_layout layout{};
     if (!weight || !input || weight->ne[2] != 1 || weight->ne[3] != 1 || input->type != GGML_TYPE_F32 ||
-        !ggml_is_contiguous(input) || input->ne[0] != weight->ne[0] || op->ne[0] != weight->ne[1] ||
-        !ggml_quactlize_can_load(weight, &layout)) {
+        !ggml_is_contiguous(input) || !ggml_quactlize_can_load(weight, &layout)) {
         return false;
     }
-    const int64_t rows = ggml_nelements(input) / input->ne[0];
-    if (rows < 0 || rows > INT_MAX || ggml_nelements(op) / op->ne[0] != rows) {
+    // Meta leaves global widths on zero-row outputs; their packed weights are already local shards.
+    const int64_t rows = ggml_nrows(input);
+    if (rows < 0 || rows > INT_MAX || ggml_nrows(op) != rows ||
+        (rows != 0 && (input->ne[0] != weight->ne[0] || op->ne[0] != weight->ne[1]))) {
         return false;
     }
     params = {1,
@@ -624,8 +625,13 @@ void ggml_quactlize_prepare_graph(ggml_backend_cuda_context & cuda_ctx, const gg
                                src->name);
                 }
                 if (src != node->src[0] || !ggml_quactlize_can_compute(node)) {
-                    GGML_ABORT("quactlize: unsupported packed operation %s (%s reads %s)", ggml_op_name(node->op),
-                               node->name, src->name);
+                    const auto * input = node->src[1];
+                    GGML_ABORT(
+                        "quactlize: unsupported packed operation %s (%s reads %s) device=%d "
+                        "rows(input/output)=%" PRId64 "/%" PRId64 " n(weight/output)=%" PRId64 "/%" PRId64
+                        " k(weight/input)=%" PRId64 "/%" PRId64,
+                        ggml_op_name(node->op), node->name, src->name, cuda_ctx.device, input ? ggml_nrows(input) : -1,
+                        ggml_nrows(node), src->ne[1], node->ne[0], src->ne[0], input ? input->ne[0] : -1);
                 }
                 dense = true;
             }
