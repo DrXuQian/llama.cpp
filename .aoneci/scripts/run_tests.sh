@@ -690,6 +690,22 @@ echo "========== END REPORT =========="
 
 # Exit non-zero if any test failed
 if [ "$FAIL_COUNT" -gt 0 ]; then
+    for entry in "${FAIL_TESTS[@]}"; do
+        IFS='|' read -r FAILED_NAME FAILED_EXIT FAILED_KIND <<< "$entry"
+        FAILED_OUTPUT="$OUTPUT_DIR/test_${FAILED_NAME#test-}.txt"
+        echo "CI_TEST_FAILURE name=$FAILED_NAME rc=$FAILED_EXIT kind=$FAILED_KIND log=$FAILED_OUTPUT"
+        if [ ! -f "$FAILED_OUTPUT" ]; then
+            continue
+        fi
+        if grep -q 'KPACK_COMPUTE_DIAGNOSTIC_BEGIN' "$FAILED_OUTPUT"; then
+            awk '/KPACK_COMPUTE_FAIL/ { print }
+                 /KPACK_COMPUTE_DIAGNOSTIC_BEGIN/,/KPACK_COMPUTE_DIAGNOSTIC_END/ { print }' "$FAILED_OUTPUT"
+        else
+            grep -nEi -m1 -B8 -A24 'GGML_ASSERT|assertion.*failed|CUDA error|error:|undefined symbol|terminate called|Traceback' \
+                "$FAILED_OUTPUT" || true
+            tail -n 24 "$FAILED_OUTPUT"
+        fi
+    done
     # Package logs to shared directory for debugging
     TIMESTAMP=$(date '+%Y%m%d_%H%M%S')
     TARBALL="/ppusw/share/eec_shared/llama_ctest_logs_${TIMESTAMP}.tar.gz"

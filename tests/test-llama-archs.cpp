@@ -9,13 +9,16 @@
 
 // TODO: replace with #include "llama-ext.h" in the future
 #include "../src/llama-arch.h"
+#include "../src/llama-model-loader.h"
 #include "../src/llama-model-saver.h"
+#include "../ggml/src/ggml-backend-impl.h"
 
 #include <cinttypes>
 #include <cstddef>
 #include <cstdio>
 #include <cstring>
 #include <cstdint>
+#include <memory>
 #include <random>
 #include <stdexcept>
 #include <string>
@@ -332,6 +335,74 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
 
 static bool silent_model_load_progress(float /*progress*/, void * /*user_data*/) {
     return true;
+}
+
+static void test_meta_weight_placement() {
+    auto * cpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+    if (!cpu) {
+        return;
+    }
+    static size_t                             split_queries  = 0;
+    static size_t                             weight_queries = 0;
+    static ggml_backend_dev_get_weight_buft_t query          = [](ggml_backend_dev_t, const ggml_tensor *, ggml_op) {
+        ++weight_queries;
+        return ggml_backend_buffer_type_t(nullptr);
+    };
+    static ggml_backend_reg    reg   = {};
+    static ggml_backend_device local = *cpu;
+    reg.api_version                  = GGML_BACKEND_API_VERSION;
+    reg.iface.get_proc_address       = [](ggml_backend_reg_t, const char * name) -> void * {
+        return strcmp(name, "ggml_backend_dev_get_weight_buft") == 0 ? reinterpret_cast<void *>(query) : nullptr;
+    };
+    local.reg                    = &reg;
+    ggml_backend_dev_t devices[] = {&local, &local};
+    auto *             meta      = ggml_backend_meta_device(
+        devices, 2,
+        [](const ggml_tensor *, void *) {
+            ++split_queries;
+            return ggml_backend_meta_split_state{GGML_BACKEND_SPLIT_AXIS_MIRRORED, {}, {1}, 1};
+        },
+        nullptr);
+    gguf_context_ptr metadata(gguf_init_empty());
+    gguf_set_val_str(metadata.get(), "general.architecture", "llama");
+    llama_hparams hp            = {};
+    hp.n_layer_all              = 1;
+    hp.n_embd                   = 64;
+    const auto               tn = LLM_TN(LLM_ARCH_LLAMA)(LLM_TENSOR_ATTN_Q, "weight", 0);
+    std::vector<std::string> splits;
+
+    // A virtual model has no complete tensor inventory during placement.
+    for (auto * dev : {meta, &local}) {
+        llama_model_loader loader(metadata.get(), nullptr, nullptr, "", splits, nullptr, LLAMA_LOAD_MODE_NONE, false,
+                                  true, false, nullptr, nullptr);
+        const buft_list_t  bufts = {{dev, ggml_backend_dev_buffer_type(dev)}};
+        split_queries = weight_queries = 0;
+        auto * weight                  = loader.create_tensor(hp, &bufts, &bufts, &bufts, &bufts, tn, {64, 64}, 0);
+        GGML_ASSERT(weight && loader.ctx_map.count(bufts[0].second) == 1);
+        GGML_ASSERT(split_queries == 0 && weight_queries == (dev == meta ? 0 : 1));
+        if (dev == meta) {
+            gguf_add_tensor(metadata.get(), weight);
+        }
+    }
+
+    const auto close_file = [](FILE * file) {
+        if (file) {
+            fclose(file);
+        }
+    };
+    std::unique_ptr<FILE, decltype(close_file)> file(tmpfile(), close_file);
+    const size_t bytes = gguf_get_meta_size(metadata.get()) + gguf_get_tensor_size(metadata.get(), 0);
+    GGML_ASSERT(file && gguf_write_to_file_ptr(metadata.get(), file.get(), true));
+    GGML_ASSERT(fseek(file.get(), long(bytes - 1), SEEK_SET) == 0 && fputc(0, file.get()) != EOF);
+    GGML_ASSERT(fflush(file.get()) == 0);
+    rewind(file.get());
+    llama_model_loader loader(nullptr, nullptr, nullptr, "", splits, file.get(), LLAMA_LOAD_MODE_NONE, false, true,
+                              false, nullptr, nullptr);
+    const buft_list_t  bufts = {{meta, ggml_backend_dev_buffer_type(meta)}};
+    split_queries = weight_queries = 0;
+    auto * weight                  = loader.create_tensor(hp, &bufts, &bufts, &bufts, &bufts, tn, {64, 64}, 0);
+    GGML_ASSERT(weight && loader.ctx_map.count(bufts[0].second) == 1);
+    GGML_ASSERT(split_queries == 1 && weight_queries > 0);
 }
 
 static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
@@ -789,6 +860,7 @@ int main(int argc, char ** argv) {
     printf("%s: using seed %zu\n", __func__, seed);
 
     try {
+        test_meta_weight_placement();
         if (!out.empty()) {
             return save_models(arch, seed, log_level, out);
         }

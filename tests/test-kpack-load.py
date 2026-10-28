@@ -10,6 +10,7 @@ from pathlib import Path
 import resource
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -115,6 +116,33 @@ def check_compute_log(text, suite, qtype):
             raise RuntimeError(f'{weight}: missing or duplicated Quactlize plans (aliases must share the owner plan)')
 
 
+def print_compute_failure(log):
+    try:
+        lines = log.read_text(errors='replace').splitlines()
+    except OSError as error:
+        print(f'KPACK_COMPUTE_DIAGNOSTIC log={log} unavailable={error}', flush=True)
+        return
+    print(f'KPACK_COMPUTE_DIAGNOSTIC_BEGIN log={log}', flush=True)
+    for marker in ('KPACK_DENSE_START', '[quactlize-dense]', 'KPACK_JIT_RESOLVE'):
+        last = next((line for line in reversed(lines) if marker in line), None)
+        if last:
+            print(f'last_context: {last}', flush=True)
+    first = next((i for i, line in enumerate(lines) if re.search(
+        r'GGML_ASSERT|assertion.*failed|CUDA error|KPACK_JIT FAIL|KPACK_DENSE_ERROR|'
+        r'(?:fatal )?error:|undefined symbol|permission denied|no such file|terminate called|Traceback',
+        line, re.IGNORECASE)), None)
+    selected = set(range(max(0, len(lines) - 32), len(lines)))
+    if first is not None:
+        selected.update(range(max(0, first - 8), min(len(lines), first + 33)))
+    previous = -1
+    for i in sorted(selected):
+        if i > previous + 1:
+            print(f'... {i - previous - 1} log lines omitted ...', flush=True)
+        print(f'{i + 1}: {lines[i]}', flush=True)
+        previous = i
+    print('KPACK_COMPUTE_DIAGNOSTIC_END', flush=True)
+
+
 def run_compute_suite(args):
     env = os.environ | {'QUACTLIZE_PPU_PACK_LIBRARY': str(args.packer.resolve()), 'GGML_QUACTLIZE_DENSE': '1'}
     command = [str(args.binary.resolve()), '-b', args.backend, '--dense', '--suite', args.compute]
@@ -135,7 +163,12 @@ def run_compute_suite(args):
                 rc = process.wait()
         text = log.read_text(errors='replace')
         if (rc != 0 if rejected is None else rc == 0 or rejected not in text):
-            raise RuntimeError(f'{name}: unexpected rc={rc} or rejection marker; see {log}')
+            try:
+                reason = signal.Signals(-rc).name if rc < 0 else 'EXIT'
+            except ValueError:
+                reason = 'UNKNOWN_SIGNAL'
+            expected = f'nonzero exit with marker {rejected!r}' if rejected is not None else 'rc=0'
+            raise RuntimeError(f'{name}: rc={rc} termination={reason}; expected {expected}; log={log}')
         return text
 
     for qtype in (8, 10, 11, 12, 13, 14):
@@ -145,6 +178,7 @@ def run_compute_suite(args):
         except (OSError, RuntimeError, ValueError) as error:
             failures.append(str(error))
             print(f'KPACK_COMPUTE_FAIL q={qtype} error={error} remaining_continue=1', flush=True)
+            print_compute_failure(args.output / f'q{qtype}.log')
     if args.compute == 'contract':
         for name, extra, changes, marker in (
             ('grouped-rejected', ['--reject-grouped'], {}, 'unsupported packed operation MUL_MAT_ID'),
@@ -156,6 +190,7 @@ def run_compute_suite(args):
             except (OSError, RuntimeError) as error:
                 failures.append(str(error))
                 print(f'KPACK_COMPUTE_FAIL case={name} error={error} remaining_continue=1', flush=True)
+                print_compute_failure(args.output / (name + '.log'))
     if failures:
         raise RuntimeError(f'{args.compute}: {len(failures)} failed checks; results={args.output}')
     print(f'KPACK_COMPUTE_SUITE PASS suite={args.compute} formats=6 results={args.output}', flush=True)
