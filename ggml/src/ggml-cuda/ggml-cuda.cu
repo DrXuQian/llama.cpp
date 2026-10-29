@@ -4163,6 +4163,17 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 }
 
 static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
+#ifdef GGML_NCP_QUACTLIZE
+    if (!use_cuda_graph || cuda_graph_update_required) {
+        cudaStreamCaptureStatus capture;
+        CUDA_CHECK(cudaStreamIsCapturing(cuda_ctx->stream(), &capture));
+        // TP warmup calls this executor directly, bypassing graph_compute preparation.
+        if (capture == cudaStreamCaptureStatusNone) {
+            ggml_quactlize_prepare_graph(*cuda_ctx, cgraph);
+        }
+    }
+#endif
+
     bool graph_evaluated_or_captured = false;
 
     // flag used to determine whether it is an integrated_gpu
