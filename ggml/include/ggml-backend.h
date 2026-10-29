@@ -206,6 +206,10 @@ extern "C" {
     typedef void * (*ggml_backend_comm_init_t)(ggml_backend_t * backends, size_t n_backends);
     typedef void   (*ggml_backend_comm_free_t)(void * comm_ctx);
     typedef bool   (*ggml_backend_comm_allreduce_tensor_t)(void * comm_ctx, struct ggml_tensor ** tensors);
+    // Optional whole-graph execution. graphs[step*n_backends + rank] contains each compute segment;
+    // all but the last step end in an AllReduce. A false return means no work was submitted.
+    // uid must change when graph topology, tensor properties, or buffer addresses change (0 disables reuse).
+    typedef bool   (*ggml_backend_comm_graph_compute_t)(void * comm_ctx, struct ggml_cgraph ** graphs, size_t n_steps, uint64_t uid);
 
     // Split buffer type for tensor parallelism (old)
     typedef ggml_backend_buffer_type_t   (*ggml_backend_split_buffer_type_t)(int main_device, const float * tensor_split);

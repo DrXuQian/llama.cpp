@@ -242,6 +242,8 @@ if (NOT LLAMA_SANITIZE_ADDRESS AND NOT GGML_SCHED_NO_REALLOC)
 endif()
 llama_build_and_test(test-gguf.cpp)
 llama_build_and_test(test-backend-ops.cpp)
+llama_build_and_test(test-tp-graph.cpp)
+set_tests_properties(test-tp-graph PROPERTIES SKIP_RETURN_CODE 77)
 
 # NCP external kernel .so vs ggml's inline kernels. Needs at least one hook compiled in to have anything to compare;
 # the test itself skips cleanly when the .so is absent or the GPU backend exposes no route control, so the OR is only

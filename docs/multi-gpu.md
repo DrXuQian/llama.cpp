@@ -101,6 +101,15 @@ NVIDIA Collective Communications Library (NCCL) is unavailable, multi GPU perfor
 ```
 
 When using the "ROCm" backend (which is the ggml CUDA code translated for AMD via HIP), the AMD equivalent RCCL can be used by compiling with `-DGGML_HIP_RCCL=ON`. Note that RCCL is by default *disabled* because (unlike NCCL) it was not universally beneficial during testing.
+
+`GGML_CUDA_TP_GRAPHS=1` opts into capturing the compute segments and their AllReduces together, with one CUDA Graph launch per GPU for each meta-backend graph. This requires CUDA graphs, NCCL support, and a collective runtime that supports stream capture (PCCL on PPU). For a fully offloaded decode graph assigned to one meta-backend split, each token uses one graph launch per GPU after warmup:
+
+```bash
+GGML_CUDA_TP_GRAPHS=1 GGML_CUDA_ALLREDUCE=nccl llama-cli -m model.gguf -ngl 999 -sm tensor
+```
+
+Graph changes invalidate all ranks together and require another warmup before capture. Unsupported graphs retain segment execution, and `GGML_CUDA_DISABLE_GRAPHS` disables this option as well. CPU offload or evaluation callbacks can split a decode into multiple backend invocations; this option does not combine those invocations into one graph. The capture log reports the number of compute segments and AllReduces included per device.
+
 ### 6. With CUDA peer-to-peer access (`GGML_CUDA_P2P`)
 
 CUDA peer-to-peer (P2P) lets GPUs transfer data directly between each other instead of going through system memory, which generally improves multi-GPU performance. It is **opt-in** at runtime - set the environment variable `GGML_CUDA_P2P` to any value to enable it:
