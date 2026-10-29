@@ -1,4 +1,5 @@
 llama_add_compile_flags()
+find_package(Threads REQUIRED)
 
 function(llama_build source)
     set(TEST_SOURCES ${source} ${ARGN})
@@ -243,7 +244,10 @@ endif()
 llama_build_and_test(test-gguf.cpp)
 llama_build_and_test(test-backend-ops.cpp)
 llama_build_and_test(test-tp-graph.cpp)
-set_tests_properties(test-tp-graph PROPERTIES SKIP_RETURN_CODE 77)
+target_link_libraries(test-tp-graph PRIVATE Threads::Threads)
+set_tests_properties(test-tp-graph PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
+add_test(NAME test-tp-graph-host-launch COMMAND test-tp-graph --host-launch)
+set_tests_properties(test-tp-graph-host-launch PROPERTIES TIMEOUT 30)
 
 # NCP external kernel .so vs ggml's inline kernels. Needs at least one hook compiled in to have anything to compare;
 # the test itself skips cleanly when the .so is absent or the GPU backend exposes no route control, so the OR is only

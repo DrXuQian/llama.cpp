@@ -110,6 +110,8 @@ GGML_CUDA_TP_GRAPHS=1 GGML_CUDA_ALLREDUCE=nccl llama-cli -m model.gguf -ngl 999 
 
 Graph changes invalidate all ranks together and require another warmup before capture. Unsupported graphs retain segment execution, and `GGML_CUDA_DISABLE_GRAPHS` disables this option as well. CPU offload or evaluation callbacks can split a decode into multiple backend invocations; this option does not combine those invocations into one graph. The capture log reports the number of compute segments and AllReduces included per device.
 
+Each GPU has a persistent host launch thread, initialized before capture. Once all threads are ready, a shared barrier releases their graph submissions together. The caller waits for all launch API calls to return, without adding a device synchronization to replay. This avoids delaying later ranks behind an earlier rank's launch call; actual GPU start times still depend on stream dependencies and scheduling.
+
 ### 6. With CUDA peer-to-peer access (`GGML_CUDA_P2P`)
 
 CUDA peer-to-peer (P2P) lets GPUs transfer data directly between each other instead of going through system memory, which generally improves multi-GPU performance. It is **opt-in** at runtime - set the environment variable `GGML_CUDA_P2P` to any value to enable it:

@@ -65,6 +65,7 @@
 #include "ggml-cuda/mean.cuh"
 #include "ggml-cuda/tsembd.cuh"
 #include "ggml-cuda/topk-moe.cuh"
+#include "ggml-cuda/tp-graph-launch.h"
 #include "ggml-cuda/unary.cuh"
 #include "ggml-cuda/upscale.cuh"
 #include "ggml-cuda/wkv.cuh"
@@ -1192,6 +1193,7 @@ struct ggml_backend_cuda_comm_context {
     bool tp_graph_warmed = false;
     bool tp_graph_active = false;
     std::vector<std::unique_ptr<ggml_cuda_graph>> tp_graphs;
+    std::unique_ptr<ggml_cuda_tp_graph_launcher> tp_launcher;
     std::vector<nv_bfloat16 *> tp_scratch;
     size_t tp_scratch_ne = 0;
 
@@ -1227,6 +1229,7 @@ struct ggml_backend_cuda_comm_context {
 
     ~ggml_backend_cuda_comm_context() {
 #if defined(USE_CUDA_GRAPH) && defined(GGML_USE_NCCL)
+        tp_launcher.reset();
         reset_tp_graphs();
         free_tp_scratch();
 #endif
@@ -4806,12 +4809,7 @@ static bool ggml_backend_cuda_comm_graph_compute(
         return static_cast<ggml_backend_cuda_context *>(comm->backends[rank]->context);
     };
     auto launch = [&] {
-        // Submit every rank before waiting for any rank's collective work.
-        for (size_t j = 0; j < n; ++j) {
-            auto * ctx = ctx_at(j);
-            ggml_cuda_set_device(ctx->device);
-            CUDA_CHECK(cudaGraphLaunch(comm->tp_graphs[j]->instance, ctx->stream()));
-        }
+        comm->tp_launcher->launch();
     };
 
     const bool same_graph = uid == comm->tp_graph_uid && n_steps == comm->tp_graph_steps;
@@ -4865,6 +4863,22 @@ static bool ggml_backend_cuda_comm_graph_compute(
         }
         comm->tp_graph_uid = uid;
         comm->tp_graph_steps = n_steps;
+    }
+
+    if (!comm->tp_launcher) {
+        comm->tp_launcher = std::make_unique<ggml_cuda_tp_graph_launcher>(n, comm,
+            [](void * data, size_t rank) {
+                auto * owner = static_cast<ggml_backend_cuda_comm_context *>(data);
+                auto * ctx = static_cast<ggml_backend_cuda_context *>(owner->backends[rank]->context);
+                ggml_cuda_set_device(ctx->device);
+                (void) ctx->stream();
+            },
+            [](void * data, size_t rank) {
+                auto * owner = static_cast<ggml_backend_cuda_comm_context *>(data);
+                auto * ctx = static_cast<ggml_backend_cuda_context *>(owner->backends[rank]->context);
+                CUDA_CHECK(cudaGraphLaunch(owner->tp_graphs[rank]->instance, ctx->stream()));
+            });
+        GGML_LOG_INFO("%s: using %zu persistent threads for parallel graph launch\n", __func__, n);
     }
 
     std::vector<ggml_tensor *> tensors(n);
