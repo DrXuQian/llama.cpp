@@ -11,6 +11,7 @@
 #include "../src/llama-arch.h"
 #include "../src/llama-model-loader.h"
 #include "../src/llama-model-saver.h"
+#include "../src/llama-model.h"
 #include "../ggml/src/ggml-backend-impl.h"
 
 #include <cinttypes>
@@ -355,35 +356,62 @@ static void test_meta_weight_placement() {
         return strcmp(name, "ggml_backend_dev_get_weight_buft") == 0 ? reinterpret_cast<void *>(query) : nullptr;
     };
     local.reg                    = &reg;
+    auto params                  = llama_model_default_params();
+    params.n_gpu_layers          = 0;
+    llama_model_ptr model(llama_model_create(LLM_ARCH_LLAMA, params));
+    auto &          hp = model->hparams;
+    hp.n_layer_all     = 1;
+    hp.n_embd          = 128;
+    hp.n_head_arr[0] = hp.n_head_kv_arr[0] = 2;
+    hp.n_embd_head_k_full = hp.n_embd_head_v_full = 64;
+    static llama_meta_device_get_split_state_userdata split_data{};
+    split_data                   = {2, model.get(), nullptr};
     ggml_backend_dev_t devices[] = {&local, &local};
     auto *             meta      = ggml_backend_meta_device(
         devices, 2,
-        [](const ggml_tensor *, void *) {
+        [](const ggml_tensor * tensor, void * data) {
             ++split_queries;
-            return ggml_backend_meta_split_state{GGML_BACKEND_SPLIT_AXIS_MIRRORED, {}, {1}, 1};
+            return llama_meta_device_get_split_state(tensor, data);
         },
-        nullptr);
+        &split_data);
     gguf_context_ptr metadata(gguf_init_empty());
     gguf_set_val_str(metadata.get(), "general.architecture", "llama");
-    llama_hparams hp            = {};
-    hp.n_layer_all              = 1;
-    hp.n_embd                   = 64;
+    ggml_context_ptr ctx(ggml_init({ggml_tensor_overhead(), nullptr, true}));
+    auto *           output = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, 128, 128);
+    ggml_set_name(output, "blk.0.attn_output.weight");
     const auto               tn = LLM_TN(LLM_ARCH_LLAMA)(LLM_TENSOR_ATTN_Q, "weight", 0);
     std::vector<std::string> splits;
+    ggml_backend_meta_split_state expected{};
 
     // A virtual model has no complete tensor inventory during placement.
     for (auto * dev : {meta, &local}) {
         llama_model_loader loader(metadata.get(), nullptr, nullptr, "", splits, nullptr, LLAMA_LOAD_MODE_NONE, false,
                                   true, false, nullptr, nullptr);
         const buft_list_t  bufts = {{dev, ggml_backend_dev_buffer_type(dev)}};
+        model->tensors_by_name.clear();
+        split_data.loader = &loader;
+        GGML_ASSERT(llama_meta_device_get_split_state(output, &split_data).axis == GGML_BACKEND_SPLIT_AXIS_UNKNOWN);
         split_queries = weight_queries = 0;
-        auto * weight                  = loader.create_tensor(hp, &bufts, &bufts, &bufts, &bufts, tn, {64, 64}, 0);
+        auto * weight                  = loader.create_tensor(hp, &bufts, &bufts, &bufts, &bufts, tn, {128, 128}, 0);
         GGML_ASSERT(weight && loader.ctx_map.count(bufts[0].second) == 1);
-        GGML_ASSERT(split_queries == 0 && weight_queries == (dev == meta ? 0 : 1));
+        GGML_ASSERT(split_queries == (dev == meta ? 1 : 0) && weight_queries == (dev == meta ? 0 : 1));
+        // The normal split and allocation resume once all tensor metadata is present.
+        model->tensors_by_name = {{weight->name, weight}, {output->name, output}};
+        expected               = llama_meta_device_get_split_state(weight, &split_data);
+        GGML_ASSERT(expected.axis == GGML_BACKEND_SPLIT_AXIS_1 && expected.n_segments == 1);
+        GGML_ASSERT(expected.ne[0] == 64 && expected.ne[1] == 64 && expected.nr[0] == 1);
         if (dev == meta) {
             gguf_add_tensor(metadata.get(), weight);
+            GGML_ASSERT(ggml_backend_meta_device_get_weight_buft(meta, weight, GGML_OP_MUL_MAT) == nullptr);
+            GGML_ASSERT(weight_queries > 0);
+            ggml_backend_buffer_ptr buffer(
+                ggml_backend_alloc_ctx_tensors_from_buft(loader.ctx_map.at(bufts[0].second).get(), bufts[0].second));
+            GGML_ASSERT(buffer && weight->buffer);
         }
+        split_data.loader = nullptr;
+        model->tensors_by_name.clear();
     }
+    gguf_add_tensor(metadata.get(), output);
 
     const auto close_file = [](FILE * file) {
         if (file) {
@@ -391,7 +419,8 @@ static void test_meta_weight_placement() {
         }
     };
     std::unique_ptr<FILE, decltype(close_file)> file(tmpfile(), close_file);
-    const size_t bytes = gguf_get_meta_size(metadata.get()) + gguf_get_tensor_size(metadata.get(), 0);
+    const size_t                                bytes =
+        gguf_get_meta_size(metadata.get()) + gguf_get_tensor_offset(metadata.get(), 1) + ggml_nbytes(output);
     GGML_ASSERT(file && gguf_write_to_file_ptr(metadata.get(), file.get(), true));
     GGML_ASSERT(fseek(file.get(), long(bytes - 1), SEEK_SET) == 0 && fputc(0, file.get()) != EOF);
     GGML_ASSERT(fflush(file.get()) == 0);
@@ -399,10 +428,16 @@ static void test_meta_weight_placement() {
     llama_model_loader loader(nullptr, nullptr, nullptr, "", splits, file.get(), LLAMA_LOAD_MODE_NONE, false, true,
                               false, nullptr, nullptr);
     const buft_list_t  bufts = {{meta, ggml_backend_dev_buffer_type(meta)}};
+    split_data.loader        = &loader;
     split_queries = weight_queries = 0;
-    auto * weight                  = loader.create_tensor(hp, &bufts, &bufts, &bufts, &bufts, tn, {64, 64}, 0);
+    auto * weight                  = loader.create_tensor(hp, &bufts, &bufts, &bufts, &bufts, tn, {128, 128}, 0);
     GGML_ASSERT(weight && loader.ctx_map.count(bufts[0].second) == 1);
     GGML_ASSERT(split_queries == 1 && weight_queries > 0);
+    const auto actual = llama_meta_device_get_split_state(weight, &split_data);
+    GGML_ASSERT(actual.axis == expected.axis && actual.n_segments == expected.n_segments);
+    GGML_ASSERT(memcmp(actual.ne, expected.ne, sizeof(actual.ne)) == 0);
+    GGML_ASSERT(memcmp(actual.nr, expected.nr, sizeof(actual.nr)) == 0);
+    split_data = {};
 }
 
 static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(

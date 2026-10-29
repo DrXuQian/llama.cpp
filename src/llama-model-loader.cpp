@@ -1068,16 +1068,13 @@ static bool weight_buft_supported(const llama_hparams & hparams, ggml_tensor * w
 static ggml_backend_buffer_type_t select_weight_buft(const llama_hparams & hparams,
                                                      ggml_tensor *         tensor,
                                                      ggml_op               op,
-                                                     const buft_list_t *   buft_list,
-                                                     bool                  allow_meta_preference) {
+                                                     const buft_list_t *   buft_list) {
     GGML_ASSERT(!buft_list->empty());
     for (const auto & cur : *buft_list) {
         ggml_backend_dev_t cur_dev = cur.first;
         ggml_backend_buffer_type_t cur_buft = cur.second;
         auto *                     reg      = ggml_backend_dev_backend_reg(cur_dev);
-        // Virtual tensors do not yet have the sibling metadata used by Meta splitting.
-        if (cur_buft == ggml_backend_dev_buffer_type(cur_dev) &&
-            (allow_meta_preference || ggml_backend_dev_type(cur_dev) != GGML_BACKEND_DEVICE_TYPE_META)) {
+        if (cur_buft == ggml_backend_dev_buffer_type(cur_dev)) {
             auto   preferred   = reg ? (ggml_backend_dev_get_weight_buft_t) ggml_backend_reg_get_proc_address(
                                        reg, "ggml_backend_dev_get_weight_buft") :
                                        nullptr;
@@ -1213,7 +1210,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
                 if (std::regex_search(tensor_name, pattern)) {
                     if (overrides->buft == ggml_backend_cpu_buffer_type()) {
                         // when overriding to a CPU buffer, consider the extra buffer types
-                        buft = select_weight_buft(hparams, t_meta, op, buft_list_cpu, !files.empty());
+                        buft = select_weight_buft(hparams, t_meta, op, buft_list_cpu);
                         if (use_mmap) {
                             static std::once_flag once;
                             std::call_once(once, [] {
@@ -1245,7 +1242,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         }
 
         if (!buft) {
-            buft = select_weight_buft(hparams, t_meta, op, buft_list, !files.empty());
+            buft = select_weight_buft(hparams, t_meta, op, buft_list);
             if (!buft) {
                 throw std::runtime_error(format("failed to find a compatible buffer type for tensor %s", tn.str().c_str()));
             }

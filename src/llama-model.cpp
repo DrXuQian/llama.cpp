@@ -366,6 +366,10 @@ llama_model * llama_model_create(llama_model_loader & ml, const llama_model_para
 
 struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const struct ggml_tensor * tensor, void * userdata) {
     const llama_meta_device_get_split_state_userdata * ud = (const llama_meta_device_get_split_state_userdata *) userdata;
+    // Virtual weights have no complete metadata during placement queries.
+    if (ud->loader && ud->loader->files.empty() && ud->model->tensors_by_name.empty()) {
+        return {GGML_BACKEND_SPLIT_AXIS_UNKNOWN, {0}, {1}, 1};
+    }
     const llama_hparams & hparams = ud->model->hparams;
     const std::string tensor_name = tensor->name;
     const bool is_dsv4 = ud->model->arch == LLM_ARCH_DEEPSEEK4 ||
