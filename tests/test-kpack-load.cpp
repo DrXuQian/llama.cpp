@@ -44,7 +44,7 @@ static bool test_kpack_load(ggml_backend_t backend, const char * fixture, bool r
             ggml_backend_reg_get_proc_address(reg, "ggml_quactlize_set_packed"));
         require(extra && query && read && install, "load-only API is unavailable");
         auto ** bufts = extra(dev);
-        require(bufts && bufts[0], "packer is unavailable");
+        require(bufts && bufts[0], "Quactlize library is unavailable");
         ggml_backend_buffer_type_t buft = bufts[0];
         require(ggml_backend_dev_buffer_type(dev) != buft, "K-pack is the default model buffer");
         auto automatic = reinterpret_cast<ggml_backend_dev_get_extra_bufts_t>(
@@ -378,7 +378,7 @@ static bool test_kpack_dense(ggml_backend_t backend, const std::string & suite, 
             ggml_backend_reg_get_proc_address(reg, "ggml_quactlize_can_load"));
         require(extra && read && install && query && preferred, "packed buffer API is unavailable");
         auto ** bufts = extra(dev);
-        require(bufts && bufts[0], "packer is unavailable");
+        require(bufts && bufts[0], "Quactlize library is unavailable");
         ggml_backend_ptr second(ggml_backend_dev_init(dev, nullptr));
         require(second != nullptr, "second backend allocation failed");
         ggml_backend_t backends[] = {backend, second.get()};
@@ -690,7 +690,7 @@ int main(int argc, char ** argv) {
     }
 
     if (!dense) {
-        setenv("GGML_QUACTLIZE_DENSE", "0", 1);
+        setenv("GGML_QUACTLIZE", "0", 1);
     }
     if (reject_grouped) {
         suite = "contract";

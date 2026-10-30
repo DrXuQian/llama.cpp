@@ -27,19 +27,19 @@ def main():
     parser.add_argument('--compute', choices=('gemv', 'gemm', 'contract'),
                         help='independent compute suite; needs no GGUF fixture, Python reference, numpy or torch')
     parser.add_argument('--cache-binary', type=Path, help='also test background persistence and cross-process hits')
-    parser.add_argument('--packer', type=Path, default=os.environ.get('QUACTLIZE_PPU_PACK_LIBRARY'),
-                        help='Quactlize library; defaults to QUACTLIZE_PPU_PACK_LIBRARY or the library beside --binary')
+    parser.add_argument('--library', type=Path, default=os.environ.get('QUACTLIZE_PPU_LIBRARY'),
+                        help='Quactlize library; defaults to QUACTLIZE_PPU_LIBRARY or the library beside --binary')
     parser.add_argument('--output', type=Path,
                         help='new directory; default: temporary kpack-* directory, removed on success')
     parser.add_argument('--backend', default='CUDA0')
     parser.add_argument('--tp-devices', default=os.environ.get('KPACK_TP_DEVICES'),
                         help='comma-separated TP devices; default: two logical ranks on --backend')
     args = parser.parse_args()
-    if args.packer is None:
-        args.packer = args.binary.resolve().parent / 'libquactlize_ppu.so'
+    if args.library is None:
+        args.library = args.binary.resolve().parent / 'libncp_quactlize.so'
     if args.reference is None:
         args.reference = args.binary.resolve().parent / 'quactlize' / 'gguf_kpack.py'
-    for path in (args.binary, args.packer) + (() if args.compute else (args.reference,)):
+    for path in (args.binary, args.library) + (() if args.compute else (args.reference,)):
         if not path.is_file():
             parser.error(f'missing {path}')
     if args.cache_binary is not None and not args.cache_binary.is_file():
@@ -138,7 +138,7 @@ def print_compute_failure(log):
 
 
 def run_compute_suite(args):
-    env = os.environ | {'QUACTLIZE_PPU_PACK_LIBRARY': str(args.packer.resolve()), 'GGML_QUACTLIZE_DENSE': '1'}
+    env = os.environ | {'QUACTLIZE_PPU_LIBRARY': str(args.library.resolve()), 'GGML_QUACTLIZE': '1'}
     command = [str(args.binary.resolve()), '-b', args.backend, '--dense', '--suite', args.compute]
     resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
     failures = []
@@ -174,10 +174,19 @@ def run_compute_suite(args):
             print(f'KPACK_COMPUTE_FAIL q={qtype} error={error} remaining_continue=1', flush=True)
             print_compute_failure(args.output / f'q{qtype}.log')
     if args.compute == 'contract':
+        try:
+            default_env = {k: v for k, v in env.items() if k != 'GGML_QUACTLIZE'}
+            text = run('default-enabled', command + ['--qtype', '12'], default_env)
+            check_compute_log(text, args.compute, 12)
+        except (OSError, RuntimeError, ValueError) as error:
+            failures.append(str(error))
+            print(f'KPACK_COMPUTE_FAIL case=default-enabled error={error} remaining_continue=1', flush=True)
+            print_compute_failure(args.output / 'default-enabled.log')
         for name, extra, changes, marker in (
             ('grouped-rejected', ['--reject-grouped'], {}, 'unsupported packed operation MUL_MAT_ID'),
-            ('disabled', [], {'GGML_QUACTLIZE_DENSE': '0'}, 'aligned shape was rejected'),
-            ('missing-library', [], {'QUACTLIZE_PPU_PACK_LIBRARY': str(args.output / 'missing.so')}, 'packer is unavailable'),
+            ('disabled', [], {'GGML_QUACTLIZE': '0'}, 'aligned shape was rejected'),
+            ('invalid-switch', [], {'GGML_QUACTLIZE': 'invalid'}, 'GGML_QUACTLIZE must be 0 or 1'),
+            ('missing-library', [], {'QUACTLIZE_PPU_LIBRARY': str(args.output / 'missing.so')}, 'Quactlize library is unavailable'),
         ):
             try:
                 run(name, command + ['--qtype', '12'] + extra, env | changes, marker)
@@ -327,8 +336,8 @@ def run_suite(args):
     writer.write_tensors_to_file()
     writer.close()
     reference = args.reference.resolve()
-    env = os.environ | {'QUACTLIZE_PPU_PACK_LIBRARY': str(args.packer.resolve()),
-                        'GGML_QUACTLIZE_DENSE': '0',
+    env = os.environ | {'QUACTLIZE_PPU_LIBRARY': str(args.library.resolve()),
+                        'GGML_QUACTLIZE': '0',
                         'PYTHONPATH': GGUF_PY + os.pathsep + os.environ.get('PYTHONPATH', '')}
     subprocess.run([sys.executable, str(reference), 'pack', str(source), str(packed)], check=True, env=env)
     subprocess.run([sys.executable, str(reference), 'verify', str(packed), '--source', str(source)], check=True, env=env)
@@ -351,8 +360,8 @@ def run_suite(args):
         raise RuntimeError('default buffer isolation was not checked')
     run('forward-rejected', command + ['--reject-forward'], env, None,
         'K-pack is load-only; inference is not enabled')
-    run('missing-packer', command, env | {'QUACTLIZE_PPU_PACK_LIBRARY': str(args.output / 'missing.so')}, 1,
-        'KPACK_LOAD FAIL: packer is unavailable')
+    run('missing-library', command, env | {'QUACTLIZE_PPU_LIBRARY': str(args.output / 'missing.so')}, 1,
+        'KPACK_LOAD FAIL: Quactlize library is unavailable')
     if args.cache_binary:
         q8 = args.output / 'q8-reference.gguf'
         q8_fixture(q8)

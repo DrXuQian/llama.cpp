@@ -127,7 +127,7 @@ echo "==> [3/5] Building ncp_flash_lib (FA + MoE + GDN + Quactlize)..."
 bash "${NCP_LIB_DIR}/build.sh" fa moe gdn quactlize
 
 # Runtime libraries must load on boxes without torch.
-for so in libncp_fa.so libncp_moe.so libquactlize_ppu.so; do
+for so in libncp_fa.so libncp_moe.so libncp_quactlize.so; do
     if [ -f "build/${so}" ] && ldd "build/${so}" 2>/dev/null | grep -qi torch; then
         echo "    WARNING: ${so} links libtorch -- will fail on boxes without torch"
     fi
@@ -138,7 +138,7 @@ if ldd build/libncp_gdn.so 2>/dev/null | grep -qiE 'torch|python|triton'; then
 fi
 
 # --- 4. Check the libraries and the complete Quactlize package ---
-for so in libncp_fa.so libncp_moe.so libquactlize_ppu.so; do
+for so in libncp_fa.so libncp_moe.so libncp_quactlize.so; do
     if [ ! -f "${NCP_LIB_DIR}/build/${so}" ]; then
         echo "ERROR: ${NCP_LIB_DIR}/build/${so} was not built" >&2
         exit 1
@@ -184,7 +184,7 @@ cmake --build build-ci -j"${JOBS}"
 # copied: one copy of the .so, so there is never a question of which one is being loaded. A re-run relinks it.
 mv -f "${NCP_LIB_DIR}/build/libncp_moe.so" "${LLAMA_CI_DIR}/build-ci/bin/"
 mv -f "${NCP_LIB_DIR}/build/libncp_fa.so" "${LLAMA_CI_DIR}/build-ci/bin/"
-mv -f "${NCP_LIB_DIR}/build/libquactlize_ppu.so" "${LLAMA_CI_DIR}/build-ci/bin/"
+mv -f "${NCP_LIB_DIR}/build/libncp_quactlize.so" "${LLAMA_CI_DIR}/build-ci/bin/"
 mv -f "${NCP_LIB_DIR}/build/manifest.json" "${LLAMA_CI_DIR}/build-ci/bin/"
 mv "${NCP_LIB_DIR}/build/quactlize-runtime" "${LLAMA_CI_DIR}/build-ci/bin/"
 echo "    installed libncp_moe.so, libncp_fa.so, and the unified Quactlize package -> build-ci/bin/"
@@ -237,13 +237,15 @@ echo ""
 echo "========================================"
 echo "BUILD COMPLETE"
 echo "========================================"
-echo "  NCP hooks     : FA + MoE + Quactlize dense (libraries + deep_gemm/ + quactlize-runtime/ + quactlize/ in build-ci/bin)"
+echo "  NCP hooks     : FA + MoE + Quactlize (libraries + deep_gemm/ + quactlize-runtime/ + quactlize/ in build-ci/bin)"
 echo "  GDN hook      : actlizeLA (libncp_gdn.so in build-ci/bin)"
 echo "  test binaries : ${LLAMA_CI_DIR}/build-ci/bin/"
 echo "========================================"
 echo ""
 echo "No GGML_NCP_*_LIB to export -- the \$ORIGIN runpath finds the .so in build-ci/bin."
-echo "Replacing Quactlize? Install libquactlize_ppu.so and quactlize-runtime/ together; enabled K-pack dense does not fall back when the library is missing."
+echo "Replacing Quactlize? Install libncp_quactlize.so and quactlize-runtime/ together; enabled Quactlize does not fall back when the library is missing."
+echo "Quactlize is enabled by default; GGML_QUACTLIZE=0 disables placement and compute."
+echo "Optional candidate library: QUACTLIZE_PPU_LIBRARY=/absolute/path/libncp_quactlize.so"
 echo ""
 echo "Before running tests manually (not via run_tests.sh), source the runtime env first:"
 echo "  source ${SCRIPT_DIR}/config.sh"

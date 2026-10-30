@@ -55,7 +55,7 @@ int quactlize_ppu_prepare_fully_quantized_dev_for_arrangement_v2(
     const quactlize_ppu_placed_arrangement_v2 * arrangement,
     void *                                      stream);
 
-// Public consumer ABI in libquactlize_ppu.so, built by Quactlize and installed by ncp_flash_lib.
+// Public consumer ABI in libncp_quactlize.so, built by Quactlize and installed by ncp_flash_lib.
 // A[M,K] and C[M,N] use F32 storage; strides count elements. W[N,K] uses the
 // canonical planes below. No activation quantization to int8 or clipping.
 typedef struct {

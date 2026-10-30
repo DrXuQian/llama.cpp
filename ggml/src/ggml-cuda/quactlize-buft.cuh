@@ -18,7 +18,8 @@ bool                         ggml_cuda_buft_is_quactlize(ggml_backend_buffer_typ
 // Zero-offset, unchanged-layout aliases of resident packed weights only.
 bool                         ggml_quactlize_is_alias(const ggml_tensor * tensor);
 bool                         ggml_quactlize_can_load(const ggml_tensor * tensor, ggml_quactlize_packed_layout * layout);
-bool                         ggml_quactlize_dense_enabled();
+// One runtime switch for automatic placement and compute: GGML_QUACTLIZE=0/1 (default 1).
+bool                         ggml_quactlize_enabled();
 bool                         ggml_quactlize_can_compute(const ggml_tensor * op);
 void                         ggml_quactlize_prepare_graph(ggml_backend_cuda_context & ctx, const ggml_cgraph * graph);
 void                         ggml_quactlize_mul_mat(ggml_backend_cuda_context & ctx, ggml_tensor * dst);

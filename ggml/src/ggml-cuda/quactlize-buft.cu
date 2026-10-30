@@ -16,68 +16,55 @@ namespace {
 // Once a buffer type escapes, keep checking even after its buffers are freed.
 std::atomic<bool> buffer_type_exposed{false};
 
-struct pack_library {
+// Validate loading and execution together before admitting packed weights.
+struct quactlize_library {
     void *                                                                  handle      = nullptr;
     decltype(&quactlize_ppu_kpack_canonical_arrangement_v1)                 arrangement = nullptr;
     decltype(&quactlize_ppu_kpack_sizes_for_arrangement_v1)                 sizes       = nullptr;
     decltype(&quactlize_ppu_prepare_fully_quantized_dev_for_arrangement_v2) pack        = nullptr;
 
-    pack_library() {
-        const char * path = getenv("QUACTLIZE_PPU_PACK_LIBRARY");
-        handle            = dlopen(path && *path ? path : "libquactlize_ppu.so", RTLD_NOW | RTLD_LOCAL);
+    decltype(&quactlize_ppu_dense_supported_v1) dense_supported = nullptr;
+    decltype(&quactlize_ppu_dense_create_v1)    dense_create    = nullptr;
+    decltype(&quactlize_ppu_dense_prepare_v1)   dense_prepare   = nullptr;
+    decltype(&quactlize_ppu_dense_run_v1)       dense_run       = nullptr;
+    decltype(&quactlize_ppu_dense_destroy_v1)   dense_destroy   = nullptr;
+    decltype(&quactlize_ppu_dense_error_v1)     dense_error     = nullptr;
+
+    quactlize_library() {
+        const char * path = getenv("QUACTLIZE_PPU_LIBRARY");
+        if (!path || !*path) {
+            path = "libncp_quactlize.so";
+        }
+        handle = dlopen(path, RTLD_NOW | RTLD_LOCAL);
         if (!handle) {
-            GGML_LOG_WARN("quactlize: packer unavailable: %s\n", dlerror());
+            GGML_LOG_WARN("quactlize: library %s unavailable: %s\n", path, dlerror());
             return;
         }
-        arrangement =
-            reinterpret_cast<decltype(arrangement)>(dlsym(handle, "quactlize_ppu_kpack_canonical_arrangement_v1"));
-        sizes = reinterpret_cast<decltype(sizes)>(dlsym(handle, "quactlize_ppu_kpack_sizes_for_arrangement_v1"));
-        pack  = reinterpret_cast<decltype(pack)>(
-            dlsym(handle, "quactlize_ppu_prepare_fully_quantized_dev_for_arrangement_v2"));
-        if (!arrangement || !sizes || !pack) {
-            GGML_LOG_WARN("quactlize: packer has an incomplete ABI\n");
-            dlclose(handle);
-            handle = nullptr;
+#    define QZ_BIND(field, symbol)                                                     \
+        field = reinterpret_cast<decltype(field)>(dlsym(handle, #symbol));             \
+        if (!field) {                                                                  \
+            GGML_LOG_WARN("quactlize: library %s missing symbol %s\n", path, #symbol); \
+            dlclose(handle);                                                           \
+            handle = nullptr;                                                          \
+            return;                                                                    \
         }
+        QZ_BIND(arrangement, quactlize_ppu_kpack_canonical_arrangement_v1);
+        QZ_BIND(sizes, quactlize_ppu_kpack_sizes_for_arrangement_v1);
+        QZ_BIND(pack, quactlize_ppu_prepare_fully_quantized_dev_for_arrangement_v2);
+        QZ_BIND(dense_supported, quactlize_ppu_dense_supported_v1);
+        QZ_BIND(dense_create, quactlize_ppu_dense_create_v1);
+        QZ_BIND(dense_prepare, quactlize_ppu_dense_prepare_v1);
+        QZ_BIND(dense_run, quactlize_ppu_dense_run_v1);
+        QZ_BIND(dense_destroy, quactlize_ppu_dense_destroy_v1);
+        QZ_BIND(dense_error, quactlize_ppu_dense_error_v1);
+#    undef QZ_BIND
+        GGML_LOG_INFO("[quactlize] loaded %s\n", path);
     }
 };
 
-const pack_library & library() {
-    static const pack_library lib;
+const quactlize_library & library() {
+    static const quactlize_library lib;
     return lib;
-}
-
-struct dense_library {
-    decltype(&quactlize_ppu_dense_supported_v1) supported = nullptr;
-    decltype(&quactlize_ppu_dense_create_v1)    create    = nullptr;
-    decltype(&quactlize_ppu_dense_prepare_v1)   prepare   = nullptr;
-    decltype(&quactlize_ppu_dense_run_v1)       run       = nullptr;
-    decltype(&quactlize_ppu_dense_destroy_v1)   destroy   = nullptr;
-    decltype(&quactlize_ppu_dense_error_v1)     error     = nullptr;
-
-    dense_library() {
-        void * handle = library().handle;
-        if (!handle) {
-            GGML_ABORT("quactlize: pack library is unavailable for dense compute");
-        }
-#    define QZ_DENSE_BIND(field)                                                                       \
-        field = reinterpret_cast<decltype(field)>(dlsym(handle, "quactlize_ppu_dense_" #field "_v1")); \
-        if (!field) {                                                                                  \
-            GGML_ABORT("quactlize: pack library missing dense " #field "_v1");                         \
-        }
-        QZ_DENSE_BIND(supported);
-        QZ_DENSE_BIND(create);
-        QZ_DENSE_BIND(prepare);
-        QZ_DENSE_BIND(run);
-        QZ_DENSE_BIND(destroy);
-        QZ_DENSE_BIND(error);
-#    undef QZ_DENSE_BIND
-    }
-};
-
-const dense_library & dense_api() {
-    static const dense_library api;
-    return api;
 }
 
 struct dense_plan {
@@ -201,7 +188,7 @@ void free_buffer(ggml_backend_buffer_t buffer) {
     if (ctx->compute) {
         // Compute plans reference these weights and may be captured on other streams.
         CUDA_CHECK(cudaDeviceSynchronize());
-        dense_api().destroy(ctx->compute);
+        library().dense_destroy(ctx->compute);
     }
     for (const auto & item : ctx->tensors) {
         if (item.second.ready) {
@@ -556,16 +543,16 @@ bool ggml_quactlize_copy_range_wait(ggml_backend_event_t completion) {
     return rc == cudaSuccess;
 }
 
-bool ggml_quactlize_dense_enabled() {
+bool ggml_quactlize_enabled() {
     static const bool enabled = [] {
-        const char * value = getenv("GGML_QUACTLIZE_DENSE");
+        const char * value = getenv("GGML_QUACTLIZE");
         if (!value || !*value || strcmp(value, "1") == 0) {
             return true;
         }
         if (strcmp(value, "0") == 0) {
             return false;
         }
-        GGML_ABORT("GGML_QUACTLIZE_DENSE must be 0 or 1");
+        GGML_ABORT("GGML_QUACTLIZE must be 0 or 1");
     }();
     return enabled;
 }
@@ -573,13 +560,12 @@ bool ggml_quactlize_dense_enabled() {
 ggml_backend_buffer_type_t ggml_cuda_quactlize_weight_buft(ggml_backend_dev_t  dev,
                                                            const ggml_tensor * weight,
                                                            ggml_op             op) {
-    if (!ggml_quactlize_dense_enabled() || op != GGML_OP_MUL_MAT || !weight || weight->ne[2] != 1 ||
-        weight->ne[3] != 1 ||
+    if (!ggml_quactlize_enabled() || op != GGML_OP_MUL_MAT || !weight || weight->ne[2] != 1 || weight->ne[3] != 1 ||
         (weight->type != GGML_TYPE_Q8_0 && (weight->type < GGML_TYPE_Q2_K || weight->type > GGML_TYPE_Q6_K))) {
         return nullptr;
     }
     if (!library().handle) {
-        GGML_ABORT("quactlize: packer unavailable for automatic dense placement");
+        GGML_ABORT("quactlize: library unavailable for automatic placement");
     }
     ggml_quactlize_packed_layout layout{};
     if (!ggml_quactlize_can_load(weight, &layout)) {
@@ -588,17 +574,17 @@ ggml_backend_buffer_type_t ggml_cuda_quactlize_weight_buft(ggml_backend_dev_t  d
     quactlize_ppu_dense_params_v1 params{
         1, sizeof(params), int32_t(weight->type), int32_t(weight->ne[1]), int32_t(weight->ne[0]),
         0, weight->ne[0],  weight->ne[1],         layout.arrangement,     layout.sizes};
-    const auto & api       = dense_api();
-    const int    supported = api.supported(&params);
+    const auto & api       = library();
+    const int    supported = api.dense_supported(&params);
     if (supported < 0 || supported > 1) {
-        GGML_ABORT("quactlize: dense weight admission %s: %s", weight->name, api.error());
+        GGML_ABORT("quactlize: dense weight admission %s: %s", weight->name, api.dense_error());
     }
     return supported ? ggml_cuda_quactlize_extra_bufts(dev)[0] : nullptr;
 }
 
 bool ggml_quactlize_can_compute(const ggml_tensor * op) {
     quactlize_ppu_dense_params_v1 params{};
-    return ggml_quactlize_dense_enabled() && dense_params(op, params) && dense_api().supported(&params) == 1;
+    return ggml_quactlize_enabled() && dense_params(op, params) && library().dense_supported(&params) == 1;
 }
 
 void ggml_quactlize_prepare_graph(ggml_backend_cuda_context & cuda_ctx, const ggml_cgraph * graph) {
@@ -620,7 +606,7 @@ void ggml_quactlize_prepare_graph(ggml_backend_cuda_context & cuda_ctx, const gg
         bool dense = false;
         for (const auto * src : node->src) {
             if (packed_source(src)) {
-                if (!ggml_quactlize_dense_enabled()) {
+                if (!ggml_quactlize_enabled()) {
                     GGML_ABORT("quactlize: K-pack is load-only; inference is not enabled (%s reads %s)", node->name,
                                src->name);
                 }
@@ -661,18 +647,18 @@ void ggml_quactlize_prepare_graph(ggml_backend_cuda_context & cuda_ctx, const gg
             CUDA_CHECK(cudaEventSynchronize(state.ready));
             state.compute_ready = true;
         }
-        const auto & api = dense_api();
-        if (!ctx->compute && (api.create(ctx->device, &ctx->compute) || !ctx->compute)) {
-            GGML_ABORT("quactlize: dense context: %s", api.error());
+        const auto & api = library();
+        if (!ctx->compute && (api.dense_create(ctx->device, &ctx->compute) || !ctx->compute)) {
+            GGML_ABORT("quactlize: dense context: %s", api.dense_error());
         }
         const auto * low   = static_cast<const uint8_t *>(weight->data);
         const auto & sizes = state.layout.sizes;
         dense_plan   plan;
         plan.info.version = 1;
         plan.info.size    = sizeof(plan.info);
-        if (api.prepare(ctx->compute, &params, low, sizes.high_bytes ? low + sizes.low_bytes : nullptr,
-                        low + sizes.low_bytes + sizes.high_bytes, &plan.handle, &plan.info)) {
-            GGML_ABORT("quactlize: dense prepare %s: %s", weight->name, api.error());
+        if (api.dense_prepare(ctx->compute, &params, low, sizes.high_bytes ? low + sizes.low_bytes : nullptr,
+                              low + sizes.low_bytes + sizes.high_bytes, &plan.handle, &plan.info)) {
+            GGML_ABORT("quactlize: dense prepare %s: %s", weight->name, api.dense_error());
         }
         if (!plan.handle || plan.info.version != 1 || plan.info.size != sizeof(plan.info) ||
             plan.info.workspace_bytes > SIZE_MAX || plan.info.route < 0 || plan.info.route > 3 || plan.info.split < 1 ||
@@ -691,7 +677,7 @@ void ggml_quactlize_prepare_graph(ggml_backend_cuda_context & cuda_ctx, const gg
 
 void ggml_quactlize_mul_mat(ggml_backend_cuda_context & cuda_ctx, ggml_tensor * dst) {
     quactlize_ppu_dense_params_v1 params{};
-    GGML_ASSERT(ggml_quactlize_dense_enabled() && dense_params(dst, params));
+    GGML_ASSERT(ggml_quactlize_enabled() && dense_params(dst, params));
     const auto * weight = weight_owner(dst->src[0]);
     auto *       ctx    = static_cast<buffer_context *>(weight->buffer->context);
     GGML_ASSERT(ctx->device == cuda_ctx.device);
@@ -708,10 +694,10 @@ void ggml_quactlize_mul_mat(ggml_backend_cuda_context & cuda_ctx, ggml_tensor * 
     if (plan.info.workspace_bytes) {
         workspace.alloc(plan.info.workspace_bytes);
     }
-    const auto & api = dense_api();
-    if (api.run(plan.handle, static_cast<const float *>(dst->src[1]->data), static_cast<float *>(dst->data),
-                workspace.get(), plan.info.workspace_bytes, cuda_ctx.stream())) {
-        GGML_ABORT("quactlize: dense run %s: %s", dst->name, api.error());
+    const auto & api = library();
+    if (api.dense_run(plan.handle, static_cast<const float *>(dst->src[1]->data), static_cast<float *>(dst->data),
+                      workspace.get(), plan.info.workspace_bytes, cuda_ctx.stream())) {
+        GGML_ABORT("quactlize: dense run %s: %s", dst->name, api.dense_error());
     }
 }
 #endif

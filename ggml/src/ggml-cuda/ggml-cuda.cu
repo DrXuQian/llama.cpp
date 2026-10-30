@@ -5034,10 +5034,10 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         if (source && source->buffer && ggml_cuda_buft_is_quactlize(source->buffer->buft)) {
             return src == op->src[0] && source->buffer->buft->device == dev &&
                    (ggml_quactlize_is_alias(op) ||
-                    (ggml_quactlize_dense_enabled() ? ggml_quactlize_can_compute(op) :
-                                                      ((op->op == GGML_OP_MUL_MAT || op->op == GGML_OP_MUL_MAT_ID) &&
-                                                       (src == source || ggml_quactlize_is_alias(src)) &&
-                                                       ggml_quactlize_can_load(source, nullptr))));
+                    (ggml_quactlize_enabled() ? ggml_quactlize_can_compute(op) :
+                                                ((op->op == GGML_OP_MUL_MAT || op->op == GGML_OP_MUL_MAT_ID) &&
+                                                 (src == source || ggml_quactlize_is_alias(src)) &&
+                                                 ggml_quactlize_can_load(source, nullptr))));
         }
     }
 #endif
