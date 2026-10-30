@@ -136,6 +136,17 @@ if (LLAMA_SUBPROCESS)
     target_compile_definitions(${TARGET} PUBLIC LLAMA_SUBPROCESS)
 endif()
 
+if (LLAMA_SPEC_FASTPATH)
+    target_sources(${TARGET} PRIVATE
+        spec-opt/common-spec-opt.cpp
+        spec-opt/common-spec-opt.h
+        spec-opt/common-spec-opt-eagle3.cpp
+        spec-opt/common-spec-opt-eagle3.h
+        spec-opt/common-spec-opt-mtp.cpp
+        spec-opt/common-spec-opt-mtp.h
+    )
+endif()
+
 if (BUILD_SHARED_LIBS)
     set_target_properties(${TARGET} PROPERTIES POSITION_INDEPENDENT_CODE ON)
 

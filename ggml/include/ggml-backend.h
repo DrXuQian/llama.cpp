@@ -215,6 +215,9 @@ extern "C" {
     typedef void                         (*ggml_backend_set_n_threads_t)(ggml_backend_t backend, int n_threads);
     // Get additional buffer types provided by the device (returns a NULL-terminated array)
     typedef ggml_backend_buffer_type_t * (*ggml_backend_dev_get_extra_bufts_t)(ggml_backend_dev_t device);
+    typedef ggml_backend_buffer_type_t (*ggml_backend_dev_get_weight_buft_t)(ggml_backend_dev_t         device,
+                                                                             const struct ggml_tensor * weight,
+                                                                             enum ggml_op               op);
     // Set the abort callback for the backend
     typedef void                         (*ggml_backend_set_abort_callback_t)(ggml_backend_t backend, ggml_abort_callback abort_callback, void * abort_callback_data);
     // Get a list of feature flags supported by the backend (returns a NULL-terminated array)
@@ -315,6 +318,12 @@ extern "C" {
     //
     typedef bool (*ggml_backend_sched_eval_callback)(struct ggml_tensor * t, bool ask, void * user_data);
 
+    // Called twice for each split: before its inputs are copied (inputs_ready = false) and before the split graph is submitted (inputs_ready = true).
+    // Return false to cancel the graph compute.
+    typedef bool (*ggml_backend_sched_before_compute_callback)(ggml_backend_t backend,
+                                                               bool           inputs_ready,
+                                                               void *         user_data);
+
     // Initialize a backend scheduler, backends with low index are given priority over backends with high index
     GGML_API ggml_backend_sched_t ggml_backend_sched_new(ggml_backend_t * backends, ggml_backend_buffer_type_t * bufts, int n_backends, size_t graph_size, bool parallel, bool op_offload);
     GGML_API void                 ggml_backend_sched_free(ggml_backend_sched_t sched);
@@ -352,6 +361,10 @@ extern "C" {
 
     // Set a callback to be called for each resulting node during graph compute
     GGML_API void                 ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backend_sched_eval_callback callback, void * user_data);
+
+    GGML_API void ggml_backend_sched_set_before_compute_callback(ggml_backend_sched_t                       sched,
+                                                                 ggml_backend_sched_before_compute_callback callback,
+                                                                 void *                                     user_data);
 
     //
     // Meta backend
@@ -403,6 +416,23 @@ extern "C" {
     //       express this as a backend registry functionality instead
     GGML_API ggml_backend_dev_t ggml_backend_meta_device(
         ggml_backend_dev_t * devs, size_t n_devs, ggml_backend_meta_get_split_state_t get_split_state, void * get_split_state_ud);
+
+    // Use the same buffer family on each device; NULL means incompatible.
+    GGML_API ggml_backend_buffer_type_t ggml_backend_meta_buffer_type(ggml_backend_dev_t         dev,
+                                                                      ggml_backend_buffer_type_t prototype);
+    GGML_API ggml_backend_buffer_type_t ggml_backend_meta_device_get_weight_buft(ggml_backend_dev_t         dev,
+                                                                                 const struct ggml_tensor * weight,
+                                                                                 enum ggml_op               op);
+    GGML_API size_t                     ggml_backend_meta_buffer_type_count(ggml_backend_buffer_type_t buft);
+    GGML_API ggml_backend_buffer_type_t ggml_backend_meta_buffer_type_at(ggml_backend_buffer_type_t buft, size_t index);
+    // Query the placement of a static weight before allocation.
+    GGML_API bool                       ggml_backend_meta_tensor_split(ggml_backend_buffer_type_t             buft,
+                                                                       const struct ggml_tensor *             tensor,
+                                                                       struct ggml_backend_meta_split_state * split);
+    // Borrow an allocated weight shard and its split map. Invalid requests return NULL.
+    GGML_API struct ggml_tensor *       ggml_backend_meta_tensor_shard(const struct ggml_tensor *             tensor,
+                                                                       size_t                                 index,
+                                                                       struct ggml_backend_meta_split_state * split);
 
     //
     // Utils

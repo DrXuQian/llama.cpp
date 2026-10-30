@@ -259,28 +259,81 @@ void ggml_cuda_op_softplus(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 }
 /* gated ops */
 
-template <float (*op)(float), typename T>
-static __global__ void unary_gated_op_kernel(const T * x, const T * g, T * dst, const int64_t k, const int64_t n, const int64_t o0, const int64_t o1) {
-    ggml_cuda_pdl_lc();
-    const int64_t i = int64_t(blockDim.x)*blockIdx.x + threadIdx.x;
+template <typename T> struct ggml_vec;
+template <> struct ggml_vec<float> { using type = float2; static constexpr int width = 2; };
+template <> struct ggml_vec<half>  { using type = half2;  static constexpr int width = 2; };
 
-    if (i >= k) {
+template <float (*op)(float)>
+static __device__ __forceinline__ float2 ggml_apply(const float2 xv, const float2 gv) {
+    return make_float2(op(xv.x) * gv.x, op(xv.y) * gv.y);
+}
+template <float (*op)(float)>
+static __device__ __forceinline__ half2 ggml_apply(const half2 xv, const half2 gv) {
+    const float2 xf = __half22float2(xv);
+    const float2 gf = __half22float2(gv);
+    return __floats2half2_rn(op(xf.x) * gf.x, op(xf.y) * gf.y);
+}
+
+template <float (*op)(float), typename T, bool vec>
+static __global__ void unary_gated_op_kernel(
+        const T * __restrict__ x, const T * __restrict__ g, T * __restrict__ dst,
+        const int64_t k, const int64_t n, const int64_t o0, const int64_t o1) {
+    ggml_cuda_pdl_lc();
+
+    constexpr int W = vec ? ggml_vec<T>::width : 1;
+    const int64_t total_vecs = k / W;
+    const int64_t ivec = int64_t(blockDim.x) * blockIdx.x + threadIdx.x;
+
+    if (ivec >= total_vecs) {
         return;
     }
 
-    // perform base op and multiply with gate (either offset in same tensor or a separate one)
-    const int64_t j0 = (i / n) * o0 + (i % n);
-    const int64_t j1 = o0 == o1 ? j0 : (i / n) * o1 + (i % n);
-
     ggml_cuda_pdl_sync();
-    dst[i] = (T)(op((float)x[j0]) * (float)g[j1]);
+
+    const int64_t i   = ivec * W;
+    const int64_t row = i / n;
+    const int64_t col = i % n;
+
+    if constexpr (vec) {
+        using V = typename ggml_vec<T>::type;
+        const int64_t j0 = row * o0 + col;
+        const int64_t j1 = (o0 == o1) ? j0 : row * o1 + col;
+        const int64_t jd = row * n  + col;
+        const V xv = *reinterpret_cast<const V *>(x + j0);
+        const V gv = *reinterpret_cast<const V *>(g + j1);
+        *reinterpret_cast<V *>(dst + jd) = ggml_apply<op>(xv, gv);
+    } else {
+        const int64_t j0 = row * o0 + col;
+        const int64_t j1 = o0 == o1 ? j0 : row * o1 + col;
+        dst[i] = (T)(op((float) x[j0]) * (float) g[j1]);
+    }
 }
 
 template <float (*op)(float), typename T>
-static void unary_gated_cuda(const T * x, const T * g, T * dst, const int64_t k, const int64_t n, const int64_t o0, const int64_t o1, cudaStream_t stream) {
-    const int64_t num_blocks = (k + CUDA_GLU_BLOCK_SIZE - 1) / CUDA_GLU_BLOCK_SIZE;
-    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params((dim3)num_blocks, CUDA_GLU_BLOCK_SIZE, 0, stream);
-    ggml_cuda_kernel_launch(unary_gated_op_kernel<op, T>, launch_params, x, g, dst, k, n, o0, o1);
+static void unary_gated_cuda(const T * x, const T * g, T * dst,
+        const int64_t k, const int64_t n, const int64_t o0, const int64_t o1, cudaStream_t stream) {
+    if (n == 0) {
+        return;
+    }
+
+    constexpr int W = ggml_vec<T>::width;
+    const size_t align  = W * sizeof(T);
+    const bool can_vec =
+        (n % W == 0) && (o0 % W == 0) && (o1 % W == 0) &&
+        (reinterpret_cast<uintptr_t>(x)   % align == 0) &&
+        (reinterpret_cast<uintptr_t>(g)   % align == 0) &&
+        (reinterpret_cast<uintptr_t>(dst) % align == 0);
+
+    if (can_vec) {
+        const int64_t total_vecs = k / W;
+        const int64_t num_blocks = (total_vecs + CUDA_GLU_BLOCK_SIZE - 1) / CUDA_GLU_BLOCK_SIZE;
+        const ggml_cuda_kernel_launch_params lp((dim3) num_blocks, CUDA_GLU_BLOCK_SIZE, 0, stream);
+        ggml_cuda_kernel_launch(unary_gated_op_kernel<op, T, true>,  lp, x, g, dst, k, n, o0, o1);
+    } else {
+        const int64_t num_blocks = (k + CUDA_GLU_BLOCK_SIZE - 1) / CUDA_GLU_BLOCK_SIZE;
+        const ggml_cuda_kernel_launch_params lp((dim3) num_blocks, CUDA_GLU_BLOCK_SIZE, 0, stream);
+        ggml_cuda_kernel_launch(unary_gated_op_kernel<op, T, false>, lp, x, g, dst, k, n, o0, o1);
+    }
 }
 
 template <float (*op)(float)>

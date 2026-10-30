@@ -3563,7 +3563,11 @@ private:
         // note: the sync is done here too, so that the wait is also covered by the yield
         int ret = 0;
         queue_tasks.yield_to_queue([&]() {
+#ifdef SPEC_FASTPATH
+            ret = common_speculative_advance_pipeline(spec.get(), ctx_tgt, batch_view);
+#else
             ret = llama_decode(ctx_tgt, batch_view);
+#endif
             if (ret == 0 && has_output) {
                 llama_synchronize(ctx_tgt);
             }
@@ -3627,9 +3631,11 @@ private:
         //       ref: https://github.com/ggml-org/llama.cpp/pull/22728#issuecomment-4400925384
         if (spec) {
             bool ok = true;
+            // clang-format off
             queue_tasks.yield_to_queue([&]() {
                 ok = common_speculative_process(spec.get(), batch_view);
             });
+            // clang-format on
 
             if (!ok) {
                 SRV_ERR("%s", "failed to process speculative batch\n");
@@ -3792,7 +3798,15 @@ private:
 
             // verify and try to accept the draft
             {
-                common_sampler_ptr smpl_save(common_sampler_clone(slot.smpl.get()));
+                // smpl_save is read below only when use_ckpt_tgt, and n_rollback <= n_draft is its exact upper bound
+                const bool may_need_ckpt =
+                    ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
+                    (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && n_draft > llama_n_rs_seq(ctx_tgt));
+
+                common_sampler_ptr smpl_save;
+                if (may_need_ckpt) {
+                    smpl_save.reset(common_sampler_clone(slot.smpl.get()));
+                }
 
                 GGML_ASSERT(slot.spec_i_batch.size() == n_draft + 1);
                 auto accepted = common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft);

@@ -159,6 +159,8 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     llama_build_and_test(test-grammar-integration.cpp)
     llama_build_and_test(test-llama-grammar.cpp)
     llama_build_and_test(test-batch-alloc.cpp)
+    llama_build_and_test(test-meta-weight-buft.cpp)
+    set_tests_properties(test-meta-weight-buft PROPERTIES TIMEOUT 60)
     llama_build_and_test(test-chat.cpp WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
     target_include_directories(test-chat PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
     target_link_libraries(test-chat PRIVATE server-context)
@@ -290,6 +292,53 @@ if (NOT LLAMA_SANITIZE_ADDRESS AND NOT GGML_SCHED_NO_REALLOC)
 endif()
 llama_build_and_test(test-backend-ops.cpp)
 
+find_package(Threads REQUIRED)
+add_executable(test-kpack-sidecar test-kpack-sidecar.cpp ../src/llama-kpack-sidecar.cpp
+    ../src/llama-mmap.cpp ../src/llama-impl.cpp)
+target_include_directories(test-kpack-sidecar PRIVATE ../include)
+target_link_libraries(test-kpack-sidecar PRIVATE ggml-base vendor::nlohmann Threads::Threads)
+target_compile_features(test-kpack-sidecar PRIVATE cxx_std_17)
+if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    target_compile_definitions(test-kpack-sidecar PRIVATE LLAMA_KPACK_TEST_FSYNC)
+    target_link_options(test-kpack-sidecar PRIVATE "-Wl,--wrap=fsync")
+endif()
+add_test(NAME test-kpack-sidecar COMMAND test-kpack-sidecar)
+set_tests_properties(test-kpack-sidecar PROPERTIES LABELS "kpack" TIMEOUT 60)
+
+# K-pack load-only buffer type against an offline reference GGUF; test-kpack-load.py generates the reference and
+# drives the binary through the online/offline, forward-rejected and missing-packer cases.
+if (GGML_NCP_QUACTLIZE)
+    llama_build(test-kpack-load.cpp)
+    llama_build(test-kpack-cache.cpp)
+    find_package(Python3 REQUIRED COMPONENTS Interpreter)
+    add_test(NAME test-kpack-load
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/test-kpack-load.py"
+            --binary $<TARGET_FILE:test-kpack-load> --cache-binary $<TARGET_FILE:test-kpack-cache>)
+    set_tests_properties(test-kpack-load PROPERTIES LABELS "ppu;kpack" TIMEOUT 600 RUN_SERIAL TRUE)
+    foreach(suite gemv gemm contract)
+        add_test(NAME test-kpack-${suite}
+            COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/test-kpack-load.py"
+                --binary $<TARGET_FILE:test-kpack-load> --compute ${suite})
+        set_tests_properties(test-kpack-${suite} PROPERTIES LABELS "ppu;kpack;compute" TIMEOUT 5400 RUN_SERIAL TRUE)
+    endforeach()
+    set_tests_properties(test-kpack-contract PROPERTIES TIMEOUT 120)
+endif()
+
+# NCP external kernel .so vs ggml's inline kernels. Needs at least one hook compiled in to have anything to compare;
+# the test itself skips cleanly when the .so is absent or the GPU backend exposes no route control, so the OR is only
+# about not building a binary that can do nothing at all.
+if (GGML_NCP_FA OR GGML_NCP_MOE OR GGML_NCP_GDN)
+    llama_build_and_test(test-llama-ncp.cpp)
+endif()
+
+# The FA .so kernel against a CPU reference, plus the KV-layout precondition the hook checks before it will use it.
+# Only GGML_NCP_FA, since that precondition exists for this hook alone. The Windows condition is the same one
+# test-llama-archs carries: this one also reaches into src/ for llama-kv-cells.h, which is not exported with
+# LLAMA_API.
+if (GGML_NCP_FA AND (NOT WIN32 OR NOT BUILD_SHARED_LIBS))
+    llama_build_and_test(test-llama-ncp-fa.cpp)
+endif()
+
 llama_build_and_test(test-model-load-cancel.cpp LABEL "model")
 llama_build_and_test(test-autorelease.cpp       LABEL "model")
 llama_build_and_test(test-backend-sampler.cpp   LABEL "model")
@@ -357,6 +406,9 @@ if (NOT LLAMA_USE_SYSTEM_GGML)
 
     # Needs non-public ggml{,-backend}-impl.h
     llama_build_and_test(test-alloc.cpp)
+    if (GGML_NCP_QUACTLIZE)
+        target_compile_definitions(test-alloc PRIVATE GGML_NCP_QUACTLIZE)
+    endif()
 endif()
 
 llama_build(test-export-graph-ops.cpp)

@@ -222,6 +222,10 @@ if (GGML_SCHED_NO_REALLOC)
     target_compile_definitions(ggml-base PUBLIC GGML_SCHED_NO_REALLOC)
 endif()
 
+if (GGML_NCP_QUACTLIZE)
+    target_compile_definitions(ggml-base PRIVATE GGML_NCP_QUACTLIZE)
+endif()
+
 if (GGML_OPENMP_FETCH)
     if (NOT GGML_OPENMP)
         message(FATAL_ERROR "GGML_OPENMP_FETCH requires GGML_OPENMP")

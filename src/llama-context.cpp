@@ -2,14 +2,14 @@
 
 #include "ggml.h"
 #include "llama-arch.h"
+#include "llama-batch.h"
+#include "llama-ext.h"
 #include "llama-graph.h"
 #include "llama-impl.h"
-#include "llama-batch.h"
 #include "llama-io.h"
 #include "llama-memory.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
-#include "llama-ext.h"
 #include "llama-sampler.h"
 #include "llama.h"
 
@@ -598,6 +598,10 @@ void llama_context::sched_reserve() {
 
     LLAMA_LOG_DEBUG("%s: max_nodes = %zu\n", __func__, max_nodes);
 
+#ifdef SPEC_FASTPATH
+    spec_opt.reset();
+#endif
+
     gf_res_prev.reset(new llm_graph_result(max_nodes));
     gf_res_reserve.reset(new llm_graph_result(max_nodes));
 
@@ -703,6 +707,10 @@ void llama_context::sched_reserve() {
 }
 
 void llama_context::synchronize() {
+#ifdef SPEC_FASTPATH
+    spec_opt.submit_readback();
+#endif
+
     if (!sched) {
         return;
     }
@@ -784,6 +792,10 @@ bool llama_context::memory_update(bool optimize) {
     if (!memory) {
         return false;
     }
+
+#ifdef SPEC_FASTPATH
+    spec_opt.flush_readback(*this);
+#endif
 
     {
         const auto mctx = memory->init_update(this, optimize);
@@ -1334,7 +1346,12 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
     // the new graph parameters
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
+#ifdef SPEC_FASTPATH
+    auto gparams = graph_params(res, ubatch, mctx, gtype);
+    spec_opt.set_graph_params(gparams);
+#else
     const auto gparams = graph_params(res, ubatch, mctx, gtype);
+#endif
 
     if (!graph_reuse_disable && res->can_reuse(gparams)) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
@@ -1364,6 +1381,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             ret = GGML_STATUS_FAILED;
             return nullptr;
         }
+
+#ifdef SPEC_FASTPATH
+        spec_opt.bind_inputs(res);
+#endif
 
         if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
@@ -1580,6 +1601,7 @@ int llama_context::encode(const llama_batch & batch_inp) {
     return 0;
 }
 
+// clang-format off
 template<typename T>
 static void copy_tensor_async_rows(
     const std::vector<ggml_tensor *> & tensors,
@@ -1588,6 +1610,7 @@ static void copy_tensor_async_rows(
     uint32_t row_offset,
     ggml_backend_sched_t sched,
     std::vector<uint32_t> * counts = nullptr) {
+    // clang-format on
     if (!dst.has_data()) {
         return;
     }
@@ -1606,7 +1629,11 @@ static void copy_tensor_async_rows(
 
         ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched, tensor);
         T * row_ptr = dst.data + (size_t) row * stride;
+#ifdef SPEC_FASTPATH
+        llama_output_readback::tensor_get_async(backend, tensor, row_ptr, ggml_nbytes(tensor));
+#else
         ggml_backend_tensor_get_async(backend, tensor, row_ptr, 0, ggml_nbytes(tensor));
+#endif
 
         if (counts) {
             GGML_ASSERT(row < counts->size());
@@ -1698,6 +1725,10 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
     const uint32_t n_tokens_all  = balloc->get_n_tokens();
     const uint32_t n_outputs_all = balloc->get_n_outputs();
+
+#ifdef SPEC_FASTPATH
+    const auto readback_scope = spec_opt.begin_readback(batch_inp, n_tokens_all, n_outputs_all, cparams.n_ubatch);
+#endif
 
     if (output_all) {
         // require that all tokens are output
@@ -1951,7 +1982,14 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 float * embd_nextn_out = embd_nextn.data + offset*n_embd;
 
                 GGML_ASSERT((offset + n_rows)*n_embd <= (int64_t) embd_nextn.size);
+#ifdef SPEC_FASTPATH
+                llama_output_readback::tensor_get_async(backend_h, t_h_nextn, embd_nextn_out,
+                                                        n_rows * n_embd * sizeof(float));
+#else
+                // clang-format off
                 ggml_backend_tensor_get_async(backend_h, t_h_nextn, embd_nextn_out, 0, n_rows*n_embd*sizeof(float));
+                // clang-format on
+#endif
             }
         }
 
@@ -1959,10 +1997,12 @@ int llama_context::decode(const llama_batch & batch_inp) {
             const auto stride = n_vocab;
 
             // async copy the sampling data from the backend to the host
+            // clang-format off
             copy_tensor_async_rows(res->t_sampled,        sampling.sampled,    1,      n_outputs_prev, sched.get());
             copy_tensor_async_rows(res->t_sampled_logits, sampling.logits,     stride, n_outputs_prev, sched.get(), &sampling.logits_count);
             copy_tensor_async_rows(res->t_sampled_probs,  sampling.probs,      stride, n_outputs_prev, sched.get(), &sampling.probs_count);
             copy_tensor_async_rows(res->t_candidates,     sampling.candidates, stride, n_outputs_prev, sched.get(), &sampling.candidates_count);
+            // clang-format on
         }
 
         n_outputs_prev += n_outputs;
@@ -2030,6 +2070,11 @@ int llama_context::decode(const llama_batch & batch_inp) {
 //
 
 uint32_t llama_context::output_reserve(int32_t n_outputs) {
+#ifdef SPEC_FASTPATH
+    spec_opt.flush_readback(*this);
+    spec_opt.finish();
+#endif
+
     const auto & hparams = model.hparams;
     const auto & vocab   = model.vocab;
 
@@ -2215,7 +2260,11 @@ void llama_context::extract_layer_inputs(const llm_graph_result * res, size_t to
 
         ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched.get(), t);
         GGML_ASSERT(backend != nullptr);
+#ifdef SPEC_FASTPATH
+        llama_output_readback::tensor_get_async(backend, t, embd_layer_inp[il].data + dst_offset, nbytes);
+#else
         ggml_backend_tensor_get_async(backend, t, embd_layer_inp[il].data + dst_offset, 0, nbytes);
+#endif
     }
 }
 
@@ -2400,6 +2449,10 @@ ggml_cgraph * llama_context::graph_reserve(
         uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only, size_t * sizes) {
     LLAMA_LOG_DEBUG("%s: reserving a graph for ubatch with n_tokens = %4u, n_seqs = %2u, n_outputs = %4u\n", __func__, n_tokens, n_seqs, n_outputs);
     GGML_ASSERT(n_outputs >= 1);
+
+#ifdef SPEC_FASTPATH
+    spec_opt.flush_readback(*this);
+#endif
 
     if (n_tokens % n_seqs != 0) {
         n_tokens = ((n_tokens + (n_seqs - 1)) / n_seqs) * n_seqs; // round to next multiple of n_seqs
@@ -3281,6 +3334,9 @@ llama_memory_breakdown llama_context::memory_breakdown() const {
             ret[buft].compute += ggml_backend_sched_get_buffer_size(sched.get(), backend);
         }
     }
+#ifdef SPEC_FASTPATH
+    spec_opt.memory_breakdown(ret, sched.get(), backends);
+#endif
     return ret;
 }
 

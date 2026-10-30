@@ -109,7 +109,15 @@ int llama_batched_bench(int argc, char ** argv) {
 
     // warm up
     {
-        for (int i = 0; i < 16; ++i) {
+        // NOTE: the token count matters. MMF serves float weights only up to ne11 == 16 columns
+        // (mmf.cu: src1_ncols > 16 -> false), so a 16-token warmup can be served entirely by MMF and
+        // the vector kernels and never call cuBLAS at all. That leaves cublasCreate plus the ACBLAS
+        // module load / kernel select -- one-time, shape-independent, ~600 ms on PPU -- to be paid by
+        // the first TIMED prefill instead of here, which inflates the T_PP of the first row.
+        // Anything above 16 puts at least one matmul on cuBLAS inside this untimed warmup.
+        const int32_t n_warmup = std::min<int32_t>(n_kv_max, 64);
+
+        for (int32_t i = 0; i < n_warmup; ++i) {
             common_batch_add(batch, get_token_rand(), i, { 0 }, false);
         }
 

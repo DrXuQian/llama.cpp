@@ -1,7 +1,8 @@
 ---
 Language:        Cpp
+AccessModifierOffset: -4 # keep public:/private:/protected: flush-left, matching codebase convention
 AlignAfterOpenBracket: Align
-AlignArrayOfStructures: Left
+AlignArrayOfStructures: None
 AlignConsecutiveAssignments: AcrossComments
 AlignConsecutiveBitFields: AcrossComments
 AlignConsecutiveDeclarations: AcrossComments
@@ -68,7 +69,7 @@ CommentPragmas:  '^ IWYU pragma:'
 CompactNamespaces: false
 ConstructorInitializerIndentWidth: 4
 ContinuationIndentWidth: 4
-Cpp11BracedListStyle: false
+Cpp11BracedListStyle: true
 DerivePointerAlignment: false
 DisableFormat:   false
 EmptyLineBeforeAccessModifier: Leave
@@ -141,7 +142,7 @@ RawStringFormats:
 ReferenceAlignment: Middle
 ReflowComments:  false # IndentOnly
 SeparateDefinitionBlocks: Always
-SortIncludes:    CaseInsensitive
+SortIncludes:    Never
 SortUsingDeclarations: LexicographicNumeric
 SpaceAfterCStyleCast: true
 SpaceAfterLogicalNot: false

@@ -1,5 +1,10 @@
 #include "models.h"
 
+#ifdef SPEC_FASTPATH
+#    include "spec-opt/llama-spec-opt-eagle3-graph.h"
+#    include "spec-opt/llama-spec-opt-graph.h"
+#endif
+
 void llama_model_eagle3::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
 
@@ -190,6 +195,13 @@ llama_model_eagle3::graph<false>::graph(const llama_model & model, const llm_gra
     inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd, n_tokens);
     ggml_set_input(inp->embd);
 
+#ifdef SPEC_FASTPATH
+    const auto & spec_inputs = params.spec_inputs;
+    if (spec_inputs.has_decoder_inputs()) {
+        llama_eagle3_graph::bind_inputs(*this, model, spec_inputs, *inp);
+    }
+#endif
+
     ggml_tensor * inp_embd = ggml_get_rows(ctx0, tok_embd, inp->tokens);
     cb(inp_embd, "inp_embd", -1);
 
@@ -201,9 +213,16 @@ llama_model_eagle3::graph<false>::graph(const llama_model & model, const llm_gra
     inpL = inp_g;
 
     // inp_pos - contains the positions
+#ifdef SPEC_FASTPATH
+    ggml_tensor * inp_pos = llama_eagle3_graph::build_position(*this, spec_inputs);
+#else
     ggml_tensor * inp_pos = build_inp_pos();
+#endif
 
     auto * inp_attn = build_attn_inp_kv();
+#ifdef SPEC_FASTPATH
+    llama_spec_chain_graph::build_attn_input(*this, spec_inputs, inp_attn);
+#endif
 
     const float kq_scale = 1.0f/sqrtf(float(n_embd_head));
 
@@ -267,6 +286,10 @@ llama_model_eagle3::graph<false>::graph(const llama_model & model, const llm_gra
         cur = build_attn(inp_attn,
                 model.layers[il].wo, NULL, nullptr,
                 Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
+
+#ifdef SPEC_FASTPATH
+        llama_eagle3_graph::select_output_rows(*this, spec_inputs, cur, inpSA);
+#endif
 
         // Add residual and update it
         ggml_tensor * ffn_inp = ggml_add(ctx0, cur, inpSA);

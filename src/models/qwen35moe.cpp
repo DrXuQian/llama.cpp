@@ -1,6 +1,11 @@
 #include "models.h"
 #include "llama-memory-recurrent.h"
 
+#ifdef SPEC_FASTPATH
+#    include "spec-opt/llama-spec-opt-graph.h"
+#    include "spec-opt/llama-spec-opt-mtp-graph.h"
+#endif
+
 void llama_model_qwen35moe::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_EXPERT_FEED_FORWARD_LENGTH,        hparams.n_ff_exp, false);
     ml.get_key(LLM_KV_EXPERT_SHARED_FEED_FORWARD_LENGTH, hparams.n_ff_shexp, false);
@@ -579,10 +584,19 @@ llama_model_qwen35moe::graph_mtp::graph_mtp(const llama_model & model, const llm
     inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd_inp(), n_tokens);
     ggml_set_input(inp->embd);
 
+#ifdef SPEC_FASTPATH
+    const auto & spec_inputs = params.spec_inputs;
+    llama_mtp_graph::bind_token(spec_inputs, *inp);
+#endif
+
     // TODO: make static using `ggml_build_forward_select()`
     //       see llm_graph_context::build_inp_embd() for reference
     ggml_tensor * tok_embd;
+#ifdef SPEC_FASTPATH
+    if (ubatch.token || spec_inputs.is_chain()) {
+#else
     if (ubatch.token) {
+#endif
         ggml_tensor * tok_embd_w = layer.nextn.embed_tokens ? layer.nextn.embed_tokens : model.tok_embd;
 
         tok_embd = ggml_get_rows(ctx0, tok_embd_w, inp->tokens);
@@ -595,14 +609,26 @@ llama_model_qwen35moe::graph_mtp::graph_mtp(const llama_model & model, const llm
     ggml_set_input(inp->h);
     ggml_set_name(inp->h, "mtp_h_input");
 
+#ifdef SPEC_FASTPATH
+    llama_mtp_graph::bind_hidden(*this, spec_inputs, *inp);
+#endif
+
     ggml_tensor * h_embd = inp->h;
 
     res->add_input(std::move(inp));
 
+#ifdef SPEC_FASTPATH
+    ggml_tensor * inp_pos     = llama_mtp_graph::build_position(*this, spec_inputs);
+    ggml_tensor * inp_out_ids = llama_mtp_graph::build_output_ids(*this, spec_inputs);
+#else
     ggml_tensor * inp_pos     = build_inp_pos();
     ggml_tensor * inp_out_ids = build_inp_out_ids();
+#endif
 
     auto * inp_attn = build_attn_inp_kv();
+#ifdef SPEC_FASTPATH
+    llama_spec_chain_graph::build_attn_input(*this, spec_inputs, inp_attn);
+#endif
 
     ggml_tensor * h_norm = build_norm(h_embd, layer.nextn.hnorm, nullptr, LLM_NORM_RMS, il);
     cb(h_norm, "mtp_hnorm", il);
@@ -668,6 +694,10 @@ llama_model_qwen35moe::graph_mtp::graph_mtp(const llama_model & model, const llm
     cur = build_lora_mm(layer.wo, cur, layer.wo_s);
     cb(cur, "mtp_attn_out", il);
 
+#ifdef SPEC_FASTPATH
+    llama_mtp_graph::select_output_rows(*this, spec_inputs, inp_out_ids, cur, inpSA);
+#endif
+
     cur = ggml_add(ctx0, cur, inpSA);
     cb(cur, "mtp_attn_residual", il);
 
@@ -728,7 +758,9 @@ llama_model_qwen35moe::graph_mtp::graph_mtp(const llama_model & model, const llm
     cb(cur, "h_nextn", -1);
     res->t_h_nextn= cur;
 
-    cur = ggml_get_rows(ctx0, cur, inp_out_ids);
+    if (inp_out_ids) {
+        cur = ggml_get_rows(ctx0, cur, inp_out_ids);
+    }
     cb(cur, "mtp_shared_head_norm", -1);
 
     ggml_tensor * head_w = layer.nextn.shared_head_head ? layer.nextn.shared_head_head : model.output;

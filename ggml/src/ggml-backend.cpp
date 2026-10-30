@@ -815,6 +815,9 @@ struct ggml_backend_sched {
     ggml_backend_sched_eval_callback callback_eval;
     void * callback_eval_user_data;
 
+    ggml_backend_sched_before_compute_callback callback_before_compute;
+    void *                                     callback_before_compute_user_data;
+
     char * context_buffer;
     size_t context_buffer_size;
 
@@ -1616,6 +1619,11 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
         }
 
+        if (sched->callback_before_compute &&
+            !sched->callback_before_compute(split_backend, false, sched->callback_before_compute_user_data)) {
+            return GGML_STATUS_FAILED;
+        }
+
         // copy the input tensors to the split backend
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
             ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, split->inputs[input_id]);
@@ -1737,6 +1745,11 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     }
                 }
             }
+        }
+
+        if (sched->callback_before_compute &&
+            !sched->callback_before_compute(split_backend, true, sched->callback_before_compute_user_data)) {
+            return GGML_STATUS_FAILED;
         }
 
         if (!sched->callback_eval) {
@@ -1990,6 +2003,14 @@ void ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backe
     GGML_ASSERT(sched);
     sched->callback_eval = callback;
     sched->callback_eval_user_data = user_data;
+}
+
+void ggml_backend_sched_set_before_compute_callback(ggml_backend_sched_t                       sched,
+                                                    ggml_backend_sched_before_compute_callback callback,
+                                                    void *                                     user_data) {
+    GGML_ASSERT(sched);
+    sched->callback_before_compute           = callback;
+    sched->callback_before_compute_user_data = user_data;
 }
 
 int ggml_backend_sched_get_n_splits(ggml_backend_sched_t sched) {

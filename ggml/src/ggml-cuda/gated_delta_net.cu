@@ -1,5 +1,6 @@
 #include "gated_delta_net.cuh"
 #include "ggml-cuda/common.cuh"
+#include "gated_delta_net-ncp.cuh"
 
 template <int S_v, bool KDA, bool keep_rs_t>
 __global__ void __launch_bounds__((ggml_cuda_get_physical_warp_size() < S_v ? ggml_cuda_get_physical_warp_size() : S_v) * 4, 2)
@@ -317,11 +318,42 @@ static void ggml_cuda_op_gated_delta_net_impl(
     }
 }
 
+#ifdef GGML_NCP_GDN
+static bool ggml_cuda_try_gated_delta_net_ncp_so(
+        ggml_backend_cuda_context & ctx, ggml_tensor * dst, float * state_out) {
+    if (!ggml_cuda_op_gated_delta_net_ncp_so(ctx, dst, state_out)) {
+        return false;
+    }
+
+    static bool logged = false; // one line the first time the .so actually serves a shape, not just loads
+    if (!logged) {
+        logged = true;
+        GGML_LOG_INFO("[ncp-lib] using external gated delta net / actlizeLA (libncp_gdn.so)\n");
+    }
+    return true;
+}
+#endif
+
 void ggml_cuda_op_gated_delta_net(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+#ifdef GGML_NCP_GDN
+    // Try the external .so (libncp_gdn.so) first — same pattern as fattn-ncp.cu: if the .so handles
+    // dst we return; otherwise we fall through to the inline kernel. A plain CUDA build (no GGML_NCP_GDN)
+    // compiles to nothing — no dlopen, no extra symbols.
+    if (ggml_cuda_try_gated_delta_net_ncp_so(ctx, dst, nullptr)) {
+        return;
+    }
+#endif
     ggml_cuda_op_gated_delta_net_impl(ctx, dst, nullptr);
 }
 
 void ggml_cuda_op_gated_delta_net_fused_cache(
         ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_cuda_gated_delta_net_fused_cache cache) {
+#ifdef GGML_NCP_GDN
+    // Preserve CUDA graph fusion while letting actlizeLA write final state directly into the recurrent cache.
+    // K > 1 and other unsupported contracts return false and keep using the inline fused-cache kernel.
+    if (ggml_cuda_try_gated_delta_net_ncp_so(ctx, dst, cache.data)) {
+        return;
+    }
+#endif
     ggml_cuda_op_gated_delta_net_impl(ctx, dst, &cache);
 }

@@ -1,4 +1,7 @@
 #include "llama-model-loader.h"
+#ifdef GGML_NCP_QUACTLIZE
+#    include "llama-kpack-cache.h"
+#endif
 
 #include "ggml-alloc.h"
 #include "ggml.h"
@@ -538,6 +541,7 @@ llama_model_loader::llama_model_loader(
         const llama_model_kv_override * param_overrides_p,
         const llama_model_tensor_buft_override * param_tensor_buft_overrides_p)
         : metadata(meta), set_tensor_data(set_tensor_data), set_tensor_data_ud(set_tensor_data_ud) {
+    source_path = fname;
     int trace = 0;
     if (getenv("LLAMA_TRACE")) {
         trace = atoi(getenv("LLAMA_TRACE"));
@@ -572,6 +576,7 @@ llama_model_loader::llama_model_loader(
         llm_kv = LLM_KV(llm_arch_from_string(arch_name));
 
         files.emplace_back(new llama_file(fname.c_str(), "rb", use_direct_io));
+        source_paths.push_back(fname);
         contexts.emplace_back(ctx);
 
         // Save tensors data offset of the main file.
@@ -617,6 +622,7 @@ llama_model_loader::llama_model_loader(
             // load other splits
             for (idx = 1; idx < n_split; idx++) {
                 const char * fname_split = splits[idx].c_str();
+                source_paths.emplace_back(fname_split);
 
                 struct gguf_init_params split_params = {
                     /*.no_alloc = */ true,
@@ -938,6 +944,13 @@ static bool weight_buft_supported(const llama_hparams & hparams, ggml_tensor * w
                 ggml_tensor * b = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 512);
                 op_tensor = ggml_get_rows(ctx, w, b);
             } break;
+        case GGML_OP_SET_ROWS:
+            {
+                ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, w->ne[0]);
+                ggml_tensor * b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, w->ne[0]);
+                op_tensor       = ggml_set_rows(ctx, a, b, w);
+            }
+            break;
         case GGML_OP_MUL_MAT:
             {
                 ggml_tensor * b = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, w->ne[0], 512, w->ne[2], w->ne[3]);
@@ -1057,6 +1070,18 @@ static ggml_backend_buffer_type_t select_weight_buft(const llama_hparams & hpara
     for (const auto & cur : *buft_list) {
         ggml_backend_dev_t cur_dev = cur.first;
         ggml_backend_buffer_type_t cur_buft = cur.second;
+        auto *                     reg      = ggml_backend_dev_backend_reg(cur_dev);
+        if (cur_buft == ggml_backend_dev_buffer_type(cur_dev)) {
+            auto   preferred   = reg ? (ggml_backend_dev_get_weight_buft_t) ggml_backend_reg_get_proc_address(
+                                       reg, "ggml_backend_dev_get_weight_buft") :
+                                       nullptr;
+            auto * weight_buft = ggml_backend_dev_type(cur_dev) == GGML_BACKEND_DEVICE_TYPE_META ?
+                                     ggml_backend_meta_device_get_weight_buft(cur_dev, tensor, op) :
+                                     (preferred ? preferred(cur_dev, tensor, op) : nullptr);
+            if (weight_buft && weight_buft_supported(hparams, tensor, op, weight_buft, cur_dev)) {
+                return weight_buft;
+            }
+        }
         if (weight_buft_supported(hparams, tensor, op, cur_buft, cur_dev)) {
             return cur_buft;
         }
@@ -1191,6 +1216,17 @@ struct ggml_tensor * llama_model_loader::create_tensor(
                         }
                     } else {
                         buft = overrides->buft;
+                        auto * dev          = buft_list->front().first;
+                        auto * override_dev = ggml_backend_buft_get_device(buft);
+                        // Lift custom buffer families; explicit physical defaults keep their old placement.
+                        if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_META && override_dev &&
+                            buft != ggml_backend_dev_buffer_type(override_dev) && !ggml_backend_buft_is_host(buft)) {
+                            buft = ggml_backend_meta_buffer_type(dev, buft);
+                            if (!buft) {
+                                throw std::runtime_error(
+                                    format("tensor %s: incompatible TP buffer override", tensor_name.c_str()));
+                            }
+                        }
                     }
 
                     LLAMA_LOG_DEBUG("tensor %s (%zu MiB %s) buffer type overridden to %s\n",
@@ -1552,6 +1588,12 @@ bool llama_model_loader::load_all_data(
         }
 
         size_t n_size = ggml_nbytes(cur);
+#ifdef GGML_NCP_QUACTLIZE
+        if (kpack_cache && kpack_cache->load(cur)) {
+            size_done += n_size;
+            continue;
+        }
+#endif
 
         if (use_mmap) {
             const auto & mapping = mappings.at(weight->idx);
@@ -1658,6 +1700,11 @@ bool llama_model_loader::load_all_data(
             }
         }
 
+#ifdef GGML_NCP_QUACTLIZE
+        if (kpack_cache) {
+            kpack_cache->capture(cur);
+        }
+#endif
         size_done += n_size;
     }
 

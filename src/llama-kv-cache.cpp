@@ -1248,6 +1248,16 @@ uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
     return result;
 }
 
+bool llama_kv_cache::is_kv_prefix_ordered(const slot_info & sinfo) const {
+    for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
+        if (!v_cells[sinfo.strm[s]].is_prefix_ordered()) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
 ggml_tensor * llama_kv_cache::get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const {
     const int32_t ikv = map_layer_ids.at(il);
 
@@ -1721,6 +1731,26 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
         set_input_kq_mask_impl<T, true> (args, data);
     } else {
         set_input_kq_mask_impl<T, false>(args, data);
+    }
+}
+
+void llama_kv_cache::set_input_kv_used(ggml_tensor * dst, const slot_info & sinfo) const {
+    GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
+    GGML_ASSERT(dst->type == GGML_TYPE_I32);
+
+    // the graph only creates this input while every stream's live cells form a hole-free, position-ordered prefix, and
+    // any change to that forces a rebuild through can_reuse, so reaching here otherwise means those two went out of
+    // sync -- and used_max_p1() would then hand the consumer a length whose cells are not the history it will assume
+    GGML_ASSERT(is_kv_prefix_ordered(sinfo));
+
+    const uint32_t ns = sinfo.s1 - sinfo.s0 + 1;
+
+    GGML_ASSERT(dst->ne[0] >= ns);
+
+    int32_t * data = (int32_t *) dst->data;
+
+    for (uint32_t s = 0; s < ns; ++s) {
+        data[s] = (int32_t) v_cells[sinfo.strm[s]].used_max_p1();
     }
 }
 
@@ -2585,6 +2615,10 @@ uint32_t llama_kv_cache_context::get_n_kv() const {
     return n_kv;
 }
 
+bool llama_kv_cache_context::is_kv_prefix_ordered() const {
+    return kv->is_kv_prefix_ordered(sinfos[i_cur]);
+}
+
 ggml_type llama_kv_cache_context::type_k() const {
     return kv->type_k();
 }
@@ -2639,6 +2673,10 @@ void llama_kv_cache_context::set_input_v_idxs(ggml_tensor * dst, const llama_uba
 
 void llama_kv_cache_context::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const {
     kv->set_input_kq_mask(dst, ubatch, causal_attn);
+}
+
+void llama_kv_cache_context::set_input_kv_used(ggml_tensor * dst) const {
+    kv->set_input_kv_used(dst, sinfos[i_cur]);
 }
 
 void llama_kv_cache_context::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const {

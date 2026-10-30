@@ -62,6 +62,19 @@ target_compile_features   (llama PRIVATE cxx_std_17) # don't bump
 
 target_link_libraries(llama PUBLIC ggml)
 
+if (GGML_NCP_QUACTLIZE)
+    find_package(Threads REQUIRED)
+    target_sources(llama PRIVATE llama-kpack-cache.cpp llama-kpack-sidecar.cpp)
+    target_compile_definitions(llama PRIVATE GGML_NCP_QUACTLIZE)
+    target_link_libraries(llama PRIVATE vendor::nlohmann Threads::Threads)
+endif()
+
+if (LLAMA_SPEC_FASTPATH)
+    file(GLOB LLAMA_SPEC_OPT_SOURCES "spec-opt/*.cpp")
+    target_sources(llama PRIVATE ${LLAMA_SPEC_OPT_SOURCES})
+    target_compile_definitions(llama PUBLIC SPEC_FASTPATH)
+endif()
+
 if (BUILD_SHARED_LIBS)
     set_target_properties(llama PROPERTIES POSITION_INDEPENDENT_CODE ON)
     target_compile_definitions(llama PRIVATE LLAMA_BUILD)

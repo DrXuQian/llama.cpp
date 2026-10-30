@@ -7,6 +7,9 @@
 #include "llama-adapter.h"
 #include "llama-impl.h"
 #include "llama-memory.h"
+#ifdef SPEC_FASTPATH
+#    include "spec-opt/llama-spec-opt.h"
+#endif
 
 #include "ggml-cpp.h"
 #include "ggml-opt.h"
@@ -40,6 +43,11 @@ struct llama_memory_buffer {
 using llama_memory_buffers = std::map<ggml_backend_buffer_type_t, llama_memory_buffer>;
 
 struct llama_context {
+#ifdef SPEC_FASTPATH
+    friend struct llama_spec_opt;
+    friend struct llama_spec_chain_pipeline;
+#endif
+
     // init scheduler and compute buffers, reserve worst-case graphs
     llama_context(
             const llama_model & model,
@@ -342,6 +350,10 @@ private:
     std::vector<swap_info> output_swaps;
 
     ggml_backend_sched_ptr sched;
+
+#ifdef SPEC_FASTPATH
+    llama_spec_opt spec_opt;
+#endif
 
     bool sched_need_reserve = true;
 

@@ -1,8 +1,11 @@
 #pragma once
 
+// clang-format off
 #include "llama.h"
 #include "llama-cparams.h"
+// clang-format on
 
+#include <algorithm>
 #include <bitset>
 #include <cassert>
 #include <cstring>
@@ -42,6 +45,8 @@ public:
         has_shift = false;
 
         used.clear();
+
+        pos_ordered_upto = 0;
 
         for (uint32_t s = 0; s < LLAMA_MAX_SEQ; ++s) {
             seq_pos[s].clear();
@@ -90,6 +95,40 @@ public:
     // return 0 if no cells are used
     uint32_t used_max_p1() const {
         return used.empty() ? 0 : *used.rbegin() + 1;
+    }
+
+    // true if the used cells are exactly [0, used_max_p1()) and their positions are non-decreasing over that range,
+    // i.e. cell order is also time order -- the only shape in which "the first N cells are the history" is true.
+    // note: two independent ways for that to fail, and a consumer holding only a length cannot tell either one.
+    //       a hole (used is a set, so it may skip indices) makes a counted cell hold no live token, and no removal
+    //       path -- rm, seq_rm, seq_keep -- touches the K/V data, only this metadata, so the hole still holds the K/V
+    //       of the token that was there; clear(true) is the only thing that zeroes the buffers. refilling a hole
+    //       closes it, but find_slot hands out the lowest free index, so the new token lands below older ones and the
+    //       index stops tracking time -- a causal bound read off the index then reaches into its own future. the mask
+    //       carries both facts per cell, which is why the inline path is immune to both.
+    bool is_prefix_ordered() const {
+        const uint32_t n = used_max_p1();
+
+        // O(1), and it also establishes pos[i] != -1 across [0, n), so the scan below needs no emptiness test
+        if (used.size() != (size_t) n) {
+            return false;
+        }
+
+        // the order over [0, pos_ordered_upto) has already been established and only a write can undo it, so resume
+        // from there: appending one cell compares one pair. min() because a removal can shrink n below that mark,
+        // which leaves the remaining prefix verified -- see pos_ordered_upto.
+        for (uint32_t i = std::max<uint32_t>(1, std::min(pos_ordered_upto, n)); i < n; ++i) {
+            if (pos[i] < pos[i - 1]) {
+                // [0, i) did pass, so keep that much instead of rescanning it on the next call
+                pos_ordered_upto = i;
+
+                return false;
+            }
+        }
+
+        pos_ordered_upto = n;
+
+        return true;
     }
 
     bool get_has_shift() const {
@@ -399,6 +438,8 @@ public:
 
         pos[i] = p;
 
+        pos_ordered_upto = std::min(pos_ordered_upto, i);
+
         used.insert(i);
     }
 
@@ -418,6 +459,8 @@ public:
 
         pos[i]   += d;
         shift[i] += d;
+
+        pos_ordered_upto = std::min(pos_ordered_upto, i);
 
         has_shift = true;
 
@@ -450,6 +493,8 @@ public:
         pos[i]   /= d;
         shift[i] += p_old - pos[i];
 
+        pos_ordered_upto = std::min(pos_ordered_upto, i);
+
         seq_pos_add(i);
 
         has_shift = true;
@@ -457,6 +502,12 @@ public:
 
 private:
     bool has_shift = false;
+
+    // pos is known to be non-decreasing across [0, pos_ordered_upto), so is_prefix_ordered() only has to scan past it.
+    // every mutator that writes pos[i] pulls this back to i; removals deliberately leave it alone, because dropping
+    // cells leaves a subsequence of an ordered sequence, which is still ordered -- they can only open a hole, and that
+    // test is O(1). mutable so the memo can be filled from the const query.
+    mutable uint32_t pos_ordered_upto = 0;
 
     // set of indices of used cells (i.e. pos[i] != -1, allowed to not have any seq_id)
     std::set<uint32_t> used;

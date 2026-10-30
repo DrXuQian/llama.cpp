@@ -11,6 +11,10 @@
 #include "sampling.h"
 
 #include "../src/llama-ext.h" // staging API: llama_set_embeddings_nextn / llama_get_embeddings_nextn_ith (used by MTP)
+#ifdef SPEC_FASTPATH
+#    include "spec-opt/common-spec-opt-eagle3.h"
+#    include "spec-opt/common-spec-opt-mtp.h"
+#endif
 
 #include <algorithm>
 #include <cassert>
@@ -171,6 +175,7 @@ struct common_speculative_impl {
 
     // (optional) serialize/restore per-seq internal state (e.g. eagle3's deferred boundary).
     virtual bool get_state(llama_seq_id /*seq_id*/, std::vector<uint8_t> & /*data*/) const { return false; }
+
     virtual void set_state(llama_seq_id /*seq_id*/, const std::vector<uint8_t> & /*data*/) {}
 };
 
@@ -451,6 +456,10 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
     std::vector<float> features_buf;
     std::vector<float> g_embd_buf;
 
+#ifdef SPEC_FASTPATH
+    common_spec_opt_eagle3 opt;
+#endif
+
     common_speculative_impl_draft_eagle3(const common_params_speculative & params, uint32_t n_seq)
         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3, n_seq)
         , params(params.draft)
@@ -529,6 +538,11 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
         verify_g.assign(n_seq, std::vector<float>());
         verify_pos_first.assign(n_seq, -1);
         verify_g_rows.assign(n_seq, 0);
+
+#ifdef SPEC_FASTPATH
+        opt.init(params, n_seq, smpls[0].get(), backend_chains[0] != nullptr, verify_g[0], verify_g_rows[0],
+                 verify_pos_first[0], pending_pos_last[0]);
+#endif
     }
 
     ~common_speculative_impl_draft_eagle3() override {
@@ -568,6 +582,12 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
     }
 
     bool process(const llama_batch & batch_in) override {
+#ifdef SPEC_FASTPATH
+        if (opt.consume_process_skip(batch_in)) {
+            return true;
+        }
+#endif
+
         if (batch_in.n_tokens <= 0) {
             return true;
         }
@@ -747,6 +767,12 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
 
             llama_memory_seq_rm(llama_get_memory(ctx_dft), seq_id, pending_pos_last[seq_id], -1);
 
+#ifdef SPEC_FASTPATH
+            if (opt.prepare_host_kv_metadata(seq_id, pending_pos_last[seq_id], dp)) {
+                return;
+            }
+#endif
+
             common_batch_add(batch, dp.id_last, pending_pos_last[seq_id], { seq_id }, true);
             std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd_dec,
                         pending_g_last[seq_id].data(),
@@ -844,6 +870,9 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
     }
 
     void accept(llama_seq_id seq_id, uint16_t n_accepted, bool /*is_other*/) override {
+#ifdef SPEC_FASTPATH
+        opt.sync_pending_g_to_verify();
+#endif
         if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
             return;
         }
@@ -855,9 +884,11 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
 
         const int32_t i_g = std::min<int32_t>(n_accepted, n_rows - 1);
         pending_pos_last[seq_id] = verify_pos_first[seq_id] + i_g;
+        // clang-format off
         std::memcpy(pending_g_last[seq_id].data(),
                     verify_g[seq_id].data() + (size_t) i_g * n_embd_dec,
                     (size_t) n_embd_dec * sizeof(float));
+        // clang-format on
     }
 
     // we only need to stash the deferred boundary's g_embd row for recurrent/hybrid targets:
@@ -1314,6 +1345,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     std::vector<int>                i_last;
     std::vector<std::vector<float>> chain_h;
 
+#ifdef SPEC_FASTPATH
+    common_spec_opt_mtp opt;
+#endif
+
     common_speculative_impl_draft_mtp(const common_params_speculative & params, uint32_t n_seq)
         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_MTP, n_seq)
         , params(params.draft)
@@ -1391,6 +1426,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         verify_h.assign(n_seq, {});
         verify_h_rows.assign(n_seq, 0);
+
+#ifdef SPEC_FASTPATH
+        opt.init(params, n_seq, smpls[0].get(), backend_chains[0] != nullptr, pending_h[0]);
+#endif
     }
 
     ~common_speculative_impl_draft_mtp() override {
@@ -1465,8 +1504,14 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
 
+#ifdef SPEC_FASTPATH
+        const bool skip_draft_update = opt.consume_process_skip();
+#else
+        const bool skip_draft_update = false;
+#endif
+
         // if kv is shared with target (e.g Gemma4), then we can skip this catch-up decode
-        if (!is_mem_shared) {
+        if (!is_mem_shared && !skip_draft_update) {
             common_batch_clear(batch);
 
             for (int k = 0; k < n_tokens; ++k) {
@@ -1570,6 +1615,12 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             n_drafting++;
             drafting[seq_id] = true;
             common_sampler_reset(smpls[seq_id].get());
+
+#ifdef SPEC_FASTPATH
+            if (opt.prepare_host_kv_metadata(seq_id, dp.n_past, dp)) {
+                return;
+            }
+#endif
 
             common_batch_add(batch, dp.id_last, dp.n_past, { seq_id }, true);
             std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd, pending_h[seq_id].data(), row_bytes);
@@ -2619,6 +2670,28 @@ bool common_speculative_process(common_speculative * spec, const llama_batch & b
 
     return result;
 }
+
+#ifdef SPEC_FASTPATH
+int32_t common_speculative_advance_pipeline(common_speculative * spec, llama_context * ctx_tgt, llama_batch batch) {
+    if (spec != nullptr) {
+        for (auto & impl : spec->impls) {
+            int32_t ret = 0;
+            if (impl->type == COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3 &&
+                static_cast<common_speculative_impl_draft_eagle3 *>(impl.get())
+                    ->opt.advance_pipeline(ctx_tgt, batch, ret)) {
+                return ret;
+            }
+            if (impl->type == COMMON_SPECULATIVE_TYPE_DRAFT_MTP &&
+                static_cast<common_speculative_impl_draft_mtp *>(impl.get())
+                    ->opt.advance_pipeline(ctx_tgt, batch, ret)) {
+                return ret;
+            }
+        }
+    }
+
+    return llama_decode(ctx_tgt, batch);
+}
+#endif
 
 void common_speculative_draft(common_speculative * spec) {
     if (spec == nullptr) {

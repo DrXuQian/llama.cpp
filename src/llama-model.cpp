@@ -7,6 +7,9 @@
 #include "llama-mmap.h"
 #include "llama-cparams.h"
 #include "llama-model-loader.h"
+#ifdef GGML_NCP_QUACTLIZE
+#    include "llama-kpack-cache.h"
+#endif
 
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-iswa.h"
@@ -363,6 +366,10 @@ llama_model * llama_model_create(llama_model_loader & ml, const llama_model_para
 
 struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const struct ggml_tensor * tensor, void * userdata) {
     const llama_meta_device_get_split_state_userdata * ud = (const llama_meta_device_get_split_state_userdata *) userdata;
+    // Virtual weights have no complete metadata during placement queries.
+    if (ud->loader && ud->loader->files.empty() && ud->model->tensors_by_name.empty()) {
+        return {GGML_BACKEND_SPLIT_AXIS_UNKNOWN, {0}, {1}, 1};
+    }
     const llama_hparams & hparams = ud->model->hparams;
     const std::string tensor_name = tensor->name;
     const bool is_dsv4 = ud->model->arch == LLM_ARCH_DEEPSEEK4 ||
@@ -453,9 +460,15 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             rotation = hparams.n_layer() % ud->n_devices;
         }
         const ggml_tensor * tensor_axis_0 = suffix.empty() ? tensor : ud->model->get_tensor((prefix + suffix).c_str());
+        if (tensor_axis_0 == nullptr && ud->loader) {
+            tensor_axis_0 = ud->loader->get_tensor_meta((prefix + suffix).c_str());
+        }
         if (tensor_axis_0 == nullptr) {
             GGML_ASSERT(!suffix_fallback.empty());
             tensor_axis_0 = ud->model->get_tensor((prefix + suffix_fallback).c_str());
+            if (tensor_axis_0 == nullptr && ud->loader) {
+                tensor_axis_0 = ud->loader->get_tensor_meta((prefix + suffix_fallback).c_str());
+            }
         }
         GGML_ASSERT(tensor_axis_0 != nullptr);
         return {axis, tensor_axis_0, il, rotation};
@@ -567,6 +580,9 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         }
         if (std::regex_match(tensor_name, pattern_output_bias)) {
             const ggml_tensor * output_weight = ud->model->get_tensor("output.weight");
+            if (output_weight == nullptr && ud->loader) {
+                output_weight = ud->loader->get_tensor_meta("output.weight");
+            }
             GGML_ASSERT(output_weight != nullptr);
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0);
         }
@@ -1117,7 +1133,13 @@ static buft_list_t make_gpu_buft_list(ggml_backend_dev_t dev, llama_split_mode s
 
 struct llama_model::impl {
     impl() = default;
-    ~impl() = default;
+
+    ~impl() {
+#ifdef GGML_NCP_QUACTLIZE
+        // Drain the writer while all weight buffers and tensor metadata are alive.
+        kpack_cache.reset();
+#endif
+    }
 
     uint64_t n_elements = 0;
 
@@ -1136,6 +1158,9 @@ struct llama_model::impl {
 
     // contexts where the model tensors metadata is stored as well as the corresponding buffers:
     std::vector<std::pair<ggml_context_ptr, std::vector<ggml_backend_buffer_ptr>>> ctxs_bufs;
+#ifdef GGML_NCP_QUACTLIZE
+    std::unique_ptr<llama_kpack_cache> kpack_cache;
+#endif
 
     buft_list_t cpu_buft_list;
     std::map<ggml_backend_dev_t, buft_list_t> gpu_buft_list;
@@ -1380,6 +1405,14 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     const bool use_mmap_buffer = true;
 
     this->ml = &ml; // to be used by create_tensor() and load_arch_tensors()
+
+    struct split_metadata_scope {
+        llama_meta_device_get_split_state_userdata & data;
+
+        ~split_metadata_scope() { data.loader = nullptr; }
+    } split_metadata{get_split_state_ud};
+
+    get_split_state_ud.loader = &ml;
 
     if (ml.use_mmap && params.load_mode == LLAMA_LOAD_MODE_AUTO) {
         for (const auto & dev : devices) {
@@ -1660,7 +1693,15 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     }
 
-    ml.init_mappings(true, use_mlock ? &pimpl->mlock_mmaps : nullptr);
+    bool prefetch_source = true;
+#ifdef GGML_NCP_QUACTLIZE
+    if (params.split_mode != LLAMA_SPLIT_MODE_ROW) {
+        pimpl->kpack_cache = llama_kpack_cache::create(ml);
+        ml.kpack_cache     = pimpl->kpack_cache.get();
+        prefetch_source    = !ml.kpack_cache || ml.kpack_cache->should_prefetch(ml);
+    }
+#endif
+    ml.init_mappings(prefetch_source, use_mlock ? &pimpl->mlock_mmaps : nullptr);
     pimpl->mappings.reserve(ml.mappings.size());
 
     // create the backend buffers
@@ -1788,6 +1829,11 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             return false;
         }
     }
+#ifdef GGML_NCP_QUACTLIZE
+    if (pimpl->kpack_cache) {
+        pimpl->kpack_cache->start();
+    }
+#endif
 
     if (use_mmap_buffer) {
         for (auto & mapping : ml.mappings) {

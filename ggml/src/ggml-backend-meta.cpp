@@ -13,6 +13,7 @@
 #include <cstring>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <set>
 #include <string>
 #include <tuple>
@@ -255,11 +256,11 @@ struct ggml_backend_meta_buffer_type_context {
 
     ggml_backend_meta_buffer_type_context(std::vector<ggml_backend_buffer_type_t> simple_bufts) : simple_bufts(std::move(simple_bufts)) {
         name = "Meta(";
-        for (size_t i = 0; i < simple_bufts.size(); i++) {
+        for (size_t i = 0; i < this->simple_bufts.size(); i++) {
             if (i > 0) {
                 name += ",";
             }
-            name += ggml_backend_buft_name(simple_bufts[i]);
+            name += ggml_backend_buft_name(this->simple_bufts[i]);
         }
         name += ")";
     }
@@ -389,6 +390,172 @@ static ggml_backend_buffer_type_t ggml_backend_meta_device_get_host_buffer_type(
         }
     }
     return host_buft;
+}
+
+ggml_backend_buffer_type_t ggml_backend_meta_buffer_type(ggml_backend_dev_t dev, ggml_backend_buffer_type_t prototype) {
+    if (!ggml_backend_dev_is_meta(dev) || !prototype) {
+        return nullptr;
+    }
+    if (ggml_backend_buft_is_meta(prototype)) {
+        return ggml_backend_meta_device_supports_buft(dev, prototype) ? prototype : nullptr;
+    }
+    auto * source = ggml_backend_buft_get_device(prototype);
+    auto * reg    = source ? ggml_backend_dev_backend_reg(source) : nullptr;
+    auto * ctx    = static_cast<ggml_backend_meta_device_context *>(dev->context);
+    if (!reg || std::find(ctx->simple_devs.begin(), ctx->simple_devs.end(), source) == ctx->simple_devs.end()) {
+        return nullptr;
+    }
+    if (prototype == ggml_backend_dev_buffer_type(source)) {
+        return ggml_backend_meta_device_get_buffer_type(dev);
+    }
+    for (const char * proc : {"ggml_backend_dev_get_extra_bufts", "ggml_backend_dev_get_override_bufts"}) {
+        auto extras =
+            reinterpret_cast<ggml_backend_dev_get_extra_bufts_t>(ggml_backend_reg_get_proc_address(reg, proc));
+        auto ** candidates = extras ? extras(source) : nullptr;
+        size_t  slot       = 0;
+        while (candidates && candidates[slot] && candidates[slot] != prototype) {
+            ++slot;
+        }
+        if (!candidates || !candidates[slot]) {
+            continue;
+        }
+        std::vector<ggml_backend_buffer_type_t> types;
+        for (auto * local_dev : ctx->simple_devs) {
+            if (ggml_backend_dev_backend_reg(local_dev) != reg) {
+                return nullptr;
+            }
+            auto ** local = extras(local_dev);
+            for (size_t i = 0; i <= slot; ++i) {
+                if (!local || !local[i]) {
+                    return nullptr;
+                }
+            }
+            if (ggml_backend_buft_get_device(local[slot]) != local_dev ||
+                !ggml_backend_dev_supports_buft(local_dev, local[slot])) {
+                return nullptr;
+            }
+            types.push_back(local[slot]);
+        }
+        using key = std::pair<ggml_backend_dev_t, std::vector<ggml_backend_buffer_type_t>>;
+        static std::mutex                              mutex;
+        static std::map<key, ggml_backend_buffer_type> buffers;
+        std::lock_guard<std::mutex>                    lock(mutex);
+        const key                                      identity{dev, types};
+        const auto                                     found = buffers.find(identity);
+        if (found != buffers.end()) {
+            return &found->second;
+        }
+        auto * context = new ggml_backend_meta_buffer_type_context(std::move(types));
+        return &buffers.emplace(identity, ggml_backend_buffer_type{ggml_backend_meta_buffer_type_iface, dev, context})
+                    .first->second;
+    }
+    return nullptr;
+}
+
+size_t ggml_backend_meta_buffer_type_count(ggml_backend_buffer_type_t buft) {
+    return ggml_backend_buft_is_meta(buft) ? ggml_backend_meta_buft_n_bufts(buft) : 0;
+}
+
+static void ggml_backend_meta_split_shape(const ggml_tensor *                   tensor,
+                                          const ggml_backend_meta_split_state & split,
+                                          size_t                                count,
+                                          size_t                                rank,
+                                          int64_t *                             ne,
+                                          size_t *                              nb) {
+    std::copy_n(tensor->ne, GGML_MAX_DIMS, ne);
+    std::copy_n(tensor->nb, GGML_MAX_DIMS, nb);
+    if (split.axis >= 0 && split.axis < GGML_MAX_DIMS) {
+        ne[split.axis] = 0;
+        for (size_t s = 0; s < split.n_segments; ++s) {
+            ne[split.axis] += split.ne[s * count + rank] * split.nr[s];
+        }
+        for (int i = 0; i < GGML_MAX_DIMS; ++i) {
+            if (tensor->nb[i] > tensor->nb[split.axis]) {
+                nb[i] = tensor->nb[i] * ne[split.axis] / tensor->ne[split.axis];
+            }
+        }
+    }
+}
+
+ggml_backend_buffer_type_t ggml_backend_meta_device_get_weight_buft(ggml_backend_dev_t  dev,
+                                                                    const ggml_tensor * weight,
+                                                                    ggml_op             op) {
+    if (!ggml_backend_dev_is_meta(dev) || !weight || weight->view_src || ggml_nelements(weight) == 0 ||
+        !ggml_is_contiguous(weight)) {
+        return nullptr;
+    }
+    const auto *                                    ctx = static_cast<ggml_backend_meta_device_context *>(dev->context);
+    const size_t                                    count = ctx->simple_devs.size();
+    std::vector<ggml_backend_dev_get_weight_buft_t> queries;
+    for (auto * local_dev : ctx->simple_devs) {
+        auto * reg   = ggml_backend_dev_backend_reg(local_dev);
+        auto   query = reg ? reinterpret_cast<ggml_backend_dev_get_weight_buft_t>(
+                               ggml_backend_reg_get_proc_address(reg, "ggml_backend_dev_get_weight_buft")) :
+                             nullptr;
+        if (!query) {
+            return nullptr;
+        }
+        queries.push_back(query);
+    }
+    const auto split = ctx->get_split_state(weight, ctx->get_split_state_ud);
+    if (split.axis != GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
+        if (split.axis < 0 || split.axis >= GGML_MAX_DIMS || split.n_segments == 0 || split.n_segments > 16) {
+            return nullptr;
+        }
+        int64_t total = 0;
+        for (size_t s = 0; s < split.n_segments; ++s) {
+            if (split.nr[s] == 0) {
+                return nullptr;
+            }
+            for (size_t rank = 0; rank < count; ++rank) {
+                const int64_t part = split.ne[s * count + rank];
+                if (part < 0 || part > (weight->ne[split.axis] - total) / split.nr[s] ||
+                    (split.axis == 0 && part % ggml_blck_size(weight->type) != 0)) {
+                    return nullptr;
+                }
+                total += part * split.nr[s];
+            }
+        }
+        if (total != weight->ne[split.axis]) {
+            return nullptr;
+        }
+    }
+    ggml_backend_buffer_type_t result = nullptr;
+    for (size_t rank = 0; rank < count; ++rank) {
+        ggml_tensor local = *weight;
+        ggml_backend_meta_split_shape(weight, split, count, rank, local.ne, local.nb);
+        if (ggml_nelements(&local) == 0) {
+            continue;
+        }
+        auto * local_dev = ctx->simple_devs[rank];
+        auto * buft      = queries[rank](local_dev, &local, op);
+        if (!buft || ggml_backend_buft_get_device(buft) != local_dev) {
+            return nullptr;
+        }
+        if (!result) {
+            result = ggml_backend_meta_buffer_type(dev, buft);
+        }
+        if (!result || ggml_backend_meta_buffer_type_at(result, rank) != buft) {
+            return nullptr;
+        }
+    }
+    return result;
+}
+
+bool ggml_backend_meta_tensor_split(ggml_backend_buffer_type_t             buft,
+                                    const struct ggml_tensor *             tensor,
+                                    struct ggml_backend_meta_split_state * split) {
+    if (!ggml_backend_buft_is_meta(buft) || !tensor || !split) {
+        return false;
+    }
+    const auto * ctx = static_cast<ggml_backend_meta_device_context *>(buft->device->context);
+    *split           = ctx->get_split_state(tensor, ctx->get_split_state_ud);
+    return true;
+}
+
+ggml_backend_buffer_type_t ggml_backend_meta_buffer_type_at(ggml_backend_buffer_type_t buft, size_t index) {
+    return index < ggml_backend_meta_buffer_type_count(buft) ? ggml_backend_meta_buft_simple_buft(buft, index) :
+                                                               nullptr;
 }
 
 //
@@ -1178,6 +1345,20 @@ static void * ggml_backend_meta_buffer_get_base(ggml_backend_buffer_t buffer) {
     return (void *) 0x1000000000000000; // FIXME
 }
 
+struct ggml_tensor * ggml_backend_meta_tensor_shard(const struct ggml_tensor *             tensor,
+                                                    size_t                                 index,
+                                                    struct ggml_backend_meta_split_state * split) {
+    if (!tensor || !tensor->buffer || !ggml_backend_buffer_is_meta(tensor->buffer) ||
+        index >= ggml_backend_meta_buffer_n_bufs(tensor->buffer)) {
+        return nullptr;
+    }
+    auto * local = ggml_backend_meta_buffer_simple_tensor(tensor, index);
+    if (local && split) {
+        *split = ggml_backend_meta_get_split_state(tensor, false);
+    }
+    return local;
+}
+
 static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_meta_simple_tensor_container & stc, ggml_tensor * tensor) {
     GGML_ASSERT(ggml_backend_buffer_is_meta(tensor->buffer));
     ggml_backend_meta_buffer_context * buf_ctx = (ggml_backend_meta_buffer_context *) tensor->buffer->context;
@@ -1487,7 +1668,7 @@ static void ggml_backend_meta_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
             for (size_t j = 0; j < n_bufs; j++) {
                 ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(tensor, j);
                 const size_t chunk_size_j = simple_tensor->nb[split_state.axis + 1];
-                if (chunk_size_j == 0) {
+                if (chunk_size_j == 0 || ggml_nelements(simple_tensor) == 0) {
                     continue;
                 }
                 const size_t simple_offset = i_start * chunk_size_j;

@@ -1,5 +1,6 @@
 #include "convert.cuh"
 #include "dequantize.cuh"
+#include "convert-ppu.cuh"
 
 #include <cstdint>
 
@@ -443,6 +444,12 @@ template <typename src_t, typename dst_t>
 static void convert_unary_cuda(const void * vx, dst_t * y,
         const int64_t ne00, const int64_t ne01, const int64_t ne02, const int64_t ne03,
         const int64_t s01, const int64_t s02, const int64_t s03, cudaStream_t stream) {
+    #if defined(GGML_USE_PPU)
+    // PPU: vectorized strided convert (4 elems/thread) for {f32,f16,bf16} cross-cast.
+    if constexpr (ppu_convert_cont_supported<src_t, dst_t>()) {
+        if ((ne00 & 3) == 0) { ppu_convert_unary_strided<src_t, dst_t>(vx, y, ne00, ne01, ne02, ne03, s01, s02, s03, stream); return; }
+    }
+    #endif
     const int64_t ne0203 = ne02*ne03;
     const uint3 ne02_fdv = init_fastdiv_values(ne02);
     const dim3 num_blocks((ne00 + CUDA_DEQUANTIZE_BLOCK_SIZE - 1) / CUDA_DEQUANTIZE_BLOCK_SIZE, (int)std::min(ne01, (int64_t)65535), (int)std::min(ne0203, (int64_t)65535));
@@ -452,6 +459,13 @@ static void convert_unary_cuda(const void * vx, dst_t * y,
 
 template <typename src_t, typename dst_t>
 static void convert_unary_cont_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
+#if defined(GGML_USE_PPU)
+    // PPU: vectorized convert (8 elems/thread) for any {f32,f16,bf16} cross-cast, instead of the scalar 1-elem/
+    // thread convert_unary. The if constexpr keeps the ppu kernel out of unsupported instantiations (quant src etc.).
+    if constexpr (ppu_convert_cont_supported<src_t, dst_t>()) {
+        if ((k & 7) == 0) { ppu_convert_unary_cont<src_t, dst_t>(vx, y, k, stream); return; }   // k % 8 -> 16B-aligned
+    }
+#endif
     convert_unary_cuda<src_t>(vx, y, k, 1, 1, 1, k, k, k, stream);
 }
 
