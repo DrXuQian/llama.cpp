@@ -1,7 +1,7 @@
 #pragma once
-// C ABI of the Quactlize packer and dense runtime in one library, installed through ncp_flash_lib. Only the subset
+// C ABI of the Quactlize packer and compute runtime in one library, installed through ncp_flash_lib. Only the subset
 // quactlize-buft.cu dlsym's is mirrored here, so llama.cpp needs no include path into ncp_flash_lib -- the same model
-// as ncp-moe-lib.h. Source of truth: quactlize/packing/api.h, quactlize/dense/api.h and
+// as ncp-moe-lib.h. Source of truth: quactlize/packing/api.h, quactlize/dense/api.h, quactlize/moe/matmul.h and
 // quactlize/include/quactlize_ppu_config.h.
 //
 // These must stay byte-identical to what the library exports: the struct layouts are passed across the dlopen
@@ -110,9 +110,48 @@ void         quactlize_ppu_dense_destroy_v1(void * context);
 // Non-NULL, thread-local message for the last error; valid until the next API call on this thread.
 const char * quactlize_ppu_dense_error_v1(void);
 
+// Independent indexed projection: BF16 operands, FP32 accumulation and F32 I/O.
+// IDs are distinct within each token. Output retains token/slot order; no weighted sum or FFN fusion.
+typedef struct {
+    uint32_t                            version, size;
+    int32_t                             qtype, n, k, experts, tokens, topk, channels, reserved;
+    int64_t                             input_row_stride, input_token_stride, ids_stride, output_stride;
+    quactlize_ppu_placed_arrangement_v2 arrangement;
+    quactlize_ppu_kpack_sizes_v1        sizes;
+} quactlize_ppu_moe_matmul_params_v1;
+
+typedef struct {
+    uint32_t version, size;
+    uint64_t workspace_bytes;
+    int32_t  route, policy, split, compute_type, source_tokens, prepare_algorithm, prepare_helper, reserved;
+    char     config[192];
+} quactlize_ppu_moe_matmul_plan_info_v1;
+
+// tokens=0 admits the weight for every legal inference M. Strides count elements.
+int          quactlize_ppu_moe_matmul_supported_v1(const quactlize_ppu_moe_matmul_params_v1 * params);
+int          quactlize_ppu_moe_matmul_create_v1(int32_t device, void ** context);
+int          quactlize_ppu_moe_matmul_prepare_v1(void *                                     context,
+                                                 const quactlize_ppu_moe_matmul_params_v1 * params,
+                                                 const void *                               low,
+                                                 const void *                               high,
+                                                 const void *                               units,
+                                                 void **                                    plan,
+                                                 quactlize_ppu_moe_matmul_plan_info_v1 *    info);
+int          quactlize_ppu_moe_matmul_run_v1(void *          plan,
+                                             const float *   input,
+                                             const int32_t * ids,
+                                             float *         output,
+                                             void *          workspace,
+                                             uint64_t        workspace_bytes,
+                                             void *          stream);
+void         quactlize_ppu_moe_matmul_destroy_v1(void * context);
+const char * quactlize_ppu_moe_matmul_error_v1(void);
+
 #ifdef __cplusplus
 }
 
 static_assert(sizeof(quactlize_ppu_dense_params_v1) == 112, "dense parameter ABI drift");
 static_assert(sizeof(quactlize_ppu_dense_plan_info_v1) == 224, "dense plan ABI drift");
+static_assert(sizeof(quactlize_ppu_moe_matmul_params_v1) == 144, "MoE parameter ABI drift");
+static_assert(sizeof(quactlize_ppu_moe_matmul_plan_info_v1) == 240, "MoE plan ABI drift");
 #endif

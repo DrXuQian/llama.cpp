@@ -1946,6 +1946,11 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
 static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int cc) {
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
+#ifdef GGML_NCP_QUACTLIZE
+    if (ggml_quactlize_tensor_is_kpack(src0) || ggml_quactlize_is_alias(src0)) {
+        return false;
+    }
+#endif
 
     if (src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
         return true;
@@ -1977,6 +1982,12 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
     const ggml_tensor * ids  = dst->src[2];
+#ifdef GGML_NCP_QUACTLIZE
+    if (ggml_quactlize_tensor_is_kpack(src0) || ggml_quactlize_is_alias(src0)) {
+        ggml_quactlize_mul_mat_id(ctx, dst);
+        return;
+    }
+#endif
 
     GGML_ASSERT(src1->type == GGML_TYPE_F32);
     GGML_ASSERT(dst->type  == GGML_TYPE_F32);

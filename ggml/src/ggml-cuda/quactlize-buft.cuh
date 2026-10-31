@@ -23,6 +23,7 @@ bool                         ggml_quactlize_enabled();
 bool                         ggml_quactlize_can_compute(const ggml_tensor * op);
 void                         ggml_quactlize_prepare_graph(ggml_backend_cuda_context & ctx, const ggml_cgraph * graph);
 void                         ggml_quactlize_mul_mat(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+void                         ggml_quactlize_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
 // Explicit packed-byte I/O. The ordinary get_tensor/copy interfaces stay disabled.
 bool ggml_quactlize_read_packed(const ggml_tensor * tensor, void * data, size_t size);

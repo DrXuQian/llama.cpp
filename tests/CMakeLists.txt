@@ -315,7 +315,7 @@ if (GGML_NCP_QUACTLIZE)
         COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/test-kpack-load.py"
             --binary $<TARGET_FILE:test-kpack-load> --cache-binary $<TARGET_FILE:test-kpack-cache>)
     set_tests_properties(test-kpack-load PROPERTIES LABELS "ppu;kpack" TIMEOUT 600 RUN_SERIAL TRUE)
-    foreach(suite gemv gemm contract)
+    foreach(suite gemv gemm contract moe-gemv moe-gemm)
         add_test(NAME test-kpack-${suite}
             COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/test-kpack-load.py"
                 --binary $<TARGET_FILE:test-kpack-load> --compute ${suite})

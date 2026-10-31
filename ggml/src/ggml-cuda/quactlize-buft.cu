@@ -29,6 +29,12 @@ struct quactlize_library {
     decltype(&quactlize_ppu_dense_run_v1)       dense_run       = nullptr;
     decltype(&quactlize_ppu_dense_destroy_v1)   dense_destroy   = nullptr;
     decltype(&quactlize_ppu_dense_error_v1)     dense_error     = nullptr;
+    decltype(&quactlize_ppu_moe_matmul_supported_v1) moe_supported   = nullptr;
+    decltype(&quactlize_ppu_moe_matmul_create_v1)    moe_create      = nullptr;
+    decltype(&quactlize_ppu_moe_matmul_prepare_v1)   moe_prepare     = nullptr;
+    decltype(&quactlize_ppu_moe_matmul_run_v1)       moe_run         = nullptr;
+    decltype(&quactlize_ppu_moe_matmul_destroy_v1)   moe_destroy     = nullptr;
+    decltype(&quactlize_ppu_moe_matmul_error_v1)     moe_error       = nullptr;
 
     quactlize_library() {
         const char * path = getenv("QUACTLIZE_PPU_LIBRARY");
@@ -57,6 +63,12 @@ struct quactlize_library {
         QZ_BIND(dense_run, quactlize_ppu_dense_run_v1);
         QZ_BIND(dense_destroy, quactlize_ppu_dense_destroy_v1);
         QZ_BIND(dense_error, quactlize_ppu_dense_error_v1);
+        QZ_BIND(moe_supported, quactlize_ppu_moe_matmul_supported_v1);
+        QZ_BIND(moe_create, quactlize_ppu_moe_matmul_create_v1);
+        QZ_BIND(moe_prepare, quactlize_ppu_moe_matmul_prepare_v1);
+        QZ_BIND(moe_run, quactlize_ppu_moe_matmul_run_v1);
+        QZ_BIND(moe_destroy, quactlize_ppu_moe_matmul_destroy_v1);
+        QZ_BIND(moe_error, quactlize_ppu_moe_matmul_error_v1);
 #    undef QZ_BIND
         GGML_LOG_INFO("[quactlize] loaded %s\n", path);
     }
@@ -73,6 +85,17 @@ struct dense_plan {
 };
 
 using dense_key = std::array<int64_t, 3>;
+
+struct moe_plan {
+    void *                                handle = nullptr;
+    quactlize_ppu_moe_matmul_plan_info_v1 info{};
+};
+
+using moe_key = std::array<int64_t, 7>;
+
+moe_key key_for(const quactlize_ppu_moe_matmul_params_v1 & p) {
+    return {p.tokens, p.topk, p.channels, p.input_row_stride, p.input_token_stride, p.ids_stride, p.output_stride};
+}
 
 const ggml_tensor * weight_owner(const ggml_tensor * tensor) {
     while (tensor && tensor->view_src) {
@@ -126,12 +149,55 @@ bool dense_params(const ggml_tensor * op, quactlize_ppu_dense_params_v1 & params
     return true;
 }
 
+bool moe_params(const ggml_tensor * op, quactlize_ppu_moe_matmul_params_v1 & params) {
+    if (!op || op->op != GGML_OP_MUL_MAT_ID || op->type != GGML_TYPE_F32 || !ggml_is_contiguous(op)) {
+        return false;
+    }
+    const auto *                 weight = weight_owner(op->src[0]);
+    const auto *                 input  = op->src[1];
+    const auto *                 ids    = op->src[2];
+    ggml_quactlize_packed_layout layout{};
+    if (!weight || !input || !ids || !ggml_quactlize_can_load(weight, &layout) || weight->ne[3] != 1 ||
+        input->type != GGML_TYPE_F32 || input->nb[0] != sizeof(float) || input->ne[3] != 1 ||
+        ids->type != GGML_TYPE_I32 || ids->nb[0] != sizeof(int32_t) || ids->ne[2] != 1 || ids->ne[3] != 1 ||
+        (ids->ne[1] != 0 && (input->ne[0] != weight->ne[0] || op->ne[0] != weight->ne[1])) || op->ne[1] != ids->ne[0] ||
+        op->ne[2] != ids->ne[1] || input->ne[2] != ids->ne[1] || op->ne[3] != 1 || input->ne[1] < 1 ||
+        input->ne[1] > 32 || ids->ne[0] < 1 || ids->ne[0] > 32 || ids->ne[1] < 0 || ids->ne[1] > INT_MAX ||
+        input->nb[1] % sizeof(float) || input->nb[2] % sizeof(float) || ids->nb[1] % sizeof(int32_t)) {
+        return false;
+    }
+    params = {1,
+              sizeof(params),
+              int32_t(weight->type),
+              int32_t(weight->ne[1]),
+              int32_t(weight->ne[0]),
+              int32_t(weight->ne[2]),
+              int32_t(ids->ne[1]),
+              int32_t(ids->ne[0]),
+              int32_t(input->ne[1]),
+              0,
+              int64_t(input->nb[1] / sizeof(float)),
+              int64_t(input->nb[2] / sizeof(float)),
+              int64_t(ids->nb[1] / sizeof(int32_t)),
+              int64_t(op->nb[1] / sizeof(float)),
+              layout.arrangement,
+              layout.sizes};
+    if (params.tokens == 0) {
+        // Meta can retain global strides on an empty local output.
+        params.input_row_stride   = params.k;
+        params.input_token_stride = int64_t(params.k) * params.channels;
+        params.output_stride      = params.n;
+    }
+    return true;
+}
+
 struct tensor_state {
     ggml_quactlize_packed_layout    layout{};
     bool                            loaded        = false;
     cudaEvent_t                     ready         = nullptr;
     bool                            compute_ready = false;
     std::map<dense_key, dense_plan> plans;
+    std::map<moe_key, moe_plan>     moe_plans;
 };
 
 constexpr size_t cache_chunk_bytes = 8 * 1024 * 1024;
@@ -157,7 +223,19 @@ struct buffer_context {
     std::map<const ggml_tensor *, tensor_state> tensors;
     std::mutex                                  compute_mutex;
     void *                                      compute = nullptr;
+    void *                                      moe_compute = nullptr;
 };
+
+void prepare_ready(ggml_backend_cuda_context & cuda_ctx, tensor_state & state) {
+    cudaStreamCaptureStatus capture;
+    CUDA_CHECK(cudaStreamIsCapturing(cuda_ctx.stream(), &capture));
+    GGML_ASSERT(capture == cudaStreamCaptureStatusNone);
+    // Retire the one-time upload before capture; no event wait is inserted in replay.
+    if (!state.compute_ready) {
+        CUDA_CHECK(cudaEventSynchronize(state.ready));
+        state.compute_ready = true;
+    }
+}
 
 struct buft_context {
     int                        device;
@@ -185,10 +263,15 @@ void free_buffer(ggml_backend_buffer_t buffer) {
     ggml_cuda_set_device(ctx->device);
     CUDA_CHECK(cudaStreamSynchronize(ctx->stream));
     CUDA_CHECK(cudaStreamSynchronize(ctx->copy_stream));
-    if (ctx->compute) {
+    if (ctx->compute || ctx->moe_compute) {
         // Compute plans reference these weights and may be captured on other streams.
         CUDA_CHECK(cudaDeviceSynchronize());
-        library().dense_destroy(ctx->compute);
+        if (ctx->compute) {
+            library().dense_destroy(ctx->compute);
+        }
+        if (ctx->moe_compute) {
+            library().moe_destroy(ctx->moe_compute);
+        }
     }
     for (const auto & item : ctx->tensors) {
         if (item.second.ready) {
@@ -560,7 +643,8 @@ bool ggml_quactlize_enabled() {
 ggml_backend_buffer_type_t ggml_cuda_quactlize_weight_buft(ggml_backend_dev_t  dev,
                                                            const ggml_tensor * weight,
                                                            ggml_op             op) {
-    if (!ggml_quactlize_enabled() || op != GGML_OP_MUL_MAT || !weight || weight->ne[2] != 1 || weight->ne[3] != 1 ||
+    if (!ggml_quactlize_enabled() || (op != GGML_OP_MUL_MAT && op != GGML_OP_MUL_MAT_ID) || !weight ||
+        (op == GGML_OP_MUL_MAT && weight->ne[2] != 1) || weight->ne[3] != 1 ||
         (weight->type != GGML_TYPE_Q8_0 && (weight->type < GGML_TYPE_Q2_K || weight->type > GGML_TYPE_Q6_K))) {
         return nullptr;
     }
@@ -570,6 +654,29 @@ ggml_backend_buffer_type_t ggml_cuda_quactlize_weight_buft(ggml_backend_dev_t  d
     ggml_quactlize_packed_layout layout{};
     if (!ggml_quactlize_can_load(weight, &layout)) {
         return nullptr;
+    }
+    if (op == GGML_OP_MUL_MAT_ID) {
+        const quactlize_ppu_moe_matmul_params_v1 params{1,
+                                                        sizeof(params),
+                                                        int32_t(weight->type),
+                                                        int32_t(weight->ne[1]),
+                                                        int32_t(weight->ne[0]),
+                                                        int32_t(weight->ne[2]),
+                                                        0,
+                                                        1,
+                                                        1,
+                                                        0,
+                                                        weight->ne[0],
+                                                        weight->ne[0],
+                                                        1,
+                                                        weight->ne[1],
+                                                        layout.arrangement,
+                                                        layout.sizes};
+        const int                                supported = library().moe_supported(&params);
+        if (supported < 0 || supported > 1) {
+            GGML_ABORT("quactlize: MoE weight admission %s: %s", weight->name, library().moe_error());
+        }
+        return supported ? ggml_cuda_quactlize_extra_bufts(dev)[0] : nullptr;
     }
     quactlize_ppu_dense_params_v1 params{
         1, sizeof(params), int32_t(weight->type), int32_t(weight->ne[1]), int32_t(weight->ne[0]),
@@ -583,6 +690,10 @@ ggml_backend_buffer_type_t ggml_cuda_quactlize_weight_buft(ggml_backend_dev_t  d
 }
 
 bool ggml_quactlize_can_compute(const ggml_tensor * op) {
+    if (op && op->op == GGML_OP_MUL_MAT_ID) {
+        quactlize_ppu_moe_matmul_params_v1 params{};
+        return ggml_quactlize_enabled() && moe_params(op, params) && library().moe_supported(&params) == 1;
+    }
     quactlize_ppu_dense_params_v1 params{};
     return ggml_quactlize_enabled() && dense_params(op, params) && library().dense_supported(&params) == 1;
 }
@@ -603,7 +714,7 @@ void ggml_quactlize_prepare_graph(ggml_backend_cuda_context & cuda_ctx, const gg
         if (packed_source(node)) {
             GGML_ABORT("quactlize: K-pack is load-only; inference is not enabled (%s)", node->name);
         }
-        bool dense = false;
+        bool packed = false;
         for (const auto * src : node->src) {
             if (packed_source(src)) {
                 if (!ggml_quactlize_enabled()) {
@@ -619,11 +730,11 @@ void ggml_quactlize_prepare_graph(ggml_backend_cuda_context & cuda_ctx, const gg
                         ggml_op_name(node->op), node->name, src->name, cuda_ctx.device, input ? ggml_nrows(input) : -1,
                         ggml_nrows(node), src->ne[1], node->ne[0], src->ne[0], input ? input->ne[0] : -1);
                 }
-                dense = true;
+                packed = true;
             }
         }
         // Empty outputs stay on this backend, but need no compute plan.
-        if (!dense || ggml_is_empty(node)) {
+        if (!packed || ggml_is_empty(node)) {
             continue;
         }
         const auto * weight = weight_owner(node->src[0]);
@@ -633,20 +744,50 @@ void ggml_quactlize_prepare_graph(ggml_backend_cuda_context & cuda_ctx, const gg
         auto                        found = ctx->tensors.find(weight);
         GGML_ASSERT(found != ctx->tensors.end() && found->second.loaded);
         auto &                        state = found->second;
+        if (node->op == GGML_OP_MUL_MAT_ID) {
+            quactlize_ppu_moe_matmul_params_v1 params{};
+            GGML_ASSERT(moe_params(node, params));
+            const auto key = key_for(params);
+            if (state.moe_plans.count(key)) {
+                continue;
+            }
+            prepare_ready(cuda_ctx, state);
+            const auto & api = library();
+            if (!ctx->moe_compute && (api.moe_create(ctx->device, &ctx->moe_compute) || !ctx->moe_compute)) {
+                GGML_ABORT("quactlize: MoE context: %s", api.moe_error());
+            }
+            const auto * low   = static_cast<const uint8_t *>(weight->data);
+            const auto & sizes = state.layout.sizes;
+            moe_plan     plan;
+            plan.info.version = 1;
+            plan.info.size    = sizeof(plan.info);
+            if (api.moe_prepare(ctx->moe_compute, &params, low, sizes.high_bytes ? low + sizes.low_bytes : nullptr,
+                                low + sizes.low_bytes + sizes.high_bytes, &plan.handle, &plan.info)) {
+                GGML_ABORT("quactlize: MoE prepare %s: %s", weight->name, api.moe_error());
+            }
+            if (!plan.handle || plan.info.version != 1 || plan.info.size != sizeof(plan.info) ||
+                plan.info.workspace_bytes > SIZE_MAX || plan.info.route < 0 || plan.info.route > 2 ||
+                plan.info.split < 1 || plan.info.compute_type != 1 || plan.info.reserved || !plan.info.config[0] ||
+                !memchr(plan.info.config, '\0', sizeof(plan.info.config))) {
+                GGML_ABORT("quactlize: invalid MoE plan ABI for %s", weight->name);
+            }
+            state.moe_plans.emplace(key, plan);
+            GGML_LOG_INFO(
+                "[quactlize-moe] tensor=%s device=%d q=%d m=%d n=%d k=%d e=%d topk=%d channels=%d "
+                "route=%d policy=%d source_m=%d split=%d compute=%d prepare=%d/%d workspace=%" PRIu64 " config=%s\n",
+                weight->name, ctx->device, params.qtype, params.tokens, params.n, params.k, params.experts, params.topk,
+                params.channels, plan.info.route, plan.info.policy, plan.info.source_tokens, plan.info.split,
+                plan.info.compute_type, plan.info.prepare_algorithm, plan.info.prepare_helper,
+                plan.info.workspace_bytes, plan.info.config);
+            continue;
+        }
         quactlize_ppu_dense_params_v1 params{};
         GGML_ASSERT(dense_params(node, params));
         const dense_key key{params.m, params.input_stride, params.output_stride};
         if (state.plans.count(key)) {
             continue;
         }
-        cudaStreamCaptureStatus capture;
-        CUDA_CHECK(cudaStreamIsCapturing(cuda_ctx.stream(), &capture));
-        GGML_ASSERT(capture == cudaStreamCaptureStatusNone);
-        // Retire the one-time upload before capture; no event wait is inserted in replay.
-        if (!state.compute_ready) {
-            CUDA_CHECK(cudaEventSynchronize(state.ready));
-            state.compute_ready = true;
-        }
+        prepare_ready(cuda_ctx, state);
         const auto & api = library();
         if (!ctx->compute && (api.dense_create(ctx->device, &ctx->compute) || !ctx->compute)) {
             GGML_ABORT("quactlize: dense context: %s", api.dense_error());
@@ -698,6 +839,33 @@ void ggml_quactlize_mul_mat(ggml_backend_cuda_context & cuda_ctx, ggml_tensor * 
     if (api.dense_run(plan.handle, static_cast<const float *>(dst->src[1]->data), static_cast<float *>(dst->data),
                       workspace.get(), plan.info.workspace_bytes, cuda_ctx.stream())) {
         GGML_ABORT("quactlize: dense run %s: %s", dst->name, api.dense_error());
+    }
+}
+
+void ggml_quactlize_mul_mat_id(ggml_backend_cuda_context & cuda_ctx, ggml_tensor * dst) {
+    quactlize_ppu_moe_matmul_params_v1 params{};
+    GGML_ASSERT(ggml_quactlize_enabled() && moe_params(dst, params));
+    const auto * weight = weight_owner(dst->src[0]);
+    auto *       ctx    = static_cast<buffer_context *>(weight->buffer->context);
+    GGML_ASSERT(ctx->device == cuda_ctx.device);
+    moe_plan plan;
+    {
+        std::lock_guard<std::mutex> lock(ctx->compute_mutex);
+        const auto                  tensor = ctx->tensors.find(weight);
+        GGML_ASSERT(tensor != ctx->tensors.end() && tensor->second.compute_ready);
+        const auto found = tensor->second.moe_plans.find(key_for(params));
+        GGML_ASSERT(found != tensor->second.moe_plans.end());
+        plan = found->second;
+    }
+    ggml_cuda_pool_alloc<uint8_t> workspace(cuda_ctx.pool());
+    if (plan.info.workspace_bytes) {
+        workspace.alloc(plan.info.workspace_bytes);
+    }
+    const auto & api = library();
+    if (api.moe_run(plan.handle, static_cast<const float *>(dst->src[1]->data),
+                    static_cast<const int32_t *>(dst->src[2]->data), static_cast<float *>(dst->data), workspace.get(),
+                    plan.info.workspace_bytes, cuda_ctx.stream())) {
+        GGML_ABORT("quactlize: MoE run %s: %s", dst->name, api.moe_error());
     }
 }
 #endif

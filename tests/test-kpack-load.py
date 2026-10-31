@@ -24,7 +24,7 @@ def main():
     parser.add_argument('--reference', type=Path,
                         help='offline gguf_kpack.py; defaults to quactlize/gguf_kpack.py beside --binary')
     parser.add_argument('--binary', type=Path, required=True)
-    parser.add_argument('--compute', choices=('gemv', 'gemm', 'contract'),
+    parser.add_argument('--compute', choices=('gemv', 'gemm', 'contract', 'moe-gemv', 'moe-gemm'),
                         help='independent compute suite; needs no GGUF fixture, Python reference, numpy or torch')
     parser.add_argument('--cache-binary', type=Path, help='also test background persistence and cross-process hits')
     parser.add_argument('--library', type=Path, default=os.environ.get('QUACTLIZE_PPU_LIBRARY'),
@@ -72,6 +72,19 @@ def compute_points(suite, qtype):
 
 
 def check_compute_log(text, suite, qtype):
+    if suite.startswith('moe-'):
+        mode = suite.removeprefix('moe-')
+        ms = range(1, 9) if mode == 'gemv' else (9,16,32,64,128,256,512,1024,2048,4096,5120)
+        expected = {(m,ch) for m in ms for ch in (1,2)}
+        marker = f'KPACK_MOE PASS suite={mode} cases={len(expected)} formats=1 storage=F32 compute=BF16'
+        rows = re.findall(rf'^KPACK_MOE suite={mode} q={qtype} m=(\d+) channels=(\d+) '
+                          r'replays=4 streams=2 relative=(\S+) status=PASS$', text, re.MULTILINE)
+        if (text.count(marker) != 1 or len(rows) != len(expected) or
+                {(int(m),int(ch)) for m,ch,_ in rows} != expected or
+                any(not math.isfinite(float(e)) or not 0 <= float(e) < .02 for _,_,e in rows) or
+                text.count('[quactlize-moe]') != len(expected)):
+            raise RuntimeError('incomplete MoE numerical/plan coverage')
+        return
     points = compute_points(suite, qtype)
     marker = f'KPACK_DENSE PASS suite={suite} cases={len(points) or 1} formats=1 storage=F32 grouped=DISABLED'
     if text.count(marker) != 1:
@@ -81,7 +94,7 @@ def check_compute_log(text, suite, qtype):
                     'replays=3 weight_upload=NONE status=PASS')
         if text.count(tp_empty) != 1:
             raise RuntimeError('missing/duplicate TP empty-output checks')
-        if f'KPACK_DENSE_CONTRACT q={qtype} unaligned=REJECTED tail=ADMITTED grouped=REJECTED status=PASS' not in text:
+        if f'KPACK_DENSE_CONTRACT q={qtype} unaligned=REJECTED tail=ADMITTED grouped=ADMITTED status=PASS' not in text:
             raise RuntimeError('missing admission/rejection checks')
         for source in ('OWNER', 'ALIAS'):
             empty = (f'KPACK_DENSE_EMPTY q={qtype} source={source} graphs=2 replays=3 '
@@ -117,7 +130,7 @@ def print_compute_failure(log):
         print(f'KPACK_COMPUTE_DIAGNOSTIC log={log} unavailable={error}', flush=True)
         return
     print(f'KPACK_COMPUTE_DIAGNOSTIC_BEGIN log={log}', flush=True)
-    for marker in ('KPACK_DENSE_START', '[quactlize-dense]', 'KPACK_JIT_RESOLVE'):
+    for marker in ('KPACK_DENSE_START', 'KPACK_MOE_START', '[quactlize-dense]', '[quactlize-moe]', 'KPACK_JIT_RESOLVE'):
         last = next((line for line in reversed(lines) if marker in line), None)
         if last:
             print(f'last_context: {last}', flush=True)
@@ -139,7 +152,9 @@ def print_compute_failure(log):
 
 def run_compute_suite(args):
     env = os.environ | {'QUACTLIZE_PPU_LIBRARY': str(args.library.resolve()), 'GGML_QUACTLIZE': '1'}
-    command = [str(args.binary.resolve()), '-b', args.backend, '--dense', '--suite', args.compute]
+    moe = args.compute.startswith('moe-')
+    command = [str(args.binary.resolve()), '-b', args.backend, '--moe' if moe else '--dense',
+               '--suite', args.compute.removeprefix('moe-')]
     resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
     failures = []
 
@@ -152,7 +167,7 @@ def run_compute_suite(args):
                 for line in process.stdout:
                     out.write(line)
                     out.flush()
-                    if line.startswith(('KPACK_DENSE', 'KPACK_JIT')) or '[quactlize-dense]' in line:
+                    if line.startswith(('KPACK_DENSE', 'KPACK_MOE', 'KPACK_JIT')) or '[quactlize-' in line:
                         print(line, end='', flush=True)
                 rc = process.wait()
         text = log.read_text(errors='replace')
@@ -183,7 +198,6 @@ def run_compute_suite(args):
             print(f'KPACK_COMPUTE_FAIL case=default-enabled error={error} remaining_continue=1', flush=True)
             print_compute_failure(args.output / 'default-enabled.log')
         for name, extra, changes, marker in (
-            ('grouped-rejected', ['--reject-grouped'], {}, 'unsupported packed operation MUL_MAT_ID'),
             ('disabled', [], {'GGML_QUACTLIZE': '0'}, 'aligned shape was rejected'),
             ('invalid-switch', [], {'GGML_QUACTLIZE': 'invalid'}, 'GGML_QUACTLIZE must be 0 or 1'),
             ('missing-library', [], {'QUACTLIZE_PPU_LIBRARY': str(args.output / 'missing.so')}, 'Quactlize library is unavailable'),

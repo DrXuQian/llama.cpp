@@ -357,7 +357,7 @@ static void dense_fixture(const std::vector<float> & decoded,
     }
 }
 
-static bool test_kpack_dense(ggml_backend_t backend, const std::string & suite, int qtype, bool reject_grouped) {
+static bool test_kpack_dense(ggml_backend_t backend, const std::string & suite, int qtype) {
     auto require = [](bool ok, const char * message) {
         if (!ok) {
             throw std::runtime_error(message);
@@ -409,7 +409,7 @@ static bool test_kpack_dense(ggml_backend_t backend, const std::string & suite, 
                         "weight view selected K-pack");
                 auto * experts = ggml_new_tensor_3d(ctx.get(), type, 512, 256, 2);
                 require(!preferred(dev, experts, GGML_OP_MUL_MAT), "batched weight selected as dense");
-                for (auto op : {GGML_OP_MUL_MAT_ID, GGML_OP_GET_ROWS, GGML_OP_NONE}) {
+                for (auto op : {GGML_OP_GET_ROWS, GGML_OP_NONE}) {
                     require(!preferred(dev, weight, op), "non-dense consumer selected K-pack");
                 }
                 // Bind just the weight; unsupported graph nodes must be rejected before launch or allocation.
@@ -459,13 +459,12 @@ static bool test_kpack_dense(ggml_backend_t backend, const std::string & suite, 
                 auto * ids     = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_I32, 1, 3);
                 auto * indexed = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, 1024, 1, 3);
                 auto * grouped = ggml_mul_mat_id(ctx.get(), weight, indexed, ids);
-                require(!ggml_backend_supports_op(backend, grouped), "grouped operation admitted by dense MR");
-                if (reject_grouped) {
-                    auto * graph = ggml_new_graph(ctx.get());
-                    ggml_build_forward_expand(graph, grouped);
-                    ggml_backend_graph_compute(backend, graph);
-                    throw std::runtime_error("grouped packed forward did not abort");
-                }
+                require(ggml_backend_supports_op(backend, grouped), "indexed operation was rejected");
+                auto bad_ids = *ids;
+                bad_ids.nb[0] *= 2;
+                auto bad_grouped   = *grouped;
+                bad_grouped.src[2] = &bad_ids;
+                require(!ggml_backend_supports_op(backend, &bad_grouped), "strided ID slots admitted");
                 for (auto storage : {GGML_TYPE_F16, GGML_TYPE_BF16}) {
                     auto * narrow = ggml_new_tensor_2d(ctx.get(), storage, 1024, 3);
                     require(!ggml_backend_supports_op(backend, ggml_mul_mat(ctx.get(), weight, narrow)),
@@ -478,7 +477,7 @@ static bool test_kpack_dense(ggml_backend_t backend, const std::string & suite, 
                     auto * raw = ggml_new_tensor_2d(ctx.get(), unsupported, 512, 256);
                     require(!preferred(dev, raw, GGML_OP_MUL_MAT), "unsupported weight type selected K-pack");
                 }
-                printf("KPACK_DENSE_CONTRACT q=%d unaligned=REJECTED tail=ADMITTED grouped=REJECTED status=PASS\n",
+                printf("KPACK_DENSE_CONTRACT q=%d unaligned=REJECTED tail=ADMITTED grouped=ADMITTED status=PASS\n",
                        type);
                 ++cases;
                 continue;
@@ -495,7 +494,7 @@ static bool test_kpack_dense(ggml_backend_t backend, const std::string & suite, 
                 ggml_set_name(cached, "dense-cached");
                 auto * buft = preferred(dev, weight, GGML_OP_MUL_MAT);
                 require(buft == bufts[0], "default dense weight placement is not K-pack");
-                require(!preferred(dev, weight, GGML_OP_MUL_MAT_ID), "grouped weight was selected automatically");
+                require(preferred(dev, weight, GGML_OP_MUL_MAT_ID) == bufts[0], "indexed weight was not selected");
                 require(!preferred(dev, weight, GGML_OP_GET_ROWS), "embedding weight was selected automatically");
                 require(!preferred(dev, weight, GGML_OP_NONE),
                         "weight with no known consumer was selected automatically");
@@ -641,19 +640,139 @@ static bool test_kpack_dense(ggml_backend_t backend, const std::string & suite, 
     }
 }
 
+static bool test_kpack_moe(ggml_backend_t backend, const std::string & suite, int qtype) {
+    try {
+        auto * dev       = ggml_backend_get_device(backend);
+        auto * reg       = ggml_backend_dev_backend_reg(dev);
+        auto   preferred = reinterpret_cast<ggml_backend_dev_get_weight_buft_t>(
+            ggml_backend_reg_get_proc_address(reg, "ggml_backend_dev_get_weight_buft"));
+        auto read = reinterpret_cast<decltype(&ggml_quactlize_read_packed)>(
+            ggml_backend_reg_get_proc_address(reg, "ggml_quactlize_read_packed"));
+        dense_require(preferred && read, "MoE packed buffer API unavailable");
+        ggml_backend_ptr second(ggml_backend_dev_init(dev, nullptr));
+        dense_require(second != nullptr, "second MoE backend allocation failed");
+        ggml_backend_t backends[] = {backend, second.get()};
+        int            cases      = 0;
+        for (auto type :
+             {GGML_TYPE_Q8_0, GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K}) {
+            if (qtype != -1 && type != qtype) {
+                continue;
+            }
+            constexpr int    n = 256, k = 512, experts = 4, topk = 2;
+            ggml_context_ptr wc(ggml_init({ggml_tensor_overhead(), nullptr, true}));
+            auto *           weight = ggml_new_tensor_3d(wc.get(), type, k, n, experts);
+            ggml_set_name(weight, "moe-online");
+            auto * buft = preferred(dev, weight, GGML_OP_MUL_MAT_ID);
+            dense_require(buft && std::string(ggml_backend_buft_name(buft)).find("KPACK") != std::string::npos,
+                          "MoE automatic packed placement failed");
+            ggml_backend_buffer_ptr weights(ggml_backend_alloc_ctx_tensors_from_buft(wc.get(), buft));
+            dense_require(weights != nullptr, "MoE packed allocation failed");
+            std::vector<float> source(size_t(experts) * n * k), decoded(source.size());
+            for (size_t i = 0; i < source.size(); ++i) {
+                source[i] = float(int((i * 17 + i / k * 3 + i / (n * k) * 11) % 59) - 29) / 64.0f;
+            }
+            std::vector<uint8_t> raw(ggml_nbytes(weight)), packed(raw.size());
+            dense_require(
+                ggml_quantize_chunk(type, source.data(), raw.data(), 0, n * experts, k, nullptr) == raw.size(),
+                "MoE fixture quantization failed");
+            ggml_get_type_traits(type)->to_float(raw.data(), decoded.data(), int64_t(n) * k * experts);
+            ggml_backend_tensor_set(weight, raw.data(), 0, raw.size());
+            dense_require(read(weight, packed.data(), packed.size()), "MoE packed read failed");
+            const std::vector<int> ms = suite == "gemv" ?
+                                            std::vector<int>{1, 2, 3, 4, 5, 6, 7, 8} :
+                                            std::vector<int>{9, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 5120};
+            for (int m : ms) {
+                for (int channels : {1, topk}) {
+                    printf("KPACK_MOE_START suite=%s q=%d m=%d n=%d k=%d channels=%d\n", suite.c_str(), type, m, n, k,
+                           channels);
+                    fflush(stdout);
+                    ggml_context_ptr        contexts[2];
+                    ggml_backend_buffer_ptr buffers[2];
+                    ggml_tensor *           input[2], *ids[2], *output[2];
+                    ggml_cgraph *           graphs[2];
+                    for (int lane = 0; lane < 2; ++lane) {
+                        contexts[lane].reset(
+                            ggml_init({ggml_tensor_overhead() * 6 + ggml_graph_overhead(), nullptr, true}));
+                        auto * ctx   = contexts[lane].get();
+                        auto * w     = lane ? ggml_view_tensor(ctx, weight) : weight;
+                        input[lane]  = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, channels, m);
+                        ids[lane]    = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, topk, m);
+                        output[lane] = ggml_mul_mat_id(ctx, w, input[lane], ids[lane]);
+                        ggml_set_output(output[lane]);
+                        graphs[lane] = ggml_new_graph(ctx);
+                        ggml_build_forward_expand(graphs[lane], output[lane]);
+                        buffers[lane].reset(ggml_backend_alloc_ctx_tensors(ctx, backends[lane]));
+                        dense_require(buffers[lane] && ggml_backend_supports_op(backends[lane], output[lane]),
+                                      "MoE operation rejected");
+                    }
+                    double worst = 0;
+                    for (int replay = 0; replay < 4; ++replay) {
+                        std::vector<double> expected[2];
+                        for (int lane = 0; lane < 2; ++lane) {
+                            std::vector<float>   a(size_t(m) * channels * k, 0);
+                            std::vector<int32_t> routes(size_t(m) * topk);
+                            expected[lane].resize(size_t(m) * topk * n);
+                            const float amplitude = replay == 3 ? 262144.0f : (lane ? -1.0f : 1.0f);
+                            for (int token = 0; token < m; ++token) {
+                                for (int channel = 0; channel < channels; ++channel) {
+                                    const int j = (token * 31 + channel * 17 + replay * 13) % k;
+                                    a[(size_t(token) * channels + channel) * k + j] = amplitude;
+                                }
+                                for (int slot = 0; slot < topk; ++slot) {
+                                    const int expert                    = (token + slot + replay + lane) % experts;
+                                    routes[size_t(token) * topk + slot] = expert;
+                                    const int j = (token * 31 + (slot % channels) * 17 + replay * 13) % k;
+                                    for (int col = 0; col < n; ++col) {
+                                        expected[lane][(size_t(token) * topk + slot) * n + col] =
+                                            double(amplitude) * decoded[(size_t(expert) * n + col) * k + j];
+                                    }
+                                }
+                            }
+                            ggml_backend_tensor_set(input[lane], a.data(), 0, ggml_nbytes(input[lane]));
+                            ggml_backend_tensor_set(ids[lane], routes.data(), 0, ggml_nbytes(ids[lane]));
+                        }
+                        for (int lane = 0; lane < 2; ++lane) {
+                            dense_require(
+                                ggml_backend_graph_compute_async(backends[lane], graphs[lane]) == GGML_STATUS_SUCCESS,
+                                "MoE forward failed");
+                        }
+                        for (int lane = 0; lane < 2; ++lane) {
+                            ggml_backend_synchronize(backends[lane]);
+                            std::vector<float> got(expected[lane].size());
+                            ggml_backend_tensor_get(output[lane], got.data(), 0, ggml_nbytes(output[lane]));
+                            worst = std::max(worst, check_dense_output(got, expected[lane], n, m * topk, 1.0f));
+                        }
+                    }
+                    printf("KPACK_MOE suite=%s q=%d m=%d channels=%d replays=4 streams=2 relative=%.8g status=PASS\n",
+                           suite.c_str(), type, m, channels, worst);
+                    ++cases;
+                }
+            }
+            std::vector<uint8_t> unchanged(packed.size());
+            dense_require(read(weight, unchanged.data(), unchanged.size()) && unchanged == packed,
+                          "MoE modified packed weights");
+        }
+        const int formats = qtype == -1 ? 6 : 1;
+        dense_require(cases == formats * (suite == "gemv" ? 16 : 22), "incomplete MoE coverage");
+        printf("KPACK_MOE PASS suite=%s cases=%d formats=%d storage=F32 compute=BF16\n", suite.c_str(), cases, formats);
+        return true;
+    } catch (const std::exception & error) {
+        fprintf(stderr, "KPACK_MOE FAIL: %s\n", error.what());
+        return false;
+    }
+}
+
 static void usage(char ** argv) {
     printf("Usage: %s -b <backend> [--reject-forward] <reference.gguf>\n", argv[0]);
     printf("    --reject-forward additionally expects a load-only inference abort\n");
-    printf(
-        "       %s -b <backend> --dense [--suite gemv|gemm|contract] [--qtype 8|10|11|12|13|14] [--reject-grouped]\n",
-        argv[0]);
+    printf("       %s -b <backend> --dense|--moe [--suite gemv|gemm|contract] [--qtype 8|10|11|12|13|14]\n", argv[0]);
 }
 
 int main(int argc, char ** argv) {
     const char * backend_name   = nullptr;
     const char * fixture        = nullptr;
     bool         reject_forward = false;
-    bool         dense = false, reject_grouped = false;
+    bool         dense = false, moe = false;
     std::string  suite = "all";
     int          qtype = -1;
 
@@ -664,8 +783,8 @@ int main(int argc, char ** argv) {
             reject_forward = true;
         } else if (strcmp(argv[i], "--dense") == 0) {
             dense = true;
-        } else if (strcmp(argv[i], "--reject-grouped") == 0) {
-            reject_grouped = true;
+        } else if (strcmp(argv[i], "--moe") == 0) {
+            moe = true;
         } else if (strcmp(argv[i], "--suite") == 0 && i + 1 < argc) {
             suite = argv[++i];
         } else if (strcmp(argv[i], "--qtype") == 0 && i + 1 < argc) {
@@ -682,18 +801,15 @@ int main(int argc, char ** argv) {
             return 1;
         }
     }
-    if (!backend_name ||
-        (dense ? fixture || reject_forward : !fixture || reject_grouped || suite != "all" || qtype != -1) ||
+    if (!backend_name || (dense && moe) || (moe && suite != "gemv" && suite != "gemm") ||
+        ((dense || moe) ? fixture || reject_forward : !fixture || suite != "all" || qtype != -1) ||
         (suite != "all" && suite != "gemv" && suite != "gemm" && suite != "contract")) {
         usage(argv);
         return 1;
     }
 
-    if (!dense) {
+    if (!dense && !moe) {
         setenv("GGML_QUACTLIZE", "0", 1);
-    }
-    if (reject_grouped) {
-        suite = "contract";
     }
 
     ggml_backend_load_all();
@@ -704,7 +820,8 @@ int main(int argc, char ** argv) {
         return 1;
     }
     ggml_backend_ptr backend(ggml_backend_dev_init(dev, nullptr));
-    return backend && (dense ? test_kpack_dense(backend.get(), suite, qtype, reject_grouped) :
+    return backend && (moe   ? test_kpack_moe(backend.get(), suite, qtype) :
+                       dense ? test_kpack_dense(backend.get(), suite, qtype) :
                                test_kpack_load(backend.get(), fixture, reject_forward)) ?
                0 :
                1;
