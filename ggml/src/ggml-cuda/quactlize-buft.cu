@@ -424,8 +424,11 @@ void prepare_ffn(ggml_backend_cuda_context & cuda_ctx, const ggml_quactlize_ffn_
             !p.config[0] || !memchr(p.config, '\0', sizeof(p.config))) {
             GGML_ABORT("quactlize: invalid FFN projection ABI for %s stage=%d", owner->name, i);
         }
-        GGML_LOG_INFO("[quactlize-ffn-projection] tensor=%s stage=%d route=%d policy=%d split=%d compute=%d config=%s\n",
-                      owner->name, i, p.route, p.policy, p.split, p.compute_type, p.config);
+        const auto & w = i == 0 ? params.gate : i == 1 ? params.up : params.down;
+        GGML_LOG_INFO("[quactlize-ffn-projection] tensor=%s stage=%d device=%d kind=%d m=%d merged=%d "
+                      "q=%d n=%d k=%d experts=%d topk=%d route=%d policy=%d split=%d compute=%d config=%s\n",
+                      owner->name, i, ctx->device, params.kind, params.tokens, params.merged,
+                      w.qtype, w.n, w.k, w.experts, params.topk, p.route, p.policy, p.split, p.compute_type, p.config);
     }
     state.ffn_plans.emplace(key, plan);
     GGML_LOG_INFO("[quactlize-ffn] tensor=%s device=%d kind=%d m=%d merged=%d nodes=%d prepare=%d/%d finish=%d workspace=%" PRIu64 "\n",

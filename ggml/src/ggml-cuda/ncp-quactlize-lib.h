@@ -70,7 +70,7 @@ typedef struct {
 typedef struct {
     uint32_t version, size;
     uint64_t workspace_bytes;
-    // route: 0=FQ TC, 1=SF TC, 2=SIMT, 3=full dequant + BF16 GEMM.
+    // route: 0=FQ TC, 1=SF TC, 2=SIMT, 3=full dequant + GEMM (compute_type selects F16/BF16).
     // policy identifies the library's selector; compute_type: 0=F16, 1=BF16.
     int32_t  route, policy, split, compute_type;
     char     config[192];

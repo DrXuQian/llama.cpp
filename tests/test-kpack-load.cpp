@@ -925,86 +925,110 @@ static bool test_ffn_match() {
             if (!kind && topk != 1) {
                 continue;
             }
-            for (int merged : {0, 1, 2}) {
-                if (kind && merged == 2) {
-                    continue;
-                }
-                ggml_context_ptr ctx(ggml_init({2 * 1024 * 1024, nullptr, true}));
-                auto *           c     = ctx.get();
-                auto *           graph = ggml_new_graph_custom(c, 256, false);
-                constexpr int    k = 64, n = 128, m = 9;
-                auto *           input =
-                    kind ? ggml_new_tensor_3d(c, GGML_TYPE_F32, k, 1, m) : ggml_new_tensor_2d(c, GGML_TYPE_F32, k, m);
-                auto * ids        = kind ? ggml_new_tensor_2d(c, GGML_TYPE_I32, topk, m) : nullptr;
-                auto   projection = [&](ggml_tensor * a, int cols, int inner) {
-                    auto * w = ggml_new_tensor_3d(c, GGML_TYPE_F32, inner, cols, kind ? 32 : 1);
-                    return kind ? ggml_mul_mat_id(c, w, a, ids) : ggml_mul_mat(c, w, a);
-                };
-                auto *        gate = projection(input, merged ? 2 * n : n, k);
-                ggml_tensor * glu;
-                if (!merged) {
-                    auto * up = projection(input, n, k);
-                    glu       = ggml_swiglu_split(c, gate, up);
-                } else if (merged == 1) {
-                    auto * g = ggml_view_3d(c, gate, n, gate->ne[1], gate->ne[2], gate->nb[1], gate->nb[2], 0);
-                    auto * u =
-                        ggml_view_3d(c, gate, n, gate->ne[1], gate->ne[2], gate->nb[1], gate->nb[2], n * sizeof(float));
-                    glu = ggml_swiglu_split(c, g, u);
-                } else {
-                    glu = ggml_swiglu(c, gate);
-                }
-                auto * down   = projection(glu, k, n);
-                auto * output = down;
-                if (kind) {
-                    auto * weights  = ggml_new_tensor_3d(c, GGML_TYPE_F32, 1, topk, m);
-                    auto * weighted = ggml_mul(c, down, weights);
-                    ggml_build_forward_expand(graph, weighted);
-                    std::vector<ggml_tensor *> views;
-                    for (int slot = 0; slot < topk; ++slot) {
-                        views.push_back(ggml_view_2d(c, weighted, k, m, weighted->nb[2], slot * weighted->nb[1]));
-                        ggml_build_forward_expand(graph, views.back());
-                    }
-                    output = views[0];
-                    for (int slot = 1; slot < topk; ++slot) {
-                        output = ggml_add(c, output, views[slot]);
-                        ggml_build_forward_expand(graph, output);
-                    }
-                    if (topk == 1) {
-                        output = ggml_cont(c, output);
+
+            struct shape {
+                int k, n, m;
+            };
+
+            std::vector<shape> shapes{{64, 128, 9}};
+            if (!kind || topk == 8) {
+                for (int m : {1, 2, 3, 4, 5, 6, 7, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 5120}) {
+                    if (kind) {
+                        shapes.push_back({2048, 512, m});
+                        shapes.push_back({3072, 512, m});
+                    } else {
+                        shapes.push_back({5120, 17408, m});
+                        shapes.push_back({5120, 25600, m});
                     }
                 }
-                ggml_set_output(output);
-                ggml_build_forward_expand(graph, output);
-                int start = 0;
-                while (start < graph->n_nodes && graph->nodes[start] != gate) {
-                    ++start;
+            }
+            for (const auto & shape : shapes) {
+                for (int merged : {0, 1, 2}) {
+                    if (kind && merged == 2) {
+                        continue;
+                    }
+                    ggml_context_ptr ctx(ggml_init({2 * 1024 * 1024, nullptr, true}));
+                    auto *           c     = ctx.get();
+                    auto *           graph = ggml_new_graph_custom(c, 256, false);
+                    const int        k = shape.k, n = shape.n, m = shape.m;
+                    auto *           input      = kind ? ggml_new_tensor_3d(c, GGML_TYPE_F32, k, 1, m) :
+                                                         ggml_new_tensor_2d(c, GGML_TYPE_F32, k, m);
+                    auto *           ids        = kind ? ggml_new_tensor_2d(c, GGML_TYPE_I32, topk, m) : nullptr;
+                    auto             projection = [&](ggml_tensor * a, int cols, int inner) {
+                        auto * w = ggml_new_tensor_3d(c, GGML_TYPE_F32, inner, cols, kind ? 32 : 1);
+                        return kind ? ggml_mul_mat_id(c, w, a, ids) : ggml_mul_mat(c, w, a);
+                    };
+                    auto *        gate = projection(input, merged ? 2 * n : n, k);
+                    ggml_tensor * glu;
+                    if (!merged) {
+                        auto * up = projection(input, n, k);
+                        glu       = ggml_swiglu_split(c, gate, up);
+                    } else if (merged == 1) {
+                        auto * g = ggml_view_3d(c, gate, n, gate->ne[1], gate->ne[2], gate->nb[1], gate->nb[2], 0);
+                        auto * u = ggml_view_3d(c, gate, n, gate->ne[1], gate->ne[2], gate->nb[1], gate->nb[2],
+                                                n * sizeof(float));
+                        glu      = ggml_swiglu_split(c, g, u);
+                    } else {
+                        glu = ggml_swiglu(c, gate);
+                    }
+                    auto * down   = projection(glu, k, n);
+                    auto * output = down;
+                    if (kind) {
+                        auto * weights  = ggml_new_tensor_3d(c, GGML_TYPE_F32, 1, topk, m);
+                        auto * weighted = ggml_mul(c, down, weights);
+                        ggml_build_forward_expand(graph, weighted);
+                        std::vector<ggml_tensor *> views;
+                        for (int slot = 0; slot < topk; ++slot) {
+                            views.push_back(ggml_view_2d(c, weighted, k, m, weighted->nb[2], slot * weighted->nb[1]));
+                            ggml_build_forward_expand(graph, views.back());
+                        }
+                        output = views[0];
+                        for (int slot = 1; slot < topk; ++slot) {
+                            output = ggml_add(c, output, views[slot]);
+                            ggml_build_forward_expand(graph, output);
+                        }
+                        if (topk == 1) {
+                            output = ggml_cont(c, output);
+                        }
+                    }
+                    ggml_set_output(output);
+                    ggml_build_forward_expand(graph, output);
+                    int start = 0;
+                    while (start < graph->n_nodes && graph->nodes[start] != gate) {
+                        ++start;
+                    }
+                    auto match = ggml_quactlize_match_ffn(graph, start);
+                    dense_require(match.count == graph->n_nodes - start && match.gate == gate && match.down == down &&
+                                      match.output == output && bool(match.up) == !merged,
+                                  "FFN supported graph was not matched");
+                    ggml_set_output(glu);
+                    dense_require(!ggml_quactlize_match_ffn(graph, start).count,
+                                  "FFN hides an observable intermediate");
+                    glu->flags &= ~GGML_TENSOR_FLAG_OUTPUT;
+                    auto * saved = down->src[1];
+                    down->src[1] = ggml_cont(c, saved);
+                    dense_require(!ggml_quactlize_match_ffn(graph, start).count,
+                                  "FFN crossed an intermediate operator");
+                    down->src[1] = saved;
+                    const int op = ggml_get_op_params_i32(glu, 0);
+                    ggml_set_op_params_i32(glu, 0, GGML_GLU_OP_GEGLU);
+                    dense_require(!ggml_quactlize_match_ffn(graph, start).count, "FFN accepted another activation");
+                    ggml_set_op_params_i32(glu, 0, op);
+                    if (kind) {
+                        auto * saved_ids = down->src[2];
+                        down->src[2]     = ggml_new_tensor_2d(c, GGML_TYPE_I32, topk, m);
+                        dense_require(!ggml_quactlize_match_ffn(graph, start).count,
+                                      "FFN accepted different routing IDs");
+                        down->src[2] = saved_ids;
+                    }
+                    dense_require(ggml_quactlize_match_ffn(graph, start).count == match.count,
+                                  "FFN graph restore differs");
+                    ++cases;
                 }
-                auto match = ggml_quactlize_match_ffn(graph, start);
-                dense_require(match.count == graph->n_nodes - start && match.gate == gate && match.down == down &&
-                                  match.output == output && bool(match.up) == !merged,
-                              "FFN supported graph was not matched");
-                ggml_set_output(glu);
-                dense_require(!ggml_quactlize_match_ffn(graph, start).count, "FFN hides an observable intermediate");
-                glu->flags &= ~GGML_TENSOR_FLAG_OUTPUT;
-                auto * saved = down->src[1];
-                down->src[1] = ggml_cont(c, saved);
-                dense_require(!ggml_quactlize_match_ffn(graph, start).count, "FFN crossed an intermediate operator");
-                down->src[1] = saved;
-                const int op = ggml_get_op_params_i32(glu, 0);
-                ggml_set_op_params_i32(glu, 0, GGML_GLU_OP_GEGLU);
-                dense_require(!ggml_quactlize_match_ffn(graph, start).count, "FFN accepted another activation");
-                ggml_set_op_params_i32(glu, 0, op);
-                if (kind) {
-                    auto * saved_ids = down->src[2];
-                    down->src[2]     = ggml_new_tensor_2d(c, GGML_TYPE_I32, topk, m);
-                    dense_require(!ggml_quactlize_match_ffn(graph, start).count, "FFN accepted different routing IDs");
-                    down->src[2] = saved_ids;
-                }
-                dense_require(ggml_quactlize_match_ffn(graph, start).count == match.count, "FFN graph restore differs");
-                ++cases;
             }
         }
     }
+    dense_require(cases == 193, "incomplete FFN matcher shape coverage");
     dense_require(!ggml_quactlize_match_ffn(nullptr, 0).count, "FFN accepted a null graph");
     printf("KPACK_FFN_MATCH PASS cases=%d scope=HOST_GRAPH_ONLY\n", cases);
     return true;

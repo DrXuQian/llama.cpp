@@ -83,6 +83,17 @@ def check_compute_log(text, suite, qtype):
                 len(plans) != len(expected) or {(int(k),int(g),int(m)) for k,m,g in plans} != expected or
                 any(not math.isfinite(float(r[3])) or not 0 <= float(r[3]) < .02 for r in rows)):
             raise RuntimeError('incomplete FFN numerical/actual fusion coverage')
+        projections = re.findall(
+            rf'\[quactlize-ffn-projection\] tensor=ffn-test-gate stage=([012]) device=\d+ kind=([01]) '
+            rf'm=(\d+) merged=([01]) q={qtype} n=(\d+) k=(\d+) experts=(\d+) topk=(\d+) '
+            r'route=\d+ policy=\d+ split=\d+ compute=([01]) config=\S+', text)
+        wanted = {(stage, kind, m, merged, 1024 if merged and stage == 0 else 512,
+                   512, 4 if kind else 1, 2 if kind else 1, kind)
+                  for kind, merged, m in expected for stage in (0, 2) if merged}
+        wanted |= {(stage, kind, m, merged, 512, 512, 4 if kind else 1, 2 if kind else 1, kind)
+                   for kind, merged, m in expected for stage in (0, 1, 2) if not merged}
+        if len(projections) != len(wanted) or {tuple(map(int, p)) for p in projections} != wanted:
+            raise RuntimeError('FFN projection shape/dtype coverage differs; inspect quactlize-ffn-projection logs')
         return
     if suite.startswith('moe-'):
         mode = suite.removeprefix('moe-')
