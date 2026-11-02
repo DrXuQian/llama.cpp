@@ -517,12 +517,76 @@ static void test_tp_sidecars(fixture & f) {
     printf("KPACK_TP_SIDECAR PASS cases=%zu cross_topology=MISS rank4=PASS\n", cases);
 }
 
+static void test_paired_sidecar(fixture & f) {
+    std::string    error;
+    auto           first     = f.jobs[0];
+    auto &         source    = first.source;
+    const uint64_t half      = source.size_bytes / 2;
+    source.name              = "blk.0.ffn_gate_up.weight";
+    source.gguf_index        = 1;
+    source.parts             = {{"blk.0.ffn_gate.weight", 3, source.data_offset + half + 4096, half},
+                                {"blk.0.ffn_up.weight", 1, source.data_offset, half}};
+    auto second              = f.jobs[2];
+    second.source.gguf_index = 4;
+    const std::vector<llama_kpack_source_tensor> inventory = {source, second.source};
+    const auto                                   directory = f.root / "paired";
+    llama_kpack_background_writer                writer;
+    check(writer.prepare(directory.u8string(), f.source.u8string(), error), error);
+    check(writer.start({first, second}, inventory, 4096, error) && writer.wait(error), error);
+    llama_kpack_sidecar_reader reader;
+    check(reader.open(directory.u8string(), error) && reader.load_unchecked(f.source.u8string(), inventory, error),
+          error);
+    check(reader.find(source.name) && reader.find(source.name)->source.parts == source.parts,
+          "paired source identity lost");
+    auto changed = inventory;
+    std::swap(changed[0].parts[0], changed[0].parts[1]);
+    check(!reader.load_unchecked(f.source.u8string(), changed, error), "swapped gate/up sources accepted");
+    changed = inventory;
+    changed[0].parts[0].data_offset += 1;
+    check(!reader.load_unchecked(f.source.u8string(), changed, error), "different gate range accepted");
+    const json manifest = json::parse(std::ifstream(directory / "manifest.json"));
+    check(manifest["schema_version"] == 4, "paired cache schema differs");
+    for (const std::string fault : {"overlap", "index", "count", "size", "bounds", "version"}) {
+        auto   bad   = manifest;
+        auto & parts = bad["tensors"][0]["source_tensor"]["parts"];
+        if (fault == "overlap") {
+            parts[0]["data_offset"] = parts[1]["data_offset"];
+        }
+        if (fault == "index") {
+            parts[0]["index"] = parts[1]["index"];
+        }
+        if (fault == "count") {
+            parts.erase(0);
+        }
+        if (fault == "size") {
+            parts[0]["size_bytes"] = half - 1;
+        }
+        if (fault == "bounds") {
+            parts[0]["data_offset"] = fs::file_size(f.source);
+        }
+        if (fault == "version") {
+            bad["schema_version"] = 3;
+        }
+        const auto target = f.root / ("paired-" + fault);
+        fs::create_directory(target);
+        fs::copy_file(directory / "weights.bin", target / "weights.bin");
+        {
+            std::ofstream out(target / "manifest.json");
+            out << bad.dump();
+        }
+        llama_kpack_sidecar_reader rejected;
+        check(!rejected.open(target.u8string(), error), "invalid paired cache accepted: " + fault);
+    }
+    puts("KPACK_PAIRED_SIDECAR PASS noncontiguous=PASS swapped=REJECTED invalid_ranges=REJECTED");
+}
+
 int main() try {
     fixture     f;
     std::string error;
     test_cache_directory(f);
     test_tp_raw_splits();
     test_tp_sidecars(f);
+    test_paired_sidecar(f);
     test_prefetch_coverage();
 #ifdef LLAMA_KPACK_TEST_FSYNC
     test_sync(f);

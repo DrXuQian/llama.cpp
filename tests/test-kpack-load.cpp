@@ -8,6 +8,7 @@
 #include "gguf.h"
 
 #include "../ggml/src/ggml-cuda/quactlize-buft.cuh"
+#include "../ggml/src/ggml-cuda/quactlize-ffn.cuh"
 
 #include <nlohmann/json.hpp>
 
@@ -762,17 +763,273 @@ static bool test_kpack_moe(ggml_backend_t backend, const std::string & suite, in
     }
 }
 
+static bool test_kpack_ffn(ggml_backend_t backend, int qtype) {
+    try {
+        auto * dev       = ggml_backend_get_device(backend);
+        auto * reg       = ggml_backend_dev_backend_reg(dev);
+        auto   preferred = reinterpret_cast<ggml_backend_dev_get_weight_buft_t>(
+            ggml_backend_reg_get_proc_address(reg, "ggml_backend_dev_get_weight_buft"));
+        dense_require(preferred != nullptr, "FFN packed buffer API unavailable");
+        ggml_backend_ptr control(ggml_backend_dev_init(dev, nullptr));
+        dense_require(control != nullptr, "FFN control backend allocation failed");
+        ggml_backend_t backends[] = {backend, control.get()};
+        int            cases      = 0;
+        for (auto type :
+             {GGML_TYPE_Q8_0, GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K}) {
+            if (qtype != -1 && type != qtype) {
+                continue;
+            }
+            for (int kind : {0, 1}) {
+                for (int merged : {0, 1}) {
+                    const int        k = 512, n = 512, experts = kind ? 4 : 1, topk = kind ? 2 : 1;
+                    ggml_context_ptr wc(ggml_init({ggml_tensor_overhead() * 3, nullptr, true}));
+                    auto *           wg = ggml_new_tensor_3d(wc.get(), type, k, n * (merged ? 2 : 1), experts);
+                    auto *           wu = merged ? nullptr : ggml_new_tensor_3d(wc.get(), type, k, n, experts);
+                    auto *           wd = ggml_new_tensor_3d(wc.get(), type, n, k, experts);
+                    ggml_set_name(wg, "ffn-test-gate");
+                    if (wu) {
+                        ggml_set_name(wu, "ffn-test-up");
+                    }
+                    ggml_set_name(wd, "ffn-test-down");
+                    auto * buft = preferred(dev, wg, kind ? GGML_OP_MUL_MAT_ID : GGML_OP_MUL_MAT);
+                    dense_require(buft != nullptr, "FFN automatic packed placement failed");
+                    ggml_backend_buffer_ptr weights(ggml_backend_alloc_ctx_tensors_from_buft(wc.get(), buft));
+                    dense_require(weights != nullptr, "FFN weight allocation failed");
+                    int stage = 0;
+                    for (auto * w : {wg, wu, wd}) {
+                        if (!w) {
+                            continue;
+                        }
+                        std::vector<float> source(ggml_nelements(w));
+                        for (size_t j = 0; j < source.size(); ++j) {
+                            source[j] = float(int((j * 17 + j / k * 3 + stage * 7) % 59) - 29) / 256.0f;
+                        }
+                        std::vector<uint8_t> raw(ggml_nbytes(w));
+                        dense_require(ggml_quantize_chunk(type, source.data(), raw.data(), 0, ggml_nrows(w), w->ne[0],
+                                                          nullptr) == raw.size(),
+                                      "FFN fixture quantization failed");
+                        if (w == wg && merged) {
+                            // Same strided upload as two independent GGUF source tensors.
+                            const size_t width = raw.size() / (2 * experts);
+                            for (int side = 0; side < 2; ++side) {
+                                std::vector<uint8_t> part(width * experts);
+                                for (int e = 0; e < experts; ++e) {
+                                    memcpy(part.data() + e * width, raw.data() + (2 * e + side) * width, width);
+                                }
+                                ggml_backend_tensor_set_2d(w, part.data(), side * width, width, experts, 2 * width,
+                                                           width);
+                            }
+                        } else {
+                            ggml_backend_tensor_set(w, raw.data(), 0, raw.size());
+                        }
+                        ++stage;
+                    }
+                    for (int m : {1, 3, 8, 16, 128}) {
+                        printf("KPACK_FFN_START q=%d kind=%d merged=%d m=%d\n", type, kind, merged, m);
+                        fflush(stdout);
+                        ggml_context_ptr        contexts[2];
+                        ggml_backend_buffer_ptr buffers[2];
+                        ggml_tensor *           input[2], *ids[2], *routing[2], *output[2];
+                        ggml_cgraph *           graphs[2];
+                        for (int lane = 0; lane < 2; ++lane) {
+                            contexts[lane].reset(
+                                ggml_init({ggml_tensor_overhead() * 32 + ggml_graph_overhead(), nullptr, true}));
+                            auto * c      = contexts[lane].get();
+                            input[lane]   = kind ? ggml_new_tensor_3d(c, GGML_TYPE_F32, k, 1, m) :
+                                                   ggml_new_tensor_2d(c, GGML_TYPE_F32, k, m);
+                            ids[lane]     = kind ? ggml_new_tensor_2d(c, GGML_TYPE_I32, topk, m) : nullptr;
+                            routing[lane] = kind ? ggml_new_tensor_3d(c, GGML_TYPE_F32, 1, topk, m) : nullptr;
+                            auto project  = [&](ggml_tensor * w, ggml_tensor * a) {
+                                return kind ? ggml_mul_mat_id(c, w, a, ids[lane]) : ggml_mul_mat(c, w, a);
+                            };
+                            auto * gate = project(wg, input[lane]);
+                            auto * up   = merged ? nullptr : project(wu, input[lane]);
+                            auto * glu  = merged ? ggml_swiglu(c, gate) : ggml_swiglu_split(c, gate, up);
+                            auto * down = project(wd, glu);
+                            if (lane) {
+                                // Observable intermediates force independent projections.
+                                ggml_set_output(gate);
+                                if (up) {
+                                    ggml_set_output(up);
+                                }
+                                ggml_set_output(glu);
+                                ggml_set_output(down);
+                            }
+                            auto * result = down;
+                            if (kind) {
+                                auto * weighted = ggml_mul(c, down, routing[lane]);
+                                auto * first    = ggml_view_2d(c, weighted, k, m, weighted->nb[2], 0);
+                                auto * second   = ggml_view_2d(c, weighted, k, m, weighted->nb[2], weighted->nb[1]);
+                                result          = ggml_add(c, first, second);
+                            }
+                            output[lane] = result;
+                            ggml_set_output(result);
+                            graphs[lane] = ggml_new_graph(c);
+                            ggml_build_forward_expand(graphs[lane], result);
+                            buffers[lane].reset(ggml_backend_alloc_ctx_tensors(c, backends[lane]));
+                            dense_require(buffers[lane] != nullptr, "FFN graph allocation failed");
+                        }
+                        double worst = 0;
+                        for (int replay = 0; replay < 4; ++replay) {
+                            std::vector<float>   a(size_t(m) * k), router(size_t(m) * topk);
+                            std::vector<int32_t> routes(router.size());
+                            for (size_t j = 0; j < a.size(); ++j) {
+                                a[j] = float(int((j * 11 + replay * 13) % 37) - 18) / 256.0f;
+                            }
+                            for (size_t j = 0; j < router.size(); ++j) {
+                                router[j] = .25f + float((j + replay) % 3) / 8;
+                                routes[j] = int(j + replay) % experts;
+                            }
+                            for (int lane = 0; lane < 2; ++lane) {
+                                ggml_backend_tensor_set(input[lane], a.data(), 0, a.size() * sizeof(float));
+                                if (kind) {
+                                    ggml_backend_tensor_set(ids[lane], routes.data(), 0,
+                                                            routes.size() * sizeof(int32_t));
+                                    ggml_backend_tensor_set(routing[lane], router.data(), 0,
+                                                            router.size() * sizeof(float));
+                                }
+                                dense_require(ggml_backend_graph_compute_async(backends[lane], graphs[lane]) ==
+                                                  GGML_STATUS_SUCCESS,
+                                              "FFN forward failed");
+                            }
+                            std::vector<float> values[2];
+                            for (int lane = 0; lane < 2; ++lane) {
+                                ggml_backend_synchronize(backends[lane]);
+                                values[lane].resize(size_t(m) * k);
+                                ggml_backend_tensor_get(output[lane], values[lane].data(), 0,
+                                                        values[lane].size() * sizeof(float));
+                            }
+                            std::vector<double> expected(values[1].begin(), values[1].end());
+                            worst = std::max(worst, check_dense_output(values[0], expected, k, m, 1.0f));
+                        }
+                        printf("KPACK_FFN q=%d kind=%d merged=%d m=%d replays=4 relative=%.8g status=PASS\n", type,
+                               kind, merged, m, worst);
+                        ++cases;
+                    }
+                }
+            }
+        }
+        dense_require(cases == (qtype == -1 ? 120 : 20), "incomplete FFN coverage");
+        printf("KPACK_FFN PASS cases=%d scope=FUSED_VS_INDEPENDENT_GRAPH\n", cases);
+        return true;
+    } catch (const std::exception & error) {
+        fprintf(stderr, "KPACK_FFN FAIL: %s\n", error.what());
+        return false;
+    }
+}
+
+static bool test_ffn_match() {
+    int cases = 0;
+    for (int kind : {0, 1}) {
+        for (int topk : {1, 2, 8, 16, 32}) {
+            if (!kind && topk != 1) {
+                continue;
+            }
+            for (int merged : {0, 1, 2}) {
+                if (kind && merged == 2) {
+                    continue;
+                }
+                ggml_context_ptr ctx(ggml_init({2 * 1024 * 1024, nullptr, true}));
+                auto *           c     = ctx.get();
+                auto *           graph = ggml_new_graph_custom(c, 256, false);
+                constexpr int    k = 64, n = 128, m = 9;
+                auto *           input =
+                    kind ? ggml_new_tensor_3d(c, GGML_TYPE_F32, k, 1, m) : ggml_new_tensor_2d(c, GGML_TYPE_F32, k, m);
+                auto * ids        = kind ? ggml_new_tensor_2d(c, GGML_TYPE_I32, topk, m) : nullptr;
+                auto   projection = [&](ggml_tensor * a, int cols, int inner) {
+                    auto * w = ggml_new_tensor_3d(c, GGML_TYPE_F32, inner, cols, kind ? 32 : 1);
+                    return kind ? ggml_mul_mat_id(c, w, a, ids) : ggml_mul_mat(c, w, a);
+                };
+                auto *        gate = projection(input, merged ? 2 * n : n, k);
+                ggml_tensor * glu;
+                if (!merged) {
+                    auto * up = projection(input, n, k);
+                    glu       = ggml_swiglu_split(c, gate, up);
+                } else if (merged == 1) {
+                    auto * g = ggml_view_3d(c, gate, n, gate->ne[1], gate->ne[2], gate->nb[1], gate->nb[2], 0);
+                    auto * u =
+                        ggml_view_3d(c, gate, n, gate->ne[1], gate->ne[2], gate->nb[1], gate->nb[2], n * sizeof(float));
+                    glu = ggml_swiglu_split(c, g, u);
+                } else {
+                    glu = ggml_swiglu(c, gate);
+                }
+                auto * down   = projection(glu, k, n);
+                auto * output = down;
+                if (kind) {
+                    auto * weights  = ggml_new_tensor_3d(c, GGML_TYPE_F32, 1, topk, m);
+                    auto * weighted = ggml_mul(c, down, weights);
+                    ggml_build_forward_expand(graph, weighted);
+                    std::vector<ggml_tensor *> views;
+                    for (int slot = 0; slot < topk; ++slot) {
+                        views.push_back(ggml_view_2d(c, weighted, k, m, weighted->nb[2], slot * weighted->nb[1]));
+                        ggml_build_forward_expand(graph, views.back());
+                    }
+                    output = views[0];
+                    for (int slot = 1; slot < topk; ++slot) {
+                        output = ggml_add(c, output, views[slot]);
+                        ggml_build_forward_expand(graph, output);
+                    }
+                    if (topk == 1) {
+                        output = ggml_cont(c, output);
+                    }
+                }
+                ggml_set_output(output);
+                ggml_build_forward_expand(graph, output);
+                int start = 0;
+                while (start < graph->n_nodes && graph->nodes[start] != gate) {
+                    ++start;
+                }
+                auto match = ggml_quactlize_match_ffn(graph, start);
+                dense_require(match.count == graph->n_nodes - start && match.gate == gate && match.down == down &&
+                                  match.output == output && bool(match.up) == !merged,
+                              "FFN supported graph was not matched");
+                ggml_set_output(glu);
+                dense_require(!ggml_quactlize_match_ffn(graph, start).count, "FFN hides an observable intermediate");
+                glu->flags &= ~GGML_TENSOR_FLAG_OUTPUT;
+                auto * saved = down->src[1];
+                down->src[1] = ggml_cont(c, saved);
+                dense_require(!ggml_quactlize_match_ffn(graph, start).count, "FFN crossed an intermediate operator");
+                down->src[1] = saved;
+                const int op = ggml_get_op_params_i32(glu, 0);
+                ggml_set_op_params_i32(glu, 0, GGML_GLU_OP_GEGLU);
+                dense_require(!ggml_quactlize_match_ffn(graph, start).count, "FFN accepted another activation");
+                ggml_set_op_params_i32(glu, 0, op);
+                if (kind) {
+                    auto * saved_ids = down->src[2];
+                    down->src[2]     = ggml_new_tensor_2d(c, GGML_TYPE_I32, topk, m);
+                    dense_require(!ggml_quactlize_match_ffn(graph, start).count, "FFN accepted different routing IDs");
+                    down->src[2] = saved_ids;
+                }
+                dense_require(ggml_quactlize_match_ffn(graph, start).count == match.count, "FFN graph restore differs");
+                ++cases;
+            }
+        }
+    }
+    dense_require(!ggml_quactlize_match_ffn(nullptr, 0).count, "FFN accepted a null graph");
+    printf("KPACK_FFN_MATCH PASS cases=%d scope=HOST_GRAPH_ONLY\n", cases);
+    return true;
+}
+
 static void usage(char ** argv) {
     printf("Usage: %s -b <backend> [--reject-forward] <reference.gguf>\n", argv[0]);
     printf("    --reject-forward additionally expects a load-only inference abort\n");
-    printf("       %s -b <backend> --dense|--moe [--suite gemv|gemm|contract] [--qtype 8|10|11|12|13|14]\n", argv[0]);
+    printf("       %s -b <backend> --dense|--moe|--ffn [--suite gemv|gemm|contract] [--qtype 8|10|11|12|13|14]\n",
+           argv[0]);
 }
 
 int main(int argc, char ** argv) {
+    if (argc == 2 && !strcmp(argv[1], "--ffn-match")) {
+        try {
+            return test_ffn_match() ? 0 : 1;
+        } catch (const std::exception & e) {
+            fprintf(stderr, "KPACK_FFN_MATCH FAIL: %s\n", e.what());
+            return 1;
+        }
+    }
     const char * backend_name   = nullptr;
     const char * fixture        = nullptr;
     bool         reject_forward = false;
-    bool         dense = false, moe = false;
+    bool         dense = false, moe = false, ffn = false;
     std::string  suite = "all";
     int          qtype = -1;
 
@@ -785,6 +1042,8 @@ int main(int argc, char ** argv) {
             dense = true;
         } else if (strcmp(argv[i], "--moe") == 0) {
             moe = true;
+        } else if (strcmp(argv[i], "--ffn") == 0) {
+            ffn = true;
         } else if (strcmp(argv[i], "--suite") == 0 && i + 1 < argc) {
             suite = argv[++i];
         } else if (strcmp(argv[i], "--qtype") == 0 && i + 1 < argc) {
@@ -801,14 +1060,15 @@ int main(int argc, char ** argv) {
             return 1;
         }
     }
-    if (!backend_name || (dense && moe) || (moe && suite != "gemv" && suite != "gemm") ||
-        ((dense || moe) ? fixture || reject_forward : !fixture || suite != "all" || qtype != -1) ||
+    if (!backend_name || int(dense) + int(moe) + int(ffn) > 1 || (ffn && suite != "all") ||
+        (moe && suite != "gemv" && suite != "gemm") ||
+        ((dense || moe || ffn) ? fixture || reject_forward : !fixture || suite != "all" || qtype != -1) ||
         (suite != "all" && suite != "gemv" && suite != "gemm" && suite != "contract")) {
         usage(argv);
         return 1;
     }
 
-    if (!dense && !moe) {
+    if (!dense && !moe && !ffn) {
         setenv("GGML_QUACTLIZE", "0", 1);
     }
 
@@ -820,7 +1080,8 @@ int main(int argc, char ** argv) {
         return 1;
     }
     ggml_backend_ptr backend(ggml_backend_dev_init(dev, nullptr));
-    return backend && (moe   ? test_kpack_moe(backend.get(), suite, qtype) :
+    return backend && (ffn   ? test_kpack_ffn(backend.get(), qtype) :
+                       moe   ? test_kpack_moe(backend.get(), suite, qtype) :
                        dense ? test_kpack_dense(backend.get(), suite, qtype) :
                                test_kpack_load(backend.get(), fixture, reject_forward)) ?
                0 :

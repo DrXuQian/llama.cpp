@@ -310,12 +310,14 @@ set_tests_properties(test-kpack-sidecar PROPERTIES LABELS "kpack" TIMEOUT 60)
 if (GGML_NCP_QUACTLIZE)
     llama_build(test-kpack-load.cpp)
     llama_build(test-kpack-cache.cpp)
+    add_test(NAME test-kpack-ffn-match COMMAND test-kpack-load --ffn-match)
+    set_tests_properties(test-kpack-ffn-match PROPERTIES LABELS "kpack" TIMEOUT 30)
     find_package(Python3 REQUIRED COMPONENTS Interpreter)
     add_test(NAME test-kpack-load
         COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/test-kpack-load.py"
             --binary $<TARGET_FILE:test-kpack-load> --cache-binary $<TARGET_FILE:test-kpack-cache>)
     set_tests_properties(test-kpack-load PROPERTIES LABELS "ppu;kpack" TIMEOUT 600 RUN_SERIAL TRUE)
-    foreach(suite gemv gemm contract moe-gemv moe-gemm)
+    foreach(suite gemv gemm contract moe-gemv moe-gemm ffn)
         add_test(NAME test-kpack-${suite}
             COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/test-kpack-load.py"
                 --binary $<TARGET_FILE:test-kpack-load> --compute ${suite})

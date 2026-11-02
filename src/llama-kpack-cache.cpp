@@ -240,6 +240,19 @@ std::vector<resident_shard> resident_shards(ggml_tensor * tensor) {
 
 }  // namespace
 
+bool llama_kpack_buffer_type(ggml_backend_buffer_type_t buft) {
+    const size_t count = ggml_backend_meta_buffer_type_count(buft);
+    if (!count) {
+        return api_for(buft).is_kpack != nullptr;
+    }
+    for (size_t i = 0; i < count; ++i) {
+        if (!api_for(ggml_backend_meta_buffer_type_at(buft, i)).is_kpack) {
+            return false;
+        }
+    }
+    return true;
+}
+
 struct llama_kpack_cache::impl {
     std::unique_ptr<llama_kpack_sidecar_reader>               reader;
     llama_kpack_background_writer                             writer;
@@ -564,7 +577,14 @@ std::unique_ptr<llama_kpack_cache> llama_kpack_cache::create(const llama_model_l
         return nullptr;
     }
     std::vector<std::vector<llama_kpack_source_tensor>> inventories(loader.files.size());
+    std::set<std::string>                               consumed;
     for (const auto & entry : loader.weights_map) {
+        consumed.insert(entry.second.paired_sources.begin(), entry.second.paired_sources.end());
+    }
+    for (const auto & entry : loader.weights_map) {
+        if (consumed.count(entry.first)) {
+            continue;
+        }
         const auto &              w = entry.second;
         llama_kpack_source_tensor src;
         src.name        = entry.first;
@@ -577,6 +597,13 @@ std::unique_ptr<llama_kpack_cache> llama_kpack_cache::create(const llama_model_l
         src.k           = w.tensor->ne[0];
         src.experts     = src.rank >= 3 ? w.tensor->ne[2] : 0;
         src.batches     = w.tensor->ne[3];
+        for (const auto & name : w.paired_sources) {
+            const auto & part = loader.require_weight(name.c_str());
+            GGML_ASSERT(part.idx == w.idx);
+            src.parts.push_back({name, part.tensor_index, part.offs, ggml_nbytes(part.tensor)});
+            src.gguf_index  = std::min(src.gguf_index, part.tensor_index);
+            src.data_offset = std::min(src.data_offset, uint64_t(part.offs));
+        }
         inventories.at(w.idx).push_back(std::move(src));
     }
     auto                                         result = std::unique_ptr<llama_kpack_cache>(new llama_kpack_cache);
@@ -594,7 +621,7 @@ std::unique_ptr<llama_kpack_cache> llama_kpack_cache::create(const llama_model_l
         }
     }
     std::string variant;
-    if (!topology.empty()) {
+    if (!topology.empty() || !consumed.empty()) {
         // Namespace only. Cache admission still compares the full split map, not this hash.
         uint64_t   hash   = UINT64_C(14695981039346656037);
         const auto append = [&](uint64_t value) {
@@ -619,8 +646,14 @@ std::unique_ptr<llama_kpack_cache> llama_kpack_cache::create(const llama_model_l
                 append(repeat);
             }
         }
+        for (const auto & name : consumed) {
+            append(name.size());
+            for (unsigned char c : name) {
+                append(c);
+            }
+        }
         std::ostringstream suffix;
-        suffix << "-tp-" << std::hex << hash;
+        suffix << (consumed.empty() ? "-tp-" : "-gate-up-") << std::hex << hash;
         variant = suffix.str();
     }
     for (size_t i = 0; i < loader.files.size(); ++i) {

@@ -1,12 +1,13 @@
 #pragma once
 // C ABI of the Quactlize packer and compute runtime in one library, installed through ncp_flash_lib. Only the subset
 // quactlize-buft.cu dlsym's is mirrored here, so llama.cpp needs no include path into ncp_flash_lib -- the same model
-// as ncp-moe-lib.h. Source of truth: quactlize/packing/api.h, quactlize/dense/api.h, quactlize/moe/matmul.h and
+// as ncp-moe-lib.h. Source of truth: quactlize/packing/api.h, quactlize/dense/api.h, quactlize/moe/matmul.h, quactlize/ffn/api.h and
 // quactlize/include/quactlize_ppu_config.h.
 //
 // These must stay byte-identical to what the library exports: the struct layouts are passed across the dlopen
 // boundary and the symbol names are dlsym'd as written. Both sides move together or not at all.
 #include <stdint.h>
+#include <stddef.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -110,6 +111,54 @@ void         quactlize_ppu_dense_destroy_v1(void * context);
 // Non-NULL, thread-local message for the last error; valid until the next API call on this thread.
 const char * quactlize_ppu_dense_error_v1(void);
 
+// Optional FFN composition in the same library. Canonical planes only; no weight repacking.
+enum { QUACTLIZE_FFN_DENSE = 0, QUACTLIZE_FFN_MOE = 1 };
+
+typedef struct {
+    int32_t                             qtype, n, k, experts;
+    quactlize_ppu_placed_arrangement_v2 arrangement;
+    quactlize_ppu_kpack_sizes_v1        sizes;
+    const void *                        low, *high, *units;
+} quactlize_ppu_ffn_weight_v1;
+
+typedef struct {
+    uint32_t                    version, size;
+    int32_t                     kind, tokens, topk, channels, merged, reserved;
+    int64_t                     input_row_stride, input_token_stride, ids_stride, weights_stride, output_stride;
+    quactlize_ppu_ffn_weight_v1 gate, up, down;
+} quactlize_ppu_ffn_params_v1;
+
+typedef struct {
+    int32_t route, policy, split, compute_type;
+    char    config[192];
+} quactlize_ppu_ffn_projection_info_v1;
+
+typedef struct {
+    uint32_t                             version, size;
+    uint64_t                             workspace_bytes;
+    int32_t                              prepare_stage, prepare_helper, finish_helper, reserved;
+    quactlize_ppu_ffn_projection_info_v1 projections[3];
+} quactlize_ppu_ffn_plan_info_v1;
+
+// F32 endpoints and accumulation; dense F16 operands, routed MoE BF16 operands.
+// Prepare is outside capture. Run accepts current input/IDs/weights/output/scratch/stream.
+int          quactlize_ppu_ffn_supported_v1(const quactlize_ppu_ffn_params_v1 * params);
+int          quactlize_ppu_ffn_create_v1(int32_t device, void ** context);
+int          quactlize_ppu_ffn_prepare_v1(void *                              context,
+                                          const quactlize_ppu_ffn_params_v1 * params,
+                                          void **                             plan,
+                                          quactlize_ppu_ffn_plan_info_v1 *    info);
+int          quactlize_ppu_ffn_run_v1(void *          plan,
+                                      const float *   input,
+                                      const int32_t * ids,
+                                      const float *   weights,
+                                      float *         output,
+                                      void *          workspace,
+                                      uint64_t        workspace_bytes,
+                                      void *          stream);
+void         quactlize_ppu_ffn_destroy_v1(void * context);
+const char * quactlize_ppu_ffn_error_v1(void);
+
 // Independent indexed projection: BF16 operands, FP32 accumulation and F32 I/O.
 // IDs are distinct within each token. Output retains token/slot order; no weighted sum or FFN fusion.
 typedef struct {
@@ -154,4 +203,8 @@ static_assert(sizeof(quactlize_ppu_dense_params_v1) == 112, "dense parameter ABI
 static_assert(sizeof(quactlize_ppu_dense_plan_info_v1) == 224, "dense plan ABI drift");
 static_assert(sizeof(quactlize_ppu_moe_matmul_params_v1) == 144, "MoE parameter ABI drift");
 static_assert(sizeof(quactlize_ppu_moe_matmul_plan_info_v1) == 240, "MoE plan ABI drift");
+static_assert(sizeof(quactlize_ppu_ffn_weight_v1) == 112, "FFN weight ABI drift");
+static_assert(offsetof(quactlize_ppu_ffn_params_v1, gate) == 72, "FFN params ABI drift");
+static_assert(sizeof(quactlize_ppu_ffn_params_v1) == 408, "FFN params ABI drift");
+static_assert(sizeof(quactlize_ppu_ffn_plan_info_v1) == 656, "FFN plan ABI drift");
 #endif

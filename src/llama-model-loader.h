@@ -41,6 +41,7 @@ struct llama_model_loader {
         int32_t   tensor_index;
 
         ggml_tensor * tensor;
+        std::vector<std::string> paired_sources;  // gate, up; source metadata stays in weights_map
 
         llama_tensor_weight(const llama_file * file, uint16_t idx, const struct gguf_context * gguf_ctx, ggml_tensor * tensor) : idx(idx), tensor(tensor) {
             const int tensor_idx = gguf_find_tensor(gguf_ctx,  ggml_get_name(tensor));

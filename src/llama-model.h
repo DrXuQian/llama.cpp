@@ -770,6 +770,13 @@ struct llama_model_base : public llama_model {
     void create_tensor_gate_up_exps(llama_layer & layer, int bid, int64_t n_embd_,
                 int64_t n_ff_, int64_t n_expert_, int flags);
 
+    void create_tensor_gate_up(llama_layer & layer,
+                               int           bid,
+                               int64_t       n_embd_,
+                               int64_t       n_ff_,
+                               int           flags,
+                               bool          shared = false);
+
     // helper: try to load merged qkv first, fall back to separate q, k, v
     void create_tensor_qkv(llama_layer & layer, int bid,
                 int64_t n_embd_, int64_t n_embd_q_, int64_t n_embd_k_, int64_t n_embd_v_,

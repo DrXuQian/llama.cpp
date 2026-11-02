@@ -24,7 +24,7 @@ def main():
     parser.add_argument('--reference', type=Path,
                         help='offline gguf_kpack.py; defaults to quactlize/gguf_kpack.py beside --binary')
     parser.add_argument('--binary', type=Path, required=True)
-    parser.add_argument('--compute', choices=('gemv', 'gemm', 'contract', 'moe-gemv', 'moe-gemm'),
+    parser.add_argument('--compute', choices=('gemv', 'gemm', 'contract', 'moe-gemv', 'moe-gemm', 'ffn'),
                         help='independent compute suite; needs no GGUF fixture, Python reference, numpy or torch')
     parser.add_argument('--cache-binary', type=Path, help='also test background persistence and cross-process hits')
     parser.add_argument('--library', type=Path, default=os.environ.get('QUACTLIZE_PPU_LIBRARY'),
@@ -72,6 +72,18 @@ def compute_points(suite, qtype):
 
 
 def check_compute_log(text, suite, qtype):
+    if suite == 'ffn':
+        expected = {(kind, merged, m) for kind in (0,1) for merged in (0,1) for m in (1,3,8,16,128)}
+        rows = re.findall(rf'^KPACK_FFN q={qtype} kind=([01]) merged=([01]) m=(\d+) '
+                          r'replays=4 relative=(\S+) status=PASS$', text, re.MULTILINE)
+        plans = re.findall(r'\[quactlize-ffn\] tensor=ffn-test-gate device=\d+ kind=([01]) '
+                           r'm=(\d+) merged=([01]) ', text)
+        if (text.count('KPACK_FFN PASS cases=20 scope=FUSED_VS_INDEPENDENT_GRAPH') != 1 or
+                len(rows) != len(expected) or {tuple(map(int,r[:3])) for r in rows} != expected or
+                len(plans) != len(expected) or {(int(k),int(g),int(m)) for k,m,g in plans} != expected or
+                any(not math.isfinite(float(r[3])) or not 0 <= float(r[3]) < .02 for r in rows)):
+            raise RuntimeError('incomplete FFN numerical/actual fusion coverage')
+        return
     if suite.startswith('moe-'):
         mode = suite.removeprefix('moe-')
         ms = range(1, 9) if mode == 'gemv' else (9,16,32,64,128,256,512,1024,2048,4096,5120)
@@ -130,7 +142,7 @@ def print_compute_failure(log):
         print(f'KPACK_COMPUTE_DIAGNOSTIC log={log} unavailable={error}', flush=True)
         return
     print(f'KPACK_COMPUTE_DIAGNOSTIC_BEGIN log={log}', flush=True)
-    for marker in ('KPACK_DENSE_START', 'KPACK_MOE_START', '[quactlize-dense]', '[quactlize-moe]', 'KPACK_JIT_RESOLVE'):
+    for marker in ('KPACK_DENSE_START', 'KPACK_MOE_START', 'KPACK_FFN_START', '[quactlize-dense]', '[quactlize-moe]', '[quactlize-ffn]', 'KPACK_JIT_RESOLVE'):
         last = next((line for line in reversed(lines) if marker in line), None)
         if last:
             print(f'last_context: {last}', flush=True)
@@ -155,6 +167,8 @@ def run_compute_suite(args):
     moe = args.compute.startswith('moe-')
     command = [str(args.binary.resolve()), '-b', args.backend, '--moe' if moe else '--dense',
                '--suite', args.compute.removeprefix('moe-')]
+    if args.compute == 'ffn':
+        command = [str(args.binary.resolve()), '-b', args.backend, '--ffn']
     resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
     failures = []
 
@@ -167,7 +181,7 @@ def run_compute_suite(args):
                 for line in process.stdout:
                     out.write(line)
                     out.flush()
-                    if line.startswith(('KPACK_DENSE', 'KPACK_MOE', 'KPACK_JIT')) or '[quactlize-' in line:
+                    if line.startswith(('KPACK_DENSE', 'KPACK_MOE', 'KPACK_FFN', 'KPACK_JIT')) or '[quactlize-' in line:
                         print(line, end='', flush=True)
                 rc = process.wait()
         text = log.read_text(errors='replace')
@@ -258,7 +272,7 @@ def tp_fixture(path, reference, count):
     for q in (8, 10, 11, 12, 13, 14):
         block, block_bytes = gguf.GGML_QUANT_SIZES[gguf.GGMLQuantizationType(q)]
         for case, axis in (('k', 0), ('n', 1), ('experts', 2), ('outer4d', 1), ('mirror', 10),
-                           ('uneven-empty', 1), ('segments-k', 0), ('segments-n', 1)):
+                           ('uneven-empty', 1), ('segments-k', 0), ('segments-n', 1), ('paired-n', 1)):
             ne = [512, 256, 1, 1]
             widths, repeats = [], []
             coordinates = [[] for _ in range(count)]
@@ -275,6 +289,9 @@ def tp_fixture(path, reference, count):
                     widths = [256] * (2 * count)
                     repeats = [1, 1]
                     ne[2] = 2
+                if case == 'paired-n':
+                    repeats = [2]
+                    ne[2] = 2
                 position = 0
                 for s, repeat in enumerate(repeats):
                     for _ in range(repeat):
@@ -289,6 +306,16 @@ def tp_fixture(path, reference, count):
             raw = np.random.default_rng(q * 100 + axis).integers(
                 0, 256, (ne[3], ne[2], ne[1], ne[0] // block, block_bytes), dtype=np.uint8)
             writer.add_tensor(name, raw.reshape(ne[3], ne[2], ne[1], -1), raw_dtype=gguf.GGMLQuantizationType(q))
+            parts = []
+            if case == 'paired-n':
+                for side, suffix in enumerate(('gate', 'up')):
+                    part = name + '.' + suffix
+                    lo, hi = side * ne[1]//2, (side+1) * ne[1]//2
+                    writer.add_tensor(part, np.ascontiguousarray(raw[:, :, lo:hi]).reshape(ne[3], ne[2], ne[1]//2, -1),
+                                      raw_dtype=gguf.GGMLQuantizationType(q))
+                    parts.append(part)
+                    if side == 0:
+                        writer.add_tensor(name + '.padding', np.zeros(64, dtype=np.float32))
             shards = []
             for d in range(count):
                 if axis < 4 and not coordinates[d]:
@@ -321,7 +348,7 @@ def tp_fixture(path, reference, count):
                         writer.add_tensor(carrier, data.reshape(-1).view(np.int8))
                 shards.append({'carriers': carriers})
             records.append({'source_name': name, 'partition': {'axis': axis, 'widths': widths, 'repeats': repeats},
-                            'shards': shards})
+                            'shards': shards, 'parts': parts})
             print(f'KPACK_TP_FIXTURE q={q} case={case} ranks={count}', flush=True)
     writer.add_string('quactlize.kpack.reference.manifest', json.dumps({'tensors': records}))
     writer.write_header_to_file()

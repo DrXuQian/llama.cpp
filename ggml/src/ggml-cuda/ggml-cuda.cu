@@ -3447,6 +3447,12 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     ggml_tensor * node = cgraph->nodes[i];
 
+#ifdef GGML_NCP_QUACTLIZE
+    if (int skipped = ggml_quactlize_try_ffn(*cuda_ctx, cgraph, i)) {
+        return skipped;
+    }
+#endif
+
     // gated_delta_net -> cpy: scatter recurrent-state snapshots into the cache
     if (node->op == GGML_OP_GATED_DELTA_NET) {
         ggml_cuda_gated_delta_net_fused_cache fused_state_cpy;

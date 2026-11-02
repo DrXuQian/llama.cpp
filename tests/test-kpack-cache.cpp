@@ -116,6 +116,18 @@ int main(int argc, char ** argv) try {
         src.rank        = ggml_n_dims(t);
         src.experts     = src.rank >= 3 ? t->ne[2] : 0;
         src.batches     = t->ne[3];
+        for (const auto & item : record.value("parts", std::vector<std::string>{})) {
+            const int64_t part = gguf_find_tensor(file.get(), item.c_str());
+            check(part >= 0 && part <= INT32_MAX, "merged source part missing or index overflow");
+            src.parts.push_back({item, int32_t(part),
+                                 gguf_get_data_offset(file.get()) + gguf_get_tensor_offset(file.get(), part),
+                                 gguf_get_tensor_size(file.get(), part)});
+        }
+        if (!src.parts.empty()) {
+            check(src.parts.size() == 2, "merged source count differs");
+            src.gguf_index  = std::min(src.parts[0].gguf_index, src.parts[1].gguf_index);
+            src.data_offset = std::min(src.parts[0].data_offset, src.parts[1].data_offset);
+        }
         inventory.push_back(src);
     }
     ggml_backend_buffer_ptr buffer;
@@ -167,8 +179,18 @@ int main(int argc, char ** argv) try {
         if (hit) {
             ++hits;
         } else {
-            auto raw = bytes(tensor->name);
-            ggml_backend_tensor_set(tensor, raw.data(), 0, raw.size());
+            const auto & parts = inventory[i].parts;
+            if (parts.empty()) {
+                auto raw = bytes(tensor->name);
+                ggml_backend_tensor_set(tensor, raw.data(), 0, raw.size());
+            } else {
+                const size_t width = tensor->nb[2] / 2;
+                for (size_t side = 0; side < parts.size(); ++side) {
+                    auto raw = bytes(parts[side].name);
+                    ggml_backend_tensor_set_2d(tensor, raw.data(), side * width, width, tensor->ne[2] * tensor->ne[3],
+                                               2 * width, width);
+                }
+            }
             ++shuffles;
             if (!partial || i == 0) {
                 cache->capture(tensor);

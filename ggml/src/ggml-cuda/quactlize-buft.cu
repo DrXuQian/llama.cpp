@@ -1,5 +1,6 @@
 #ifdef GGML_NCP_QUACTLIZE
 #    include "quactlize-buft.cuh"
+#    include "quactlize-ffn.cuh"
 #    include "common.cuh"
 #    include "ggml-backend-impl.h"
 
@@ -35,6 +36,12 @@ struct quactlize_library {
     decltype(&quactlize_ppu_moe_matmul_run_v1)       moe_run         = nullptr;
     decltype(&quactlize_ppu_moe_matmul_destroy_v1)   moe_destroy     = nullptr;
     decltype(&quactlize_ppu_moe_matmul_error_v1)     moe_error       = nullptr;
+    decltype(&quactlize_ppu_ffn_supported_v1) ffn_supported = nullptr;
+    decltype(&quactlize_ppu_ffn_create_v1)    ffn_create    = nullptr;
+    decltype(&quactlize_ppu_ffn_prepare_v1)   ffn_prepare   = nullptr;
+    decltype(&quactlize_ppu_ffn_run_v1)       ffn_run       = nullptr;
+    decltype(&quactlize_ppu_ffn_destroy_v1)   ffn_destroy   = nullptr;
+    decltype(&quactlize_ppu_ffn_error_v1)     ffn_error     = nullptr;
 
     quactlize_library() {
         const char * path = getenv("QUACTLIZE_PPU_LIBRARY");
@@ -70,6 +77,18 @@ struct quactlize_library {
         QZ_BIND(moe_destroy, quactlize_ppu_moe_matmul_destroy_v1);
         QZ_BIND(moe_error, quactlize_ppu_moe_matmul_error_v1);
 #    undef QZ_BIND
+#    define QZ_FFN_BIND(field, symbol) field = reinterpret_cast<decltype(field)>(dlsym(handle, #symbol))
+        QZ_FFN_BIND(ffn_supported, quactlize_ppu_ffn_supported_v1);
+        QZ_FFN_BIND(ffn_create, quactlize_ppu_ffn_create_v1);
+        QZ_FFN_BIND(ffn_prepare, quactlize_ppu_ffn_prepare_v1);
+        QZ_FFN_BIND(ffn_run, quactlize_ppu_ffn_run_v1);
+        QZ_FFN_BIND(ffn_destroy, quactlize_ppu_ffn_destroy_v1);
+        QZ_FFN_BIND(ffn_error, quactlize_ppu_ffn_error_v1);
+#    undef QZ_FFN_BIND
+        if (!ffn_supported || !ffn_create || !ffn_prepare || !ffn_run || !ffn_destroy || !ffn_error) {
+            ffn_supported = nullptr;
+            GGML_LOG_WARN("quactlize: optional FFN ABI unavailable; using independent projections\n");
+        }
         GGML_LOG_INFO("[quactlize] loaded %s\n", path);
     }
 };
@@ -92,6 +111,20 @@ struct moe_plan {
 };
 
 using moe_key = std::array<int64_t, 7>;
+
+struct ffn_plan {
+    void * handle = nullptr;
+    quactlize_ppu_ffn_plan_info_v1 info{};
+};
+
+using ffn_key = std::array<uint64_t, 12>;
+
+ffn_key key_for(const quactlize_ppu_ffn_params_v1 & p) {
+    return {reinterpret_cast<uintptr_t>(p.up.low), reinterpret_cast<uintptr_t>(p.down.low),
+            uint64_t(p.kind), uint64_t(p.tokens), uint64_t(p.topk), uint64_t(p.channels), uint64_t(p.merged),
+            uint64_t(p.input_row_stride), uint64_t(p.input_token_stride), uint64_t(p.ids_stride),
+            uint64_t(p.weights_stride), uint64_t(p.output_stride)};
+}
 
 moe_key key_for(const quactlize_ppu_moe_matmul_params_v1 & p) {
     return {p.tokens, p.topk, p.channels, p.input_row_stride, p.input_token_stride, p.ids_stride, p.output_stride};
@@ -198,6 +231,7 @@ struct tensor_state {
     bool                            compute_ready = false;
     std::map<dense_key, dense_plan> plans;
     std::map<moe_key, moe_plan>     moe_plans;
+    std::map<ffn_key, ffn_plan>     ffn_plans;
 };
 
 constexpr size_t cache_chunk_bytes = 8 * 1024 * 1024;
@@ -224,6 +258,7 @@ struct buffer_context {
     std::mutex                                  compute_mutex;
     void *                                      compute = nullptr;
     void *                                      moe_compute = nullptr;
+    void *                                      ffn_compute = nullptr;
 };
 
 void prepare_ready(ggml_backend_cuda_context & cuda_ctx, tensor_state & state) {
@@ -258,12 +293,152 @@ const ggml_tensor * packed_source(const ggml_tensor * tensor) {
     return nullptr;
 }
 
+bool ffn_params(ggml_backend_cuda_context & cuda_ctx, const ggml_cgraph * graph, int start,
+                ggml_quactlize_ffn_graph & match, quactlize_ppu_ffn_params_v1 & params) {
+    static const bool disabled = getenv("GGML_CUDA_DISABLE_FUSION") && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
+    if (disabled || !ggml_quactlize_enabled() || !library().ffn_supported) {
+        return false;
+    }
+    match = ggml_quactlize_match_ffn(graph, start);
+    if (!match.count) {
+        return false;
+    }
+    for (const auto & event : cuda_ctx.stream_context().concurrent_events) {
+        for (int i = start; i < start + match.count; ++i) {
+            const auto * node = graph->nodes[i];
+            if (node == event.first || node == event.second.join_node || event.second.stream_mapping.count(node)) {
+                return false;
+            }
+        }
+    }
+    params.version = 1;
+    params.size = sizeof(params);
+    params.merged = match.up == nullptr;
+    params.kind = match.gate->op == GGML_OP_MUL_MAT_ID ? QUACTLIZE_FFN_MOE : QUACTLIZE_FFN_DENSE;
+    buffer_context * context = nullptr;
+    auto weight = [&](const ggml_tensor * op, quactlize_ppu_ffn_weight_v1 & out) {
+        if (!op) {
+            return true;
+        }
+        const auto * owner = weight_owner(op->src[0]);
+        if (!owner || !owner->buffer || !ggml_cuda_buft_is_quactlize(owner->buffer->buft) ||
+            !ggml_quactlize_can_compute(op)) {
+            return false;
+        }
+        auto * ctx = static_cast<buffer_context *>(owner->buffer->context);
+        // One buffer owns every bound weight and therefore the FFN plan lifetime.
+        if (ctx->device != cuda_ctx.device || (context && context != ctx)) {
+            return false;
+        }
+        context = ctx;
+        ggml_quactlize_packed_layout layout{};
+        if (!ggml_quactlize_can_load(owner, &layout) || !owner->data) {
+            return false;
+        }
+        const auto * low = static_cast<const uint8_t *>(owner->data);
+        out = {int32_t(owner->type), int32_t(owner->ne[1]), int32_t(owner->ne[0]), int32_t(owner->ne[2]),
+               layout.arrangement, layout.sizes, low, layout.sizes.high_bytes ? low + layout.sizes.low_bytes : nullptr,
+               low + layout.sizes.low_bytes + layout.sizes.high_bytes};
+        return true;
+    };
+    if (!weight(match.gate, params.gate) || !weight(match.up, params.up) || !weight(match.down, params.down)) {
+        return false;
+    }
+    if (params.kind == QUACTLIZE_FFN_MOE) {
+        quactlize_ppu_moe_matmul_params_v1 p{};
+        if (!moe_params(match.gate, p)) {
+            return false;
+        }
+        params.tokens = p.tokens;
+        params.topk = p.topk;
+        params.channels = p.channels;
+        params.input_row_stride = p.input_row_stride;
+        params.input_token_stride = p.input_token_stride;
+        params.ids_stride = p.ids_stride;
+        params.weights_stride = match.weights->nb[2] / sizeof(float);
+    } else {
+        quactlize_ppu_dense_params_v1 p{};
+        if (!dense_params(match.gate, p)) {
+            return false;
+        }
+        params.tokens = p.m;
+        params.topk = params.channels = 1;
+        params.input_row_stride = params.input_token_stride = p.input_stride;
+    }
+    params.output_stride = match.output->nb[1] / sizeof(float);
+    auto overlap = [&](const ggml_tensor * input) {
+        if (!input) {
+            return false;
+        }
+        const uintptr_t a = reinterpret_cast<uintptr_t>(input->data);
+        const uintptr_t b = reinterpret_cast<uintptr_t>(match.output->data);
+        const size_t as = ggml_nbytes(input), bs = ggml_nbytes(match.output);
+        return !a || !b || as > UINTPTR_MAX - a || bs > UINTPTR_MAX - b || (a < b + bs && b < a + as);
+    };
+    if (overlap(match.gate->src[1]) || overlap(match.gate->src[2]) || overlap(match.weights)) {
+        return false;
+    }
+    return library().ffn_supported(&params) == 1;
+}
+
+void prepare_ffn(ggml_backend_cuda_context & cuda_ctx, const ggml_quactlize_ffn_graph & match,
+                 const quactlize_ppu_ffn_params_v1 & params) {
+    const auto * owner = weight_owner(match.gate->src[0]);
+    auto * ctx = static_cast<buffer_context *>(owner->buffer->context);
+    std::lock_guard<std::mutex> lock(ctx->compute_mutex);
+    auto & state = ctx->tensors.at(owner);
+    const auto key = key_for(params);
+    if (state.ffn_plans.count(key)) {
+        return;
+    }
+    for (const auto * node : {match.gate, match.up, match.down}) {
+        if (node) {
+            auto & weight = ctx->tensors.at(weight_owner(node->src[0]));
+            GGML_ASSERT(weight.loaded);
+            prepare_ready(cuda_ctx, weight);
+        }
+    }
+    const auto & api = library();
+    if (!ctx->ffn_compute && (api.ffn_create(ctx->device, &ctx->ffn_compute) || !ctx->ffn_compute)) {
+        GGML_ABORT("quactlize: FFN context: %s", api.ffn_error());
+    }
+    ffn_plan plan;
+    plan.info.version = 1;
+    plan.info.size = sizeof(plan.info);
+    if (api.ffn_prepare(ctx->ffn_compute, &params, &plan.handle, &plan.info)) {
+        GGML_ABORT("quactlize: FFN prepare %s: %s", owner->name, api.ffn_error());
+    }
+    if (!plan.handle || plan.info.version != 1 || plan.info.size != sizeof(plan.info) ||
+        plan.info.workspace_bytes > SIZE_MAX || plan.info.reserved) {
+        GGML_ABORT("quactlize: invalid FFN plan ABI for %s", owner->name);
+    }
+    for (int i = 0; i < 3; ++i) {
+        const auto & p = plan.info.projections[i];
+        if (params.merged && i == 1) {
+            GGML_ASSERT(p.route == -1);
+            continue;
+        }
+        if (p.route < 0 || p.route > (params.kind == QUACTLIZE_FFN_MOE ? 2 : 3) || p.split < 1 ||
+            p.compute_type < 0 || p.compute_type > 1 ||
+            (params.kind == QUACTLIZE_FFN_MOE && p.compute_type != 1) ||
+            !p.config[0] || !memchr(p.config, '\0', sizeof(p.config))) {
+            GGML_ABORT("quactlize: invalid FFN projection ABI for %s stage=%d", owner->name, i);
+        }
+        GGML_LOG_INFO("[quactlize-ffn-projection] tensor=%s stage=%d route=%d policy=%d split=%d compute=%d config=%s\n",
+                      owner->name, i, p.route, p.policy, p.split, p.compute_type, p.config);
+    }
+    state.ffn_plans.emplace(key, plan);
+    GGML_LOG_INFO("[quactlize-ffn] tensor=%s device=%d kind=%d m=%d merged=%d nodes=%d prepare=%d/%d finish=%d workspace=%" PRIu64 "\n",
+                  owner->name, ctx->device, params.kind, params.tokens, params.merged, match.count,
+                  plan.info.prepare_stage, plan.info.prepare_helper, plan.info.finish_helper, plan.info.workspace_bytes);
+}
+
 void free_buffer(ggml_backend_buffer_t buffer) {
     auto * ctx = static_cast<buffer_context *>(buffer->context);
     ggml_cuda_set_device(ctx->device);
     CUDA_CHECK(cudaStreamSynchronize(ctx->stream));
     CUDA_CHECK(cudaStreamSynchronize(ctx->copy_stream));
-    if (ctx->compute || ctx->moe_compute) {
+    if (ctx->compute || ctx->moe_compute || ctx->ffn_compute) {
         // Compute plans reference these weights and may be captured on other streams.
         CUDA_CHECK(cudaDeviceSynchronize());
         if (ctx->compute) {
@@ -271,6 +446,9 @@ void free_buffer(ggml_backend_buffer_t buffer) {
         }
         if (ctx->moe_compute) {
             library().moe_destroy(ctx->moe_compute);
+        }
+        if (ctx->ffn_compute) {
+            library().ffn_destroy(ctx->ffn_compute);
         }
     }
     for (const auto & item : ctx->tensors) {
@@ -704,6 +882,13 @@ void ggml_quactlize_prepare_graph(ggml_backend_cuda_context & cuda_ctx, const gg
     }
     for (int i = 0; i < graph->n_nodes; ++i) {
         const auto * node = graph->nodes[i];
+        ggml_quactlize_ffn_graph ffn;
+        quactlize_ppu_ffn_params_v1 ffn_shape{};
+        if (ffn_params(cuda_ctx, graph, i, ffn, ffn_shape)) {
+            prepare_ffn(cuda_ctx, ffn, ffn_shape);
+            i += ffn.count - 1;
+            continue;
+        }
         if (node->op == GGML_OP_NONE) {
             continue;
         }
@@ -867,5 +1052,41 @@ void ggml_quactlize_mul_mat_id(ggml_backend_cuda_context & cuda_ctx, ggml_tensor
                     plan.info.workspace_bytes, cuda_ctx.stream())) {
         GGML_ABORT("quactlize: MoE run %s: %s", dst->name, api.moe_error());
     }
+}
+
+int ggml_quactlize_try_ffn(ggml_backend_cuda_context & cuda_ctx, const ggml_cgraph * graph, int start) {
+    if (!buffer_type_exposed.load(std::memory_order_acquire)) {
+        return 0;
+    }
+    ggml_quactlize_ffn_graph match;
+    quactlize_ppu_ffn_params_v1 params{};
+    if (!ffn_params(cuda_ctx, graph, start, match, params)) {
+        return 0;
+    }
+    const auto * owner = weight_owner(match.gate->src[0]);
+    auto * ctx = static_cast<buffer_context *>(owner->buffer->context);
+    ffn_plan plan;
+    {
+        std::lock_guard<std::mutex> lock(ctx->compute_mutex);
+        const auto found = ctx->tensors.at(owner).ffn_plans.find(key_for(params));
+        // Concurrent-region validation can restore node order after prepare.
+        // Do not prepare/JIT a newly visible match during capture.
+        if (found == ctx->tensors.at(owner).ffn_plans.end()) {
+            return 0;
+        }
+        plan = found->second;
+    }
+    ggml_cuda_pool_alloc<uint8_t> workspace(cuda_ctx.pool());
+    if (plan.info.workspace_bytes) {
+        workspace.alloc(plan.info.workspace_bytes);
+    }
+    const auto & api = library();
+    if (api.ffn_run(plan.handle, static_cast<const float *>(match.gate->src[1]->data),
+                    match.gate->src[2] ? static_cast<const int32_t *>(match.gate->src[2]->data) : nullptr,
+                    match.weights ? static_cast<const float *>(match.weights->data) : nullptr,
+                    static_cast<float *>(match.output->data), workspace.get(), plan.info.workspace_bytes, cuda_ctx.stream())) {
+        GGML_ABORT("quactlize: FFN run %s: %s", match.output->name, api.ffn_error());
+    }
+    return match.count - 1;
 }
 #endif

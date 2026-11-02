@@ -17,6 +17,8 @@ struct llama_kpack_cache_coverage {
 // are released. No method is called from the inference submission path.
 struct llama_model_loader;
 
+bool llama_kpack_buffer_type(ggml_backend_buffer_type_t buft);
+
 class llama_kpack_cache {
 public:
     static std::unique_ptr<llama_kpack_cache> create(const llama_model_loader & loader);

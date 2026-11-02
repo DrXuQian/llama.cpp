@@ -14,7 +14,7 @@
 // Each source stat identity has its own subdirectory. Empty means unavailable.
 std::string llama_kpack_cache_directory(const std::string & source, std::string & error);
 
-// llama.kpack-cache v1/v2: whole tensors; v3 also binds tensor-parallel split maps.
+// v1/v2: whole tensors; v3: split maps; v4: gate/up source ranges in the same GGUF.
 // There are no payload hashes. Keep the source and cache immutable during use.
 struct llama_kpack_planes {
     const uint8_t * low         = nullptr;
@@ -29,12 +29,23 @@ struct llama_kpack_planes {
 };
 
 struct llama_kpack_source_tensor {
+    struct part {
+        std::string name;
+        int32_t     gguf_index  = -1;
+        uint64_t    data_offset = 0, size_bytes = 0;
+
+        bool operator==(const part & other) const {
+            return name == other.name && gguf_index == other.gguf_index && data_offset == other.data_offset &&
+                   size_bytes == other.size_bytes;
+        }
+    };
     std::string name;
     int32_t     gguf_index  = -1;
     uint64_t    data_offset = 0, size_bytes = 0;
     int32_t     ggml_type = -1, rank = 0;
     int64_t     n = 0, k = 0, experts = 0;
     int64_t     batches = 1;
+    std::vector<part> parts;  // Empty for a file tensor, otherwise gate then up.
 };
 
 struct llama_kpack_partition {
