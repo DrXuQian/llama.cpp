@@ -32,9 +32,9 @@ static void ggml_ncp_route_log(const ggml_tensor * dst, const char * kernel, con
                  mmid ? "MUL_MAT_ID" : "MUL_MAT", name, shape, kernel);
     }
 
-    // One line per distinct (tensor, shape, decision); a long generation would otherwise repeat it thousands of times.
-    static char seen[64][320];
-    static int  n_seen = 0;
+    // Deduplicate per launch thread without serializing rank submissions.
+    static thread_local char seen[64][320];
+    static thread_local int  n_seen = 0;
     for (int i = 0; i < n_seen; i++) {
         if (strcmp(seen[i], line) == 0) {
             return;

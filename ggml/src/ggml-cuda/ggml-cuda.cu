@@ -1185,6 +1185,8 @@ struct ggml_backend_cuda_comm_context {
 
 #ifdef GGML_USE_NCCL
     std::vector<ncclComm_t>     comms;
+    std::unique_ptr<ggml_cuda_tp_graph_launcher> tp_launcher;
+    ggml_cgraph ** tp_launch_graphs = nullptr;
 #endif // GGML_USE_NCCL
 
 #if defined(USE_CUDA_GRAPH) && defined(GGML_USE_NCCL)
@@ -1193,7 +1195,6 @@ struct ggml_backend_cuda_comm_context {
     bool tp_graph_warmed = false;
     bool tp_graph_active = false;
     std::vector<std::unique_ptr<ggml_cuda_graph>> tp_graphs;
-    std::unique_ptr<ggml_cuda_tp_graph_launcher> tp_launcher;
     std::vector<nv_bfloat16 *> tp_scratch;
     size_t tp_scratch_ne = 0;
 
@@ -1228,12 +1229,12 @@ struct ggml_backend_cuda_comm_context {
 #endif
 
     ~ggml_backend_cuda_comm_context() {
-#if defined(USE_CUDA_GRAPH) && defined(GGML_USE_NCCL)
+#ifdef GGML_USE_NCCL
         tp_launcher.reset();
+#ifdef USE_CUDA_GRAPH
         reset_tp_graphs();
         free_tp_scratch();
 #endif
-#ifdef GGML_USE_NCCL
         for (ncclComm_t comm : comms) {
             NCCL_CHECK(ncclCommDestroy(comm));
         }
@@ -2818,7 +2819,7 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         // decline for certain and spend a ggml_ncp_route_log slot (64 total, deduped per line) on a "-> GENERIC" line
         // contradicting the "-> so-deepgemm-nopad" the same tensor logs seconds later.
         if (!ggml_is_quantized(src0->type) && ggml_cuda_mul_mat_id_ncp_lib(ctx, src0, src1, ids, dst)) {
-            static bool logged = false;   // one line the first time the .so actually serves a shape, not just loads
+            static thread_local bool logged = false;
             if (!logged) { logged = true; GGML_LOG_INFO("[ncp-lib] using external MoE grouped-GEMM (libncp_moe.so)\n"); }
             return;
         }
@@ -2865,7 +2866,7 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
             // gate check, not another dequant. Referencing the hook is safe: GGML_NCP_MOE is forced OFF without
             // GGML_USE_PPU (ggml-cuda/CMakeLists.txt), so this branch and the one above always compile together.
             if (ggml_cuda_mul_mat_id_ncp_lib(ctx, &src0_dequant, src1, ids, dst)) {
-                static bool logged = false;
+                static thread_local bool logged = false;
                 if (!logged) {
                     logged = true;
                     GGML_LOG_INFO("[ncp-lib] using external MoE grouped-GEMM (libncp_moe.so) on dequantized experts\n");
@@ -4786,70 +4787,104 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     return GGML_STATUS_SUCCESS;
 }
 
-#if defined(USE_CUDA_GRAPH) && defined(GGML_USE_NCCL)
+#ifdef GGML_USE_NCCL
 static bool ggml_backend_cuda_comm_graph_compute(
         void * comm_ctx_v, ggml_cgraph ** graphs, size_t n_steps, uint64_t uid) {
-    static const bool enabled = [] {
+    static const bool graphs_requested = [] {
         const char * env = getenv("GGML_CUDA_TP_GRAPHS");
-        return env && atoi(env) == 1 && !getenv("GGML_CUDA_DISABLE_GRAPHS");
+        return env && atoi(env) == 1;
     }();
-    if (!enabled || comm_ctx_v == nullptr) {
+    static const bool parallel = [] {
+        const char * env = getenv("GGML_CUDA_TP_PARALLEL");
+        return env ? atoi(env) == 1 : graphs_requested;
+    }();
+    bool capture = false;
+#ifdef USE_CUDA_GRAPH
+    capture = graphs_requested && !getenv("GGML_CUDA_DISABLE_GRAPHS") && uid != 0;
+#endif
+    if ((!capture && !parallel) || comm_ctx_v == nullptr) {
         return false;
     }
 
     auto * comm = static_cast<ggml_backend_cuda_comm_context *>(comm_ctx_v);
     const size_t n = comm->backends.size();
-    if (uid == 0 || n_steps == 0 || n < 2 ||
+    if (graphs == nullptr || n_steps == 0 || n < 2 ||
             comm->try_allreduce != ggml_backend_cuda_comm_try_allreduce_nccl) {
+#ifdef USE_CUDA_GRAPH
         comm->reset_tp_graphs();
+#endif
         return false;
     }
 
     auto ctx_at = [&](size_t rank) {
         return static_cast<ggml_backend_cuda_context *>(comm->backends[rank]->context);
     };
+#ifdef USE_CUDA_GRAPH
     auto launch = [&] {
-        comm->tp_launcher->launch();
+        if (parallel) {
+            comm->tp_launcher->launch();
+        } else {
+            for (size_t j = 0; j < n; ++j) {
+                auto * ctx = ctx_at(j);
+                ggml_cuda_set_device(ctx->device);
+                CUDA_CHECK(cudaGraphLaunch(comm->tp_graphs[j]->instance, ctx->stream()));
+            }
+        }
     };
-
     const bool same_graph = uid == comm->tp_graph_uid && n_steps == comm->tp_graph_steps;
-    if (same_graph && !comm->tp_graphs.empty()) {
+    if (capture && same_graph && !comm->tp_graphs.empty()) {
         launch();
         return true;
     }
-
-    if (!same_graph) {
+    if (!capture || !same_graph) {
         comm->reset_tp_graphs();
-        size_t scratch_ne = 0;
-        // Decide eligibility for the entire group before submitting any work.
-        for (size_t j = 0; j < n; ++j) {
-            auto * ctx = ctx_at(j);
-            ggml_cuda_set_device(ctx->device);
-            if (ctx->curr_stream_no != 0) {
+    }
+#else
+    GGML_UNUSED(uid);
+#endif
+    // Validate all ranks before submitting work; false lets the meta backend retry.
+    for (size_t j = 0; j < n; ++j) {
+        auto * ctx = ctx_at(j);
+        ggml_cuda_set_device(ctx->device);
+        if (ctx->curr_stream_no != 0) {
+            return false;
+        }
+        for (size_t i = 0; i < n_steps; ++i) {
+            ggml_cgraph * graph = graphs[i*n + j];
+            if (graph == nullptr || graph->n_nodes == 0) {
                 return false;
             }
-            for (size_t i = 0; i < n_steps; ++i) {
-                ggml_cgraph * graph = graphs[i*n + j];
-                if (graph->n_nodes == 0 ||
-                        !ggml_cuda_graph_set_enabled(ctx, ggml_cuda_graph_get_key(graph)) ||
-                        !ggml_cuda_graph_check_compability(graph)) {
-                    GGML_LOG_DEBUG("%s: incompatible TP graph, using segment execution\n", __func__);
-                    return false;
-                }
-                if (i + 1 == n_steps) {
-                    continue;
-                }
+#ifdef USE_CUDA_GRAPH
+            if (capture && (!ggml_cuda_graph_set_enabled(ctx, ggml_cuda_graph_get_key(graph)) ||
+                            !ggml_cuda_graph_check_compability(graph))) {
+                capture = false;
+            }
+#endif
+            if (i + 1 < n_steps) {
                 ggml_tensor * tensor = graph->nodes[graph->n_nodes - 1];
                 ggml_cgraph * graph0 = graphs[i*n];
-                const int64_t ne = ggml_nelements(tensor);
-                if (graph0->n_nodes == 0 || tensor->type != GGML_TYPE_F32 ||
+                if (tensor->type != GGML_TYPE_F32 ||
                         !ggml_is_contiguously_allocated(tensor) ||
-                        ne != ggml_nelements(graph0->nodes[graph0->n_nodes - 1])) {
+                        ggml_nelements(tensor) != ggml_nelements(graph0->nodes[graph0->n_nodes - 1])) {
                     return false;
                 }
-                if (!ggml_backend_cuda_comm_use_f32(n, ne)) {
-                    scratch_ne = std::max(scratch_ne, (size_t) ne);
-                }
+            }
+        }
+    }
+    if (!capture && !parallel) {
+        return false;
+    }
+
+#ifdef USE_CUDA_GRAPH
+    if (!capture) {
+        comm->reset_tp_graphs();
+    } else if (!same_graph) {
+        size_t scratch_ne = 0;
+        for (size_t i = 0; i + 1 < n_steps; ++i) {
+            ggml_cgraph * graph = graphs[i*n];
+            const int64_t ne = ggml_nelements(graph->nodes[graph->n_nodes - 1]);
+            if (!ggml_backend_cuda_comm_use_f32(n, ne)) {
+                scratch_ne = std::max(scratch_ne, (size_t) ne);
             }
         }
         if (scratch_ne > comm->tp_scratch_ne) {
@@ -4864,8 +4899,9 @@ static bool ggml_backend_cuda_comm_graph_compute(
         comm->tp_graph_uid = uid;
         comm->tp_graph_steps = n_steps;
     }
+#endif
 
-    if (!comm->tp_launcher) {
+    if (parallel && !comm->tp_launcher) {
         comm->tp_launcher = std::make_unique<ggml_cuda_tp_graph_launcher>(n, comm,
             [](void * data, size_t rank) {
                 auto * owner = static_cast<ggml_backend_cuda_comm_context *>(data);
@@ -4876,32 +4912,65 @@ static bool ggml_backend_cuda_comm_graph_compute(
             [](void * data, size_t rank) {
                 auto * owner = static_cast<ggml_backend_cuda_comm_context *>(data);
                 auto * ctx = static_cast<ggml_backend_cuda_context *>(owner->backends[rank]->context);
+                ggml_cuda_set_device(ctx->device);
+                if (owner->tp_launch_graphs) {
+                    ggml_cuda_graph_evaluate_and_capture(ctx, owner->tp_launch_graphs[rank], false, false, nullptr);
+                    return;
+                }
+#ifdef USE_CUDA_GRAPH
                 CUDA_CHECK(cudaGraphLaunch(owner->tp_graphs[rank]->instance, ctx->stream()));
+#else
+                GGML_ABORT("TP graph replay requires CUDA graphs");
+#endif
             });
-        GGML_LOG_INFO("%s: using %zu persistent threads for parallel graph launch\n", __func__, n);
+        GGML_LOG_INFO("%s: using %zu persistent threads for parallel TP kernel and graph launch\n", __func__, n);
+    }
+
+    // Prepare plans before parallel execution and outside stream capture.
+    for (size_t j = 0; j < n; ++j) {
+        auto * ctx = ctx_at(j);
+        ggml_cuda_set_device(ctx->device);
+        for (size_t i = 0; i < n_steps; ++i) {
+            ggml_quactlize_execution_prepare_graph(*ctx, graphs[i*n + j]);
+        }
     }
 
     std::vector<ggml_tensor *> tensors(n);
-    auto evaluate = [&] {
-        comm->tp_graph_active = true;
+    auto evaluate = [&](bool parallel_kernels) {
         for (size_t i = 0; i < n_steps; ++i) {
+            if (parallel_kernels) {
+                comm->tp_launch_graphs = graphs + i*n;
+                comm->tp_launcher->launch();
+                comm->tp_launch_graphs = nullptr;
+            }
             for (size_t j = 0; j < n; ++j) {
-                auto * ctx = ctx_at(j);
                 ggml_cgraph * graph = graphs[i*n + j];
-                ggml_cuda_set_device(ctx->device);
-                // The outer capture owns every segment; do not capture or launch inner graphs.
-                ggml_cuda_graph_evaluate_and_capture(ctx, graph, false, false, nullptr);
+                if (!parallel_kernels) {
+                    auto * ctx = ctx_at(j);
+                    ggml_cuda_set_device(ctx->device);
+                    // The outer capture owns every segment; do not launch inner graphs.
+                    ggml_cuda_graph_evaluate_and_capture(ctx, graph, false, false, nullptr);
+                }
                 tensors[j] = graph->nodes[graph->n_nodes - 1];
             }
+            // All rank submissions have returned; stream ordering protects the collective.
             if (i + 1 < n_steps) {
                 GGML_ASSERT(ggml_backend_cuda_comm_allreduce_nccl(comm, tensors.data()));
             }
         }
-        comm->tp_graph_active = false;
     };
 
+    if (!capture) {
+        GGML_LOG_DEBUG("%s: parallel execution of %zu TP segments without capture\n", __func__, n_steps);
+        evaluate(true);
+        return true;
+    }
+
+#ifdef USE_CUDA_GRAPH
+    comm->tp_graph_active = true;
     if (!comm->tp_graph_warmed) {
-        evaluate();
+        evaluate(parallel);
+        comm->tp_graph_active = false;
         comm->tp_graph_warmed = true;
         return true;
     }
@@ -4909,9 +4978,6 @@ static bool ggml_backend_cuda_comm_graph_compute(
     for (size_t j = 0; j < n; ++j) {
         auto * ctx = ctx_at(j);
         ggml_cuda_set_device(ctx->device);
-        for (size_t i = 0; i < n_steps; ++i) {
-            ggml_quactlize_execution_prepare_graph(*ctx, graphs[i*n + j]);
-        }
         CUDA_CHECK(cudaStreamSynchronize(ctx->stream()));
         comm->tp_graphs.emplace_back(std::make_unique<ggml_cuda_graph>());
     }
@@ -4924,7 +4990,8 @@ static bool ggml_backend_cuda_comm_graph_compute(
         ggml_cuda_set_device(ctx->device);
         CUDA_CHECK(cudaStreamBeginCapture(ctx->stream(), cudaStreamCaptureModeRelaxed));
     }
-    evaluate();
+    evaluate(false);
+    comm->tp_graph_active = false;
     for (size_t j = 0; j < n; ++j) {
         auto * ctx = ctx_at(j);
         ggml_cuda_set_device(ctx->device);
@@ -4944,6 +5011,7 @@ static bool ggml_backend_cuda_comm_graph_compute(
     GGML_LOG_INFO("%s: captured %zu segments and %zu AllReduces into one graph per device (%zu devices)\n",
                   __func__, n_steps, n_steps - 1, n);
     launch();
+#endif
     return true;
 }
 #endif
@@ -6101,7 +6169,7 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     if (strcmp(name, "ggml_backend_comm_allreduce_tensor") == 0) {
         return (void *)ggml_backend_cuda_comm_allreduce_tensor;
     }
-#if defined(USE_CUDA_GRAPH) && defined(GGML_USE_NCCL)
+#ifdef GGML_USE_NCCL
     if (strcmp(name, "ggml_backend_comm_graph_compute") == 0) {
         return (void *)ggml_backend_cuda_comm_graph_compute;
     }

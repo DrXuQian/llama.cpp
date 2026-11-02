@@ -112,6 +112,15 @@ Graph changes invalidate all ranks together and require another warmup before ca
 
 Each GPU has a persistent host launch thread, initialized before capture. Once all threads are ready, a shared barrier releases their graph submissions together. The caller waits for all launch API calls to return, without adding a device synchronization to replay. This avoids delaying later ranks behind an earlier rank's launch call; actual GPU start times still depend on stream dependencies and scheduling.
 
+The same threads submit ordinary kernels during warmup and prefill, including graphs that cannot be captured. For each TP segment, the ranks submit their kernel sequences concurrently. Once every host submission returns, the caller enqueues the existing NCCL/PCCL AllReduce on the same streams before dispatching the next segment. This adds no GPU synchronization between segments. K-pack plans are prepared serially before dispatch; capture itself remains on the caller thread.
+
+`GGML_CUDA_TP_PARALLEL=1` enables parallel submission independently of capture, including builds without CUDA graphs. It requires the NCCL/PCCL collective path. It defaults to the value of `GGML_CUDA_TP_GRAPHS`, so the command above enables both. `GGML_CUDA_DISABLE_GRAPHS` disables capture but leaves parallel submission enabled. Set `GGML_CUDA_TP_PARALLEL=0` to use serial host submission for comparison. To test parallel prefill without TP capture:
+
+```bash
+GGML_CUDA_TP_PARALLEL=1 GGML_CUDA_TP_GRAPHS=0 GGML_CUDA_ALLREDUCE=nccl \
+    llama-bench -m model.gguf -ngl 999 -sm tensor -p 512 -n 0 -r 1
+```
+
 ### 6. With CUDA peer-to-peer access (`GGML_CUDA_P2P`)
 
 CUDA peer-to-peer (P2P) lets GPUs transfer data directly between each other instead of going through system memory, which generally improves multi-GPU performance. It is **opt-in** at runtime - set the environment variable `GGML_CUDA_P2P` to any value to enable it:

@@ -230,7 +230,7 @@ void ggml_cuda_op_gated_delta_net(ggml_backend_cuda_context & ctx, ggml_tensor *
     // dst we return; otherwise we fall through to the inline kernel. A plain CUDA build (no GGML_NCP_GDN)
     // compiles to nothing — no dlopen, no extra symbols.
     if (ggml_cuda_op_gated_delta_net_ncp_so(ctx, dst)) {
-        static bool logged = false;   // one line the first time the .so actually serves a shape, not just loads
+        static thread_local bool logged = false;
         if (!logged) { logged = true; GGML_LOG_INFO("[ncp-lib] using external gated delta net / FLA (libncp_gdn.so)\n"); }
         return;
     }

@@ -578,7 +578,7 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     ggml_cuda_set_device(ctx.device);
 #ifdef GGML_NCP_FA
     if (ggml_cuda_flash_attn_ext_ncp_lib(ctx, dst)) {
-        static bool logged = false;   // one line the first time the .so actually serves a shape, not just loads
+        static thread_local bool logged = false;
         if (!logged) { logged = true; GGML_LOG_INFO("[ncp-lib] using external FlashAttention (libncp_fa.so)\n"); }
         return;
     }

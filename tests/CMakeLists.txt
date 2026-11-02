@@ -248,6 +248,9 @@ target_link_libraries(test-tp-graph PRIVATE Threads::Threads)
 set_tests_properties(test-tp-graph PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
 add_test(NAME test-tp-graph-host-launch COMMAND test-tp-graph --host-launch)
 set_tests_properties(test-tp-graph-host-launch PROPERTIES TIMEOUT 30)
+add_test(NAME test-tp-graph-eager COMMAND test-tp-graph --eager)
+add_test(NAME test-tp-graph-no-capture COMMAND test-tp-graph --no-capture)
+set_tests_properties(test-tp-graph-eager test-tp-graph-no-capture PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
 
 # NCP external kernel .so vs ggml's inline kernels. Needs at least one hook compiled in to have anything to compare;
 # the test itself skips cleanly when the .so is absent or the GPU backend exposes no route control, so the OR is only
