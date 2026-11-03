@@ -24,11 +24,12 @@ bool llama_kpack_create_ffn_tensor(llama_model_loader &                         
         tensor = llama_kpack_create_merged_tensor(loader, hparams, tn, ne, flags, buft_for_tensor, ctx_for_buft);
         return tensor != nullptr;
     }
-    // Preserve the architecture coverage of the original model-side merge.
-    const bool dense = (tn.arch == LLM_ARCH_QWEN3 || tn.arch == LLM_ARCH_QWEN35) &&
+    // Model-owned tensor names can retain UNKNOWN from construction. Use the GGUF architecture.
+    const auto arch  = loader.get_arch();
+    const bool dense = (arch == LLM_ARCH_QWEN3 || arch == LLM_ARCH_QWEN35) &&
                        (tn.tensor == LLM_TENSOR_FFN_GATE || tn.tensor == LLM_TENSOR_FFN_UP);
-    const bool shared = tn.arch == LLM_ARCH_QWEN35MOE &&
-                        (tn.tensor == LLM_TENSOR_FFN_GATE_SHEXP || tn.tensor == LLM_TENSOR_FFN_UP_SHEXP);
+    const bool shared =
+        arch == LLM_ARCH_QWEN35MOE && (tn.tensor == LLM_TENSOR_FFN_GATE_SHEXP || tn.tensor == LLM_TENSOR_FFN_UP_SHEXP);
     if ((!dense && !shared) || !tn.suffix || strcmp(tn.suffix, "weight") || ne.size() != 2 || ne.begin()[0] <= 0 ||
         ne.begin()[1] <= 0 || ne.begin()[1] > INT64_MAX / 2 ||
         (flags & (llama_model_loader::TENSOR_SKIP | llama_model_loader::TENSOR_DUPLICATED |
@@ -36,7 +37,7 @@ bool llama_kpack_create_ffn_tensor(llama_model_loader &                         
         return false;
     }
     const auto name =
-        LLM_TN_IMPL(tn.arch, shared ? LLM_TENSOR_FFN_GATE_UP_SHEXP : LLM_TENSOR_FFN_GATE_UP, "weight", tn.bid, tn.xid);
+        LLM_TN_IMPL(arch, shared ? LLM_TENSOR_FFN_GATE_UP_SHEXP : LLM_TENSOR_FFN_GATE_UP, "weight", tn.bid, tn.xid);
     const std::initializer_list<int64_t> shape  = {ne.begin()[0], 2 * ne.begin()[1]};
     ggml_tensor *                        merged = nullptr;
     if (const auto * weight = loader.get_weight(name.str().c_str())) {

@@ -443,13 +443,15 @@ static void test_paired_loading() {
     };
     size_t cases = 0;
     for (auto family : {LLM_ARCH_UNKNOWN, LLM_ARCH_QWEN3, LLM_ARCH_QWEN35, LLM_ARCH_QWEN35MOE}) {
-        const bool routed  = family == LLM_ARCH_UNKNOWN;
-        const bool shared  = family == LLM_ARCH_QWEN35MOE;
-        const auto arch    = routed ? LLM_ARCH_QWEN35MOE : family;
-        const auto tn      = LLM_TN(arch);
-        const auto gate_tn = tn(routed ? LLM_TENSOR_FFN_GATE_EXPS :
-                                shared ? LLM_TENSOR_FFN_GATE_SHEXP :
-                                         LLM_TENSOR_FFN_GATE,
+        const bool                   routed = family == LLM_ARCH_UNKNOWN;
+        const bool                   shared = family == LLM_ARCH_QWEN35MOE;
+        const auto                   arch   = routed ? LLM_ARCH_QWEN35MOE : family;
+        // Use the actual constructor/factory order, not a manually initialized naming helper.
+        std::unique_ptr<llama_model> model(llama_model_create(arch, llama_model_default_params()));
+        const auto &                 tn      = static_cast<llama_model_base *>(model.get())->tn;
+        const auto                   gate_tn = tn(routed ? LLM_TENSOR_FFN_GATE_EXPS :
+                                                  shared ? LLM_TENSOR_FFN_GATE_SHEXP :
+                                                           LLM_TENSOR_FFN_GATE,
                                 "weight", 0);
         const auto up_tn = tn(routed ? LLM_TENSOR_FFN_UP_EXPS :
                               shared ? LLM_TENSOR_FFN_UP_SHEXP :
