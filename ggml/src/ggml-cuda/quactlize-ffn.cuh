@@ -1,5 +1,5 @@
 #pragma once
-#include "ggml-impl.h"
+#include "../ggml-impl.h"
 #include <array>
 
 struct ggml_quactlize_ffn_graph {
