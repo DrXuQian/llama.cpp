@@ -173,8 +173,10 @@ int main(int argc, char ** argv) try {
     };
     size_t hits = 0, shuffles = 0;
     for (size_t i = 0; i < count; ++i) {
-        auto *     tensor = tensors[i];
-        const bool hit    = cache->load(tensor);
+        auto * tensor = tensors[i];
+        fprintf(stderr, "KPACK_CACHE_TENSOR mode=%s tensor=%s parts=%zu\n", mode.c_str(), tensor->name,
+                inventory[i].parts.size());
+        const bool hit = cache->load(tensor);
         check(hit == (hot && (!partial || i == 0)), "unexpected per-tensor cache result");
         if (hit) {
             ++hits;
@@ -184,12 +186,19 @@ int main(int argc, char ** argv) try {
                 auto raw = bytes(tensor->name);
                 ggml_backend_tensor_set(tensor, raw.data(), 0, raw.size());
             } else {
-                const size_t width = tensor->nb[2] / 2;
+                check(parts.size() == 2, "paired fixture needs Gate and Up");
+                const size_t         width = tensor->nb[2] / 2;
+                const size_t         rows  = tensor->ne[2] * tensor->ne[3];
+                // Meta requires complete Gate/Up planes, not separate half-plane writes.
+                std::vector<uint8_t> merged(ggml_nbytes(tensor));
                 for (size_t side = 0; side < parts.size(); ++side) {
                     auto raw = bytes(parts[side].name);
-                    ggml_backend_tensor_set_2d(tensor, raw.data(), side * width, width, tensor->ne[2] * tensor->ne[3],
-                                               2 * width, width);
+                    check(raw.size() == width * rows, "paired fixture source size differs");
+                    for (size_t row = 0; row < rows; ++row) {
+                        memcpy(merged.data() + (2 * row + side) * width, raw.data() + row * width, width);
+                    }
                 }
+                ggml_backend_tensor_set(tensor, merged.data(), 0, merged.size());
             }
             ++shuffles;
             if (!partial || i == 0) {

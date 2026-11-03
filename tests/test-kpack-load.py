@@ -146,14 +146,14 @@ def check_compute_log(text, suite, qtype):
             raise RuntimeError(f'{weight}: missing or duplicated Quactlize plans (aliases must share the owner plan)')
 
 
-def print_compute_failure(log):
+def print_failure(log, suite='COMPUTE'):
     try:
         lines = log.read_text(errors='replace').splitlines()
     except OSError as error:
-        print(f'KPACK_COMPUTE_DIAGNOSTIC log={log} unavailable={error}', flush=True)
+        print(f'KPACK_{suite}_DIAGNOSTIC log={log} unavailable={error}', flush=True)
         return
-    print(f'KPACK_COMPUTE_DIAGNOSTIC_BEGIN log={log}', flush=True)
-    for marker in ('KPACK_DENSE_START', 'KPACK_MOE_START', 'KPACK_FFN_START', '[quactlize-dense]', '[quactlize-moe]', '[quactlize-ffn]', 'KPACK_JIT_RESOLVE'):
+    print(f'KPACK_{suite}_DIAGNOSTIC_BEGIN log={log}', flush=True)
+    for marker in ('KPACK_DENSE_START', 'KPACK_MOE_START', 'KPACK_FFN_START', '[quactlize-dense]', '[quactlize-moe]', '[quactlize-ffn]', 'KPACK_JIT_RESOLVE', 'KPACK_CACHE_TENSOR'):
         last = next((line for line in reversed(lines) if marker in line), None)
         if last:
             print(f'last_context: {last}', flush=True)
@@ -170,7 +170,7 @@ def print_compute_failure(log):
             print(f'... {i - previous - 1} log lines omitted ...', flush=True)
         print(f'{i + 1}: {lines[i]}', flush=True)
         previous = i
-    print('KPACK_COMPUTE_DIAGNOSTIC_END', flush=True)
+    print(f'KPACK_{suite}_DIAGNOSTIC_END', flush=True)
 
 
 def run_compute_suite(args):
@@ -212,7 +212,7 @@ def run_compute_suite(args):
         except (OSError, RuntimeError, ValueError) as error:
             failures.append(str(error))
             print(f'KPACK_COMPUTE_FAIL q={qtype} error={error} remaining_continue=1', flush=True)
-            print_compute_failure(args.output / f'q{qtype}.log')
+            print_failure(args.output / f'q{qtype}.log')
     if args.compute == 'contract':
         try:
             default_env = {k: v for k, v in env.items() if k != 'GGML_QUACTLIZE'}
@@ -221,7 +221,7 @@ def run_compute_suite(args):
         except (OSError, RuntimeError, ValueError) as error:
             failures.append(str(error))
             print(f'KPACK_COMPUTE_FAIL case=default-enabled error={error} remaining_continue=1', flush=True)
-            print_compute_failure(args.output / 'default-enabled.log')
+            print_failure(args.output / 'default-enabled.log')
         for name, extra, changes, marker in (
             ('disabled', [], {'GGML_QUACTLIZE': '0'}, 'aligned shape was rejected'),
             ('invalid-switch', [], {'GGML_QUACTLIZE': 'invalid'}, 'GGML_QUACTLIZE must be 0 or 1'),
@@ -232,7 +232,7 @@ def run_compute_suite(args):
             except (OSError, RuntimeError) as error:
                 failures.append(str(error))
                 print(f'KPACK_COMPUTE_FAIL case={name} error={error} remaining_continue=1', flush=True)
-                print_compute_failure(args.output / (name + '.log'))
+                print_failure(args.output / (name + '.log'))
     if failures:
         raise RuntimeError(f'{args.compute}: {len(failures)} failed checks; results={args.output}')
     print(f'KPACK_COMPUTE_SUITE PASS suite={args.compute} formats=6 results={args.output}', flush=True)
@@ -398,11 +398,13 @@ def run_suite(args):
 
     def run(name, argv, environment, expected_rc, marker):
         log = args.output / (name + '.log')
+        print(f'KPACK_LOAD_CHECK case={name} status=START log={log}', flush=True)
         with log.open('x') as out:
             result = subprocess.run(argv, env=environment, stdout=out, stderr=subprocess.STDOUT)
         text = log.read_text(errors='replace')
         accepted_rc = result.returncode != 0 if expected_rc is None else result.returncode == expected_rc
         if not accepted_rc or marker not in text:
+            print_failure(log, 'LOAD')
             raise RuntimeError(f'{name}: rc={result.returncode}; see {log}')
         print(f'KPACK_LOAD_CHECK case={name} status=PASS log={log}', flush=True)
         return text
