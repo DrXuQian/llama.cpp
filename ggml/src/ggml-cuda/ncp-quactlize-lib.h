@@ -112,6 +112,7 @@ void         quactlize_ppu_dense_destroy_v1(void * context);
 const char * quactlize_ppu_dense_error_v1(void);
 
 // Optional FFN composition in the same library. Canonical planes only; no weight repacking.
+// Graph composition does not imply GEMM-internal SwiGLU fusion.
 enum { QUACTLIZE_FFN_DENSE = 0, QUACTLIZE_FFN_MOE = 1 };
 
 typedef struct {

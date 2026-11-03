@@ -910,7 +910,7 @@ static bool test_kpack_ffn(ggml_backend_t backend, int qtype) {
             }
         }
         dense_require(cases == (qtype == -1 ? 120 : 20), "incomplete FFN coverage");
-        printf("KPACK_FFN PASS cases=%d scope=FUSED_VS_INDEPENDENT_GRAPH\n", cases);
+        printf("KPACK_FFN PASS cases=%d scope=COMPOSED_VS_INDEPENDENT_GRAPH\n", cases);
         return true;
     } catch (const std::exception & error) {
         fprintf(stderr, "KPACK_FFN FAIL: %s\n", error.what());

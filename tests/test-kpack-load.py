@@ -78,11 +78,11 @@ def check_compute_log(text, suite, qtype):
                           r'replays=4 relative=(\S+) status=PASS$', text, re.MULTILINE)
         plans = re.findall(r'\[quactlize-ffn\] tensor=ffn-test-gate device=\d+ kind=([01]) '
                            r'm=(\d+) merged=([01]) ', text)
-        if (text.count('KPACK_FFN PASS cases=20 scope=FUSED_VS_INDEPENDENT_GRAPH') != 1 or
+        if (text.count('KPACK_FFN PASS cases=20 scope=COMPOSED_VS_INDEPENDENT_GRAPH') != 1 or
                 len(rows) != len(expected) or {tuple(map(int,r[:3])) for r in rows} != expected or
                 len(plans) != len(expected) or {(int(k),int(g),int(m)) for k,m,g in plans} != expected or
                 any(not math.isfinite(float(r[3])) or not 0 <= float(r[3]) < .02 for r in rows)):
-            raise RuntimeError('incomplete FFN numerical/actual fusion coverage')
+            raise RuntimeError('incomplete FFN numerical/graph composition coverage')
         projections = re.findall(
             rf'\[quactlize-ffn-projection\] tensor=ffn-test-gate stage=([012]) device=\d+ kind=([01]) '
             rf'm=(\d+) merged=([01]) q={qtype} n=(\d+) k=(\d+) experts=(\d+) topk=(\d+) '
