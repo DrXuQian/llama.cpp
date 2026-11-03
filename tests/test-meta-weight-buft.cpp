@@ -263,6 +263,104 @@ static void test_split_metadata() {
     puts("META_SPLIT_METADATA PASS early_late=IDENTICAL loader_lifetime=SCOPED");
 }
 
+static void test_shared_ffn_split() {
+    ggml_backend_device host{};
+    host.iface.get_name = [](ggml_backend_dev_t) {
+        return "shared-ffn-host";
+    };
+    host.iface.get_description = host.iface.get_name;
+    host.iface.get_buffer_type = [](ggml_backend_dev_t) {
+        return ggml_backend_cpu_buffer_type();
+    };
+    size_t cases = 0;
+    for (auto arch : {LLM_ARCH_QWEN35MOE, LLM_ARCH_QWEN3NEXT, LLM_ARCH_DEEPSEEK2, LLM_ARCH_DEEPSEEK4}) {
+        auto params         = llama_model_default_params();
+        params.n_gpu_layers = 0;
+        std::unique_ptr<llama_model> model(llama_model_create(arch, params));
+        auto &                       hp = model->hparams;
+        hp.n_layer_all                  = 2;
+        hp.n_embd                       = 512;
+        hp.n_head_arr.fill(8);
+        hp.n_head_kv_arr.fill(8);
+        hp.n_embd_head_k_full = 64;
+        hp.ssm_d_state        = 128;
+        hp.ssm_n_group        = 4;
+        hp.ssm_dt_rank        = 8;
+        for (size_t count : {2, 4}) {
+            for (int layer : {0, 1}) {
+                for (auto type :
+                     {GGML_TYPE_Q8_0, GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K}) {
+                    ggml_context_ptr weights(ggml_init({4 * ggml_tensor_overhead(), nullptr, true}));
+                    auto             weight = [&](const char * name, int64_t n, int64_t k) {
+                        auto * t = ggml_new_tensor_2d(weights.get(), type, k, n);
+                        ggml_format_name(t, "blk.%d.%s.weight", layer, name);
+                        ggml_set_param(t);
+                        return t;
+                    };
+                    auto * gate            = weight("ffn_gate_shexp", 512, 512);
+                    auto * up              = weight("ffn_up_shexp", 512, 512);
+                    auto * merged          = weight("ffn_gate_up_shexp", 1024, 512);
+                    auto * down            = weight("ffn_down_shexp", 512, 512);
+                    model->tensors_by_name = {
+                        {gate->name, gate}, {up->name, up}, {merged->name, merged}, {down->name, down}};
+                    llama_meta_device_get_split_state_userdata data{count, model.get(), nullptr};
+                    const auto gate_split   = llama_meta_device_get_split_state(gate, &data);
+                    const auto merged_split = llama_meta_device_get_split_state(merged, &data);
+                    const auto down_split   = llama_meta_device_get_split_state(down, &data);
+                    const bool sharded      = arch == LLM_ARCH_DEEPSEEK4;
+                    check(
+                        gate_split.axis == (sharded ? GGML_BACKEND_SPLIT_AXIS_1 : GGML_BACKEND_SPLIT_AXIS_MIRRORED) &&
+                            down_split.axis == (sharded ? GGML_BACKEND_SPLIT_AXIS_0 : GGML_BACKEND_SPLIT_AXIS_MIRRORED),
+                        "original shared FFN placement changed");
+                    std::vector<ggml_backend_dev_t> devices(count, &host);
+                    auto *                          meta =
+                        ggml_backend_meta_device(devices.data(), count, llama_meta_device_get_split_state, &data);
+                    auto *                  buft = ggml_backend_dev_buffer_type(meta);
+                    ggml_backend_buffer_ptr buffer(ggml_backend_alloc_ctx_tensors_from_buft(weights.get(), buft));
+                    check(bool(buffer), "shared FFN weight allocation failed");
+                    ggml_context_ptr ctx(ggml_init(
+                        {16 * ggml_tensor_overhead() + ggml_graph_overhead_custom(16, false), nullptr, true}));
+                    auto *           input = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, 512, layer == 0 ? 1 : 16);
+                    ggml_set_name(input, "shared-input");
+                    ggml_set_input(input);
+                    auto * separate   = ggml_swiglu_split(ctx.get(), ggml_mul_mat(ctx.get(), gate, input),
+                                                          ggml_mul_mat(ctx.get(), up, input));
+                    auto * activation = ggml_swiglu(ctx.get(), ggml_mul_mat(ctx.get(), merged, input));
+                    ggml_set_name(activation, "ffn_swiglu-0");
+                    auto * reference = ggml_mul_mat(ctx.get(), down, separate);
+                    auto * output    = ggml_mul_mat(ctx.get(), down, activation);
+                    ggml_set_name(output, "ffn_shexp-0");
+                    ggml_set_output(reference);
+                    ggml_set_output(output);
+                    auto * graph = ggml_new_graph_custom(ctx.get(), 16, false);
+                    ggml_build_forward_expand(graph, reference);
+                    ggml_build_forward_expand(graph, output);
+                    std::unique_ptr<ggml_gallocr, decltype(&ggml_gallocr_free)> allocator(ggml_gallocr_new(buft),
+                                                                                          ggml_gallocr_free);
+                    check(ggml_gallocr_alloc_graph(allocator.get(), graph), "shared FFN graph allocation failed");
+                    check(merged_split.axis == gate_split.axis, "merged shared FFN changed original placement");
+                    for (size_t rank = 0; rank < count; ++rank) {
+                        auto * local_gate       = ggml_backend_meta_tensor_shard(gate, rank, nullptr);
+                        auto * local_merged     = ggml_backend_meta_tensor_shard(merged, rank, nullptr);
+                        auto * local_down       = ggml_backend_meta_tensor_shard(down, rank, nullptr);
+                        auto * local_activation = ggml_backend_meta_tensor_shard(activation, rank, nullptr);
+                        ggml_backend_meta_split_state expected{}, actual{};
+                        auto * local_reference = ggml_backend_meta_tensor_shard(reference, rank, &expected);
+                        auto * local_output    = ggml_backend_meta_tensor_shard(output, rank, &actual);
+                        check(local_merged->ne[1] == 2 * local_gate->ne[1] &&
+                                  local_activation->ne[0] == local_down->ne[0] &&
+                                  ggml_are_same_shape(local_reference, local_output) &&
+                                  memcmp(&expected, &actual, sizeof(expected)) == 0,
+                              "merged shared FFN local matmul or reduction differs");
+                    }
+                    ++cases;
+                }
+            }
+        }
+    }
+    printf("META_SHARED_FFN PASS cases=%zu split_geometry=IDENTICAL tp2_tp4=PASS\n", cases);
+}
+
 static void test_paired_loading() {
     ggml_backend_device host{};
     host.iface.get_name = [](ggml_backend_dev_t) {
@@ -400,6 +498,7 @@ int main() {
     try {
         test_weight_selection();
         test_split_metadata();
+        test_shared_ffn_split();
         test_paired_loading();
         return 0;
     } catch (const std::exception & error) {
