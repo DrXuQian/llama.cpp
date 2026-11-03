@@ -11,6 +11,36 @@ struct ggml_quactlize_ffn_graph {
     int           count   = 0;
 };
 
+// Graph allocation can reuse A/IDs/routing storage for the final output.
+// Such bindings require the library's lifetime-aware execution entry.
+inline bool ggml_quactlize_ffn_input_aliases(const ggml_quactlize_ffn_graph & match, uint32_t & mask) {
+    mask = 0;
+    if (!match.gate || !match.output || !match.output->data) {
+        return false;
+    }
+    const uintptr_t out  = reinterpret_cast<uintptr_t>(match.output->data);
+    const size_t    size = ggml_nbytes(match.output);
+    if (size > UINTPTR_MAX - out) {
+        return false;
+    }
+    const std::array<const ggml_tensor *, 3> inputs = {match.gate->src[1], match.gate->src[2], match.weights};
+    for (size_t i = 0; i < inputs.size(); ++i) {
+        const auto * input = inputs[i];
+        if (!input) {
+            continue;
+        }
+        const uintptr_t address = reinterpret_cast<uintptr_t>(input->data);
+        const size_t    bytes   = ggml_nbytes(input);
+        if (!address || bytes > UINTPTR_MAX - address) {
+            return false;
+        }
+        if (address < out + size && out < address + bytes) {
+            mask |= 1u << i;
+        }
+    }
+    return true;
+}
+
 // Match only ordinary SwiGLU and the original ordered expert sum. Bias,
 // clamps, adapters and collectives interrupt the match and remain unfused.
 inline ggml_quactlize_ffn_graph ggml_quactlize_match_ffn(const ggml_cgraph * graph, int start) {

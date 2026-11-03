@@ -1023,6 +1023,33 @@ static bool test_ffn_match() {
                     }
                     dense_require(ggml_quactlize_match_ffn(graph, start).count == match.count,
                                   "FFN graph restore differs");
+                    const std::array<ggml_tensor *, 3> sources = {gate->src[1], gate->src[2], match.weights};
+                    match.output->data                         = reinterpret_cast<void *>(uintptr_t(1) << 32);
+                    for (size_t i = 0; i < sources.size(); ++i) {
+                        if (sources[i]) {
+                            sources[i]->data = reinterpret_cast<void *>(uintptr_t(i + 2) << 32);
+                        }
+                    }
+                    uint32_t aliases = 0;
+                    dense_require(ggml_quactlize_ffn_input_aliases(match, aliases) && !aliases,
+                                  "FFN marked disjoint inputs as aliases");
+                    for (size_t i = 0; i < sources.size(); ++i) {
+                        auto * source = sources[i];
+                        if (!source) {
+                            continue;
+                        }
+                        void * saved_data = source->data;
+                        source->data      = static_cast<char *>(match.output->data) + 16;
+                        dense_require(ggml_quactlize_ffn_input_aliases(match, aliases) && aliases == (1u << i),
+                                      "FFN missed an overlapping input");
+                        source->data = static_cast<char *>(match.output->data) + ggml_nbytes(match.output);
+                        dense_require(ggml_quactlize_ffn_input_aliases(match, aliases) && !aliases,
+                                      "FFN marked an adjacent input as an alias");
+                        source->data = nullptr;
+                        dense_require(!ggml_quactlize_ffn_input_aliases(match, aliases),
+                                      "FFN accepted an unallocated input");
+                        source->data = saved_data;
+                    }
                     ++cases;
                 }
             }
@@ -1031,6 +1058,68 @@ static bool test_ffn_match() {
     dense_require(cases == 193, "incomplete FFN matcher shape coverage");
     dense_require(!ggml_quactlize_match_ffn(nullptr, 0).count, "FFN accepted a null graph");
     printf("KPACK_FFN_MATCH PASS cases=%d scope=HOST_GRAPH_ONLY\n", cases);
+    return true;
+}
+
+static bool test_ffn_allocator() {
+    int cases = 0;
+    for (int m : {1, 8, 64, 2048}) {
+        ggml_context_ptr        ctx(ggml_init({4 * 1024 * 1024, nullptr, true}));
+        auto *                  c     = ctx.get();
+        auto *                  graph = ggml_new_graph_custom(c, 2048, false);
+        const int               k = 64, hidden = 32, experts = 8, topk = 2;
+        // Only allocate the graph. No weight values or compute are needed here.
+        ggml_backend_buffer_ptr weights(ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(), 256));
+        ggml_backend_buffer_set_usage(weights.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+        auto weight = [&](int inner, int cols, int count) {
+            auto * w  = ggml_new_tensor_3d(c, GGML_TYPE_F32, inner, cols, count);
+            w->buffer = weights.get();
+            w->data   = ggml_backend_buffer_get_base(weights.get());
+            return w;
+        };
+        auto * cur = ggml_new_tensor_2d(c, GGML_TYPE_F32, k, m);
+        ggml_set_input(cur);
+        std::vector<ggml_tensor *> starts;
+        for (int layer = 0; layer < 40; ++layer) {
+            auto * residual = cur;
+            auto * input    = ggml_rms_norm(c, cur, 1e-6f);
+            auto * probs    = ggml_soft_max(c, ggml_mul_mat(c, weight(k, experts, 1), input));
+            auto * ids      = ggml_top_k(c, probs, topk);
+            auto * routing  = ggml_get_rows(c, ggml_reshape_3d(c, probs, 1, experts, m), ids);
+            routing         = ggml_reshape_2d(c, routing, topk, m);
+            routing         = ggml_reshape_3d(c, ggml_div(c, routing, ggml_sum_rows(c, routing)), 1, topk, m);
+            ggml_build_forward_expand(graph, routing);
+            auto * gate = ggml_mul_mat_id(c, weight(k, 2 * hidden, experts), ggml_reshape_3d(c, input, k, 1, m), ids);
+            starts.push_back(gate);
+            auto * g        = ggml_view_3d(c, gate, hidden, topk, m, gate->nb[1], gate->nb[2], 0);
+            auto * u        = ggml_view_3d(c, gate, hidden, topk, m, gate->nb[1], gate->nb[2], hidden * sizeof(float));
+            auto * down     = ggml_mul_mat_id(c, weight(hidden, k, experts), ggml_swiglu_split(c, g, u), ids);
+            auto * weighted = ggml_mul(c, down, routing);
+            auto * a        = ggml_view_2d(c, weighted, k, m, weighted->nb[2], 0);
+            auto * b        = ggml_view_2d(c, weighted, k, m, weighted->nb[2], weighted->nb[1]);
+            cur             = ggml_add(c, ggml_add(c, a, b), residual);
+        }
+        ggml_set_output(cur);
+        ggml_build_forward_expand(graph, cur);
+        ggml_gallocr_ptr alloc(ggml_gallocr_new(ggml_backend_cpu_buffer_type()));
+        dense_require(ggml_gallocr_alloc_graph(alloc.get(), graph), "FFN allocator fixture failed");
+        int aliases = 0;
+        for (const auto * gate : starts) {
+            int start = 0;
+            while (start < graph->n_nodes && graph->nodes[start] != gate) {
+                ++start;
+            }
+            const auto match = ggml_quactlize_match_ffn(graph, start);
+            uint32_t   mask  = 0;
+            dense_require(match.count && ggml_quactlize_ffn_input_aliases(match, mask),
+                          "FFN rejected a graph-allocator input alias");
+            aliases += mask != 0;
+            ++cases;
+        }
+        dense_require(aliases > 0, "FFN allocator fixture did not exercise input reuse");
+        printf("KPACK_FFN_ALLOCATION m=%d layers=40 aliases=%d status=PASS\n", m, aliases);
+    }
+    printf("KPACK_FFN_ALLOCATION PASS cases=%d scope=HOST_ALLOCATION_ONLY\n", cases);
     return true;
 }
 
@@ -1044,7 +1133,7 @@ static void usage(char ** argv) {
 int main(int argc, char ** argv) {
     if (argc == 2 && !strcmp(argv[1], "--ffn-match")) {
         try {
-            return test_ffn_match() ? 0 : 1;
+            return test_ffn_match() && test_ffn_allocator() ? 0 : 1;
         } catch (const std::exception & e) {
             fprintf(stderr, "KPACK_FFN_MATCH FAIL: %s\n", e.what());
             return 1;

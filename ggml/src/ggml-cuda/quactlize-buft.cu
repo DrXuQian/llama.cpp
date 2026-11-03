@@ -40,6 +40,7 @@ struct quactlize_library {
     decltype(&quactlize_ppu_ffn_create_v1)    ffn_create    = nullptr;
     decltype(&quactlize_ppu_ffn_prepare_v1)   ffn_prepare   = nullptr;
     decltype(&quactlize_ppu_ffn_run_v1)       ffn_run       = nullptr;
+    decltype(&quactlize_ppu_ffn_run_v1)              ffn_run_alias   = nullptr;
     decltype(&quactlize_ppu_ffn_destroy_v1)   ffn_destroy   = nullptr;
     decltype(&quactlize_ppu_ffn_error_v1)     ffn_error     = nullptr;
 
@@ -82,12 +83,15 @@ struct quactlize_library {
         QZ_FFN_BIND(ffn_create, quactlize_ppu_ffn_create_v1);
         QZ_FFN_BIND(ffn_prepare, quactlize_ppu_ffn_prepare_v1);
         QZ_FFN_BIND(ffn_run, quactlize_ppu_ffn_run_v1);
+        QZ_FFN_BIND(ffn_run_alias, quactlize_ppu_ffn_run_v2);
         QZ_FFN_BIND(ffn_destroy, quactlize_ppu_ffn_destroy_v1);
         QZ_FFN_BIND(ffn_error, quactlize_ppu_ffn_error_v1);
 #    undef QZ_FFN_BIND
         if (!ffn_supported || !ffn_create || !ffn_prepare || !ffn_run || !ffn_destroy || !ffn_error) {
             ffn_supported = nullptr;
             GGML_LOG_WARN("quactlize: optional FFN ABI unavailable; using independent projections\n");
+        } else if (!ffn_run_alias) {
+            GGML_LOG_WARN("quactlize: FFN alias-safe ABI unavailable; reused input storage prevents FFN composition\n");
         }
         GGML_LOG_INFO("[quactlize] loaded %s\n", path);
     }
@@ -366,16 +370,8 @@ bool ffn_params(ggml_backend_cuda_context & cuda_ctx, const ggml_cgraph * graph,
         params.input_row_stride = params.input_token_stride = p.input_stride;
     }
     params.output_stride = match.output->nb[1] / sizeof(float);
-    auto overlap = [&](const ggml_tensor * input) {
-        if (!input) {
-            return false;
-        }
-        const uintptr_t a = reinterpret_cast<uintptr_t>(input->data);
-        const uintptr_t b = reinterpret_cast<uintptr_t>(match.output->data);
-        const size_t as = ggml_nbytes(input), bs = ggml_nbytes(match.output);
-        return !a || !b || as > UINTPTR_MAX - a || bs > UINTPTR_MAX - b || (a < b + bs && b < a + as);
-    };
-    if (overlap(match.gate->src[1]) || overlap(match.gate->src[2]) || overlap(match.weights)) {
+    uint32_t aliases     = 0;
+    if (!ggml_quactlize_ffn_input_aliases(match, aliases) || (aliases && !library().ffn_run_alias)) {
         return false;
     }
     return library().ffn_supported(&params) == 1;
@@ -431,9 +427,14 @@ void prepare_ffn(ggml_backend_cuda_context & cuda_ctx, const ggml_quactlize_ffn_
                       w.qtype, w.n, w.k, w.experts, params.topk, p.route, p.policy, p.split, p.compute_type, p.config);
     }
     state.ffn_plans.emplace(key, plan);
-    GGML_LOG_INFO("[quactlize-ffn] tensor=%s device=%d kind=%d m=%d merged=%d nodes=%d prepare=%d/%d finish=%d workspace=%" PRIu64 "\n",
-                  owner->name, ctx->device, params.kind, params.tokens, params.merged, match.count,
-                  plan.info.prepare_stage, plan.info.prepare_helper, plan.info.finish_helper, plan.info.workspace_bytes);
+    uint32_t aliases = 0;
+    GGML_ASSERT(ggml_quactlize_ffn_input_aliases(match, aliases));
+    GGML_LOG_INFO(
+        "[quactlize-ffn] tensor=%s device=%d kind=%d m=%d merged=%d nodes=%d prepare=%d/%d finish=%d workspace=%" PRIu64
+        " input_alias_mask=%u alias_safe=%d\n",
+        owner->name, ctx->device, params.kind, params.tokens, params.merged, match.count, plan.info.prepare_stage,
+        plan.info.prepare_helper, plan.info.finish_helper, plan.info.workspace_bytes, aliases,
+        int(api.ffn_run_alias != nullptr));
 }
 
 void free_buffer(ggml_backend_buffer_t buffer) {
@@ -1084,10 +1085,11 @@ int ggml_quactlize_try_ffn(ggml_backend_cuda_context & cuda_ctx, const ggml_cgra
         workspace.alloc(plan.info.workspace_bytes);
     }
     const auto & api = library();
-    if (api.ffn_run(plan.handle, static_cast<const float *>(match.gate->src[1]->data),
-                    match.gate->src[2] ? static_cast<const int32_t *>(match.gate->src[2]->data) : nullptr,
-                    match.weights ? static_cast<const float *>(match.weights->data) : nullptr,
-                    static_cast<float *>(match.output->data), workspace.get(), plan.info.workspace_bytes, cuda_ctx.stream())) {
+    const auto   run = api.ffn_run_alias ? api.ffn_run_alias : api.ffn_run;
+    if (run(plan.handle, static_cast<const float *>(match.gate->src[1]->data),
+            match.gate->src[2] ? static_cast<const int32_t *>(match.gate->src[2]->data) : nullptr,
+            match.weights ? static_cast<const float *>(match.weights->data) : nullptr,
+            static_cast<float *>(match.output->data), workspace.get(), plan.info.workspace_bytes, cuda_ctx.stream())) {
         GGML_ABORT("quactlize: FFN run %s: %s", match.output->name, api.ffn_error());
     }
     return match.count - 1;
