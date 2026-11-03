@@ -5,6 +5,18 @@
 
 #    include <functional>
 
+// A handled Gate request returns NULL; its Up request returns the resident 2N weight.
+bool llama_kpack_create_ffn_tensor(llama_model_loader &                                              loader,
+                                   const llama_hparams &                                             hparams,
+                                   const LLM_TN_IMPL &                                               tn,
+                                   const std::initializer_list<int64_t> &                            ne,
+                                   int                                                               flags,
+                                   const std::function<ggml_backend_buffer_type_t(ggml_tensor *)> &  buft_for_tensor,
+                                   const std::function<ggml_context *(ggml_backend_buffer_type_t)> & ctx_for_buft,
+                                   ggml_tensor *&                                                    tensor);
+
+bool llama_kpack_is_merged_ffn_weight(const ggml_tensor * tensor);
+
 ggml_tensor * llama_kpack_create_merged_tensor(
     llama_model_loader &                                              loader,
     const llama_hparams &                                             hparams,

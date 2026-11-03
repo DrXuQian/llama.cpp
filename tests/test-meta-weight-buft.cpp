@@ -7,6 +7,7 @@
 #include "../src/llama-model.h"
 #ifdef GGML_NCP_QUACTLIZE
 #    include "../src/llama-kpack-merge.h"
+#    include "../src/llama-graph.h"
 #endif
 
 #include <cstdio>
@@ -365,11 +366,64 @@ static void test_shared_ffn_split() {
     printf("META_SHARED_FFN PASS cases=%zu split_geometry=IDENTICAL tp2_tp4=PASS\n", cases);
 }
 
+static void test_common_ffn_build() {
+    size_t cases = 0;
+    for (const char * name : {"blk.0.ffn_gate_up.weight", "blk.0.ffn_gate_up_shexp.weight"}) {
+        for (auto type :
+             {GGML_TYPE_Q8_0, GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K}) {
+            for (int m : {1, 8, 2048}) {
+                llm_graph_result    result(32);
+                llm_graph_params    params{};
+                llama_adapter_loras loras;
+                params.res                 = &result;
+                params.loras               = &loras;
+                params.hparams.n_embd      = 1024;
+                params.hparams.n_layer_all = 1;
+                params.hparams.n_head_arr.fill(16);
+                params.hparams.n_head_kv_arr.fill(16);
+                params.hparams.n_embd_head_k_full = params.hparams.n_embd_head_v_full = 64;
+                params.ubatch.n_tokens                                                = m;
+                llm_graph_context graph(params);
+                auto *            ctx   = result.get_ctx();
+                auto *            up    = ggml_new_tensor_2d(ctx, type, 1024, 1024);
+                auto *            down  = ggml_new_tensor_2d(ctx, type, 512, 1024);
+                auto *            input = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1024, m);
+                ggml_set_name(up, name);
+                auto build = [&](llm_ffn_op_type op) {
+                    return graph.build_ffn(input, up, nullptr, nullptr, nullptr, nullptr, nullptr, down, nullptr,
+                                           nullptr, nullptr, op, LLM_FFN_PAR, 0);
+                };
+                auto * output    = build(LLM_FFN_SILU);
+                auto * reference = build(LLM_FFN_SWIGLU);
+                ggml_build_forward_expand(result.get_gf(), output);
+                check(ggml_graph_n_nodes(result.get_gf()) == 3, "common FFN lost the single 2N projection");
+                while (output != input) {
+                    check(output->op == reference->op && output->type == reference->type &&
+                              ggml_are_same_shape(output, reference) && ggml_are_same_stride(output, reference) &&
+                              memcmp(output->op_params, reference->op_params, sizeof(output->op_params)) == 0,
+                          "common FFN differs from the previous merged graph");
+                    if (output->op == GGML_OP_GLU) {
+                        check(ggml_get_glu_op(output) == GGML_GLU_OP_SWIGLU && !output->src[1], "merged GLU changed");
+                        output    = output->src[0];
+                        reference = reference->src[0];
+                    } else {
+                        check(output->src[0] == reference->src[0], "projection weight changed");
+                        output    = output->src[1];
+                        reference = reference->src[1];
+                    }
+                }
+                ++cases;
+            }
+        }
+    }
+    printf("KPACK_COMMON_FFN PASS cases=%zu merged_graph=IDENTICAL\n", cases);
+}
+
 static void test_paired_loading() {
     ggml_backend_device host{};
     ggml_backend_reg    reg{};
     auto                packed = *ggml_backend_cpu_buffer_type();
-    packed.device = &host;
+    packed.device              = &host;
     host.reg                   = &reg;
     reg.iface.get_proc_address = [](ggml_backend_reg_t, const char * name) -> void * {
         if (strcmp(name, "ggml_cuda_buft_is_quactlize") == 0) {
@@ -388,169 +442,205 @@ static void test_paired_loading() {
         return ggml_backend_cpu_buffer_type();
     };
     size_t cases = 0;
-    for (auto type : {GGML_TYPE_Q8_0, GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K}) {
-        for (int experts : {1, 4}) {
-            ggml_context_ptr source_ctx(ggml_init({2 * ggml_tensor_overhead(), nullptr, true}));
-            gguf_context_ptr gguf(gguf_init_empty());
-            gguf_set_val_str(gguf.get(), "general.architecture", "qwen35moe");
-            std::vector<uint8_t> source_data[2];
-            for (int side = 0; side < 2; ++side) {
-                auto * tensor = ggml_new_tensor_3d(source_ctx.get(), type, 1024, 512, experts);
-                ggml_set_name(tensor, side == 0 ? "blk.0.ffn_gate_exps.weight" : "blk.0.ffn_up_exps.weight");
-                source_data[side].resize(ggml_nbytes(tensor));
-                for (size_t i = 0; i < source_data[side].size(); ++i) {
-                    // Distinct row/expert bytes, with finite scales in every quantized block.
-                    source_data[side][i] = (i % 251 + i / tensor->nb[1] + 17 * (i / tensor->nb[2]) + side * 13) % 64;
+    for (auto family : {LLM_ARCH_UNKNOWN, LLM_ARCH_QWEN3, LLM_ARCH_QWEN35, LLM_ARCH_QWEN35MOE}) {
+        const bool routed  = family == LLM_ARCH_UNKNOWN;
+        const bool shared  = family == LLM_ARCH_QWEN35MOE;
+        const auto arch    = routed ? LLM_ARCH_QWEN35MOE : family;
+        const auto tn      = LLM_TN(arch);
+        const auto gate_tn = tn(routed ? LLM_TENSOR_FFN_GATE_EXPS :
+                                shared ? LLM_TENSOR_FFN_GATE_SHEXP :
+                                         LLM_TENSOR_FFN_GATE,
+                                "weight", 0);
+        const auto up_tn = tn(routed ? LLM_TENSOR_FFN_UP_EXPS :
+                              shared ? LLM_TENSOR_FFN_UP_SHEXP :
+                                       LLM_TENSOR_FFN_UP,
+                              "weight", 0);
+        const auto name = tn(routed ? LLM_TENSOR_FFN_GATE_UP_EXPS :
+                             shared ? LLM_TENSOR_FFN_GATE_UP_SHEXP :
+                                      LLM_TENSOR_FFN_GATE_UP,
+                             "weight", 0);
+        const std::string gate_name = gate_tn.str(), up_name = up_tn.str(), merged_name = name.str();
+        for (auto type :
+             {GGML_TYPE_Q8_0, GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K}) {
+            for (int experts : {1, 4}) {
+                if (!routed && experts != 1) {
+                    continue;
                 }
-                tensor->data = source_data[side].data();
-                gguf_add_tensor(gguf.get(), tensor);
-            }
-            const auto close_file = [](FILE * fp) {
-                if (fp) {
-                    fclose(fp);
-                }
-            };
-            std::unique_ptr<FILE, decltype(close_file)> file(tmpfile(), close_file);
-            check(file && gguf_write_to_file_ptr(gguf.get(), file.get(), false) && fflush(file.get()) == 0,
-                  "paired fixture write failed");
-            for (int count : {2, 4, 1}) {
-                for (auto axis : {GGML_BACKEND_SPLIT_AXIS_1, GGML_BACKEND_SPLIT_AXIS_0, GGML_BACKEND_SPLIT_AXIS_2,
-                                  GGML_BACKEND_SPLIT_AXIS_MIRRORED}) {
-                    if (count == 1 && axis != GGML_BACKEND_SPLIT_AXIS_1) {
-                        continue;
+                ggml_context_ptr source_ctx(ggml_init({2 * ggml_tensor_overhead(), nullptr, true}));
+                gguf_context_ptr gguf(gguf_init_empty());
+                gguf_set_val_str(gguf.get(), "general.architecture", llm_arch_name(arch));
+                std::vector<uint8_t> source_data[2];
+                for (int side = 0; side < 2; ++side) {
+                    auto * tensor = ggml_new_tensor_3d(source_ctx.get(), type, 1024, 512, experts);
+                    ggml_set_name(tensor, side == 0 ? gate_name.c_str() : up_name.c_str());
+                    source_data[side].resize(ggml_nbytes(tensor));
+                    for (size_t i = 0; i < source_data[side].size(); ++i) {
+                        // Distinct row/expert bytes, with finite scales in every quantized block.
+                        source_data[side][i] =
+                            (i % 251 + i / tensor->nb[1] + 17 * (i / tensor->nb[2]) + side * 13) % 64;
                     }
-                    for (bool mmap : {false, true}) {
-                        if (mmap && !llama_mmap::SUPPORTED) {
+                    tensor->data = source_data[side].data();
+                    gguf_add_tensor(gguf.get(), tensor);
+                }
+                const auto close_file = [](FILE * fp) {
+                    if (fp) {
+                        fclose(fp);
+                    }
+                };
+                std::unique_ptr<FILE, decltype(close_file)> file(tmpfile(), close_file);
+                check(file && gguf_write_to_file_ptr(gguf.get(), file.get(), false) && fflush(file.get()) == 0,
+                      "paired fixture write failed");
+                for (int count : {2, 4, 1}) {
+                    for (auto axis : {GGML_BACKEND_SPLIT_AXIS_1, GGML_BACKEND_SPLIT_AXIS_0, GGML_BACKEND_SPLIT_AXIS_2,
+                                      GGML_BACKEND_SPLIT_AXIS_MIRRORED}) {
+                        if (count == 1 && axis != GGML_BACKEND_SPLIT_AXIS_1) {
                             continue;
                         }
-                        rewind(file.get());
-                        std::vector<std::string> splits;
-                        llama_model_loader       loader(nullptr, nullptr, nullptr, "", splits, file.get(),
-                                                  mmap ? LLAMA_LOAD_MODE_MMAP : LLAMA_LOAD_MODE_NONE, true, true, false,
-                                                        nullptr, nullptr);
-                        ggml_context_ptr         ctx(ggml_init({ggml_tensor_overhead(), nullptr, true}));
-                        llama_hparams            hp{};
-                        const auto name    = LLM_TN(LLM_ARCH_QWEN35MOE)(LLM_TENSOR_FFN_GATE_UP_EXPS, "weight", 0);
-                        size_t     queries = 0;
-                        auto       choose  = [&](ggml_tensor * weight) {
-                            const char * expected[] = {"blk.0.ffn_gate_up_exps.weight", "blk.0.ffn_gate_exps.weight",
-                                                       "blk.0.ffn_up_exps.weight"};
-                            check(queries < 3 && strcmp(weight->name, expected[queries]) == 0,
-                                         "merged placement did not query both original sources");
-                            ++queries;
-                            return &packed;
-                        };
-                        auto context = [&](ggml_backend_buffer_type_t buft) {
-                            check(buft == &packed, "merged placement changed buffer type");
-                            return ctx.get();
-                        };
-                        check(!llama_kpack_create_merged_tensor(loader, hp, name, {1024, 512, experts}, 0, choose,
-                                                                context),
-                              "wrong merged dimensions accepted");
-                        auto * tensor = llama_kpack_create_merged_tensor(loader, hp, name, {1024, 1024, experts}, 0,
-                                                                         choose, context);
-                        check(tensor && queries == 3 && loader.n_created == 2, "merged tensor creation changed");
-                        ggml_set_param(tensor);
-                        ggml_backend_meta_split_state split{};
-                        split.axis       = axis;
-                        split.n_segments = 1;
-                        split.nr[0]      = axis == GGML_BACKEND_SPLIT_AXIS_1 ? 2 : 1;
-                        if (axis < GGML_MAX_DIMS) {
-                            const int64_t extent = tensor->ne[axis] / split.nr[0];
-                            for (int rank = 0; rank < count; ++rank) {
-                                split.ne[rank] = extent / count + (rank < extent % count);
+                        for (bool mmap : {false, true}) {
+                            if (mmap && !llama_mmap::SUPPORTED) {
+                                continue;
                             }
-                        }
-                        auto *                          buft = ggml_backend_cpu_buffer_type();
-                        std::vector<ggml_backend_dev_t> devices(count, &host);
-                        if (count > 1) {
-                            auto * meta = ggml_backend_meta_device(
-                                devices.data(), count,
-                                [](const ggml_tensor *, void * data) {
-                                    return *static_cast<ggml_backend_meta_split_state *>(data);
-                                },
-                                &split);
-                            buft = ggml_backend_dev_buffer_type(meta);
-                        }
-                        ggml_backend_buffer_ptr buffer(ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft));
-                        check(bool(buffer), "paired weight allocation failed");
-                        llama_buf_map buffers;
-                        loader.init_mappings(false, nullptr);
-                        check(loader.size_data == source_data[0].size() + source_data[1].size(),
-                              "paired source bytes counted twice");
-                        if (mmap) {
-                            size_t first, last;
-                            void * address;
-                            loader.get_mapping_range(&first, &last, &address, 0, ctx.get());
-                            const auto & gate = loader.require_weight("blk.0.ffn_gate_exps.weight");
-                            const auto & up   = loader.require_weight("blk.0.ffn_up_exps.weight");
-                            check(address == loader.mappings[0]->addr() && first == std::min(gate.offs, up.offs) &&
-                                      last ==
-                                          std::max(gate.offs + source_data[0].size(), up.offs + source_data[1].size()),
-                                  "paired mmap range differs from its sources");
-                        }
-                        std::vector<uint8_t> host_data;
-                        if (count == 1) {
-                            // load_all_data releases offloaded mmap ranges when it completes.
-                            host_data.resize(ggml_nbytes(tensor));
-                            ggml_tensor host_tensor = *tensor;
-                            host_tensor.data        = host_data.data();
-                            loader.load_data_for(&host_tensor);
-                            std::vector<uint8_t> ordinary(source_data[0].size());
-                            for (int side = 0; side < 2; ++side) {
-                                const auto & source = loader.require_weight(side == 0 ? "blk.0.ffn_gate_exps.weight" :
-                                                                                        "blk.0.ffn_up_exps.weight");
-                                host_tensor         = *source.tensor;
-                                host_tensor.data    = ordinary.data();
-                                loader.load_data_for(&host_tensor);
-                                check(ordinary == source_data[side], "ordinary source load changed");
+                            rewind(file.get());
+                            std::vector<std::string> splits;
+                            llama_model_loader       loader(nullptr, nullptr, nullptr, "", splits, file.get(),
+                                                      mmap ? LLAMA_LOAD_MODE_MMAP : LLAMA_LOAD_MODE_NONE, true, true,
+                                                            false, nullptr, nullptr);
+                            ggml_context_ptr         ctx(ggml_init({ggml_tensor_overhead(), nullptr, true}));
+                            llama_hparams            hp{};
+                            size_t                   queries = 0;
+                            auto                     choose  = [&](ggml_tensor * weight) {
+                                const char * expected[] = {merged_name.c_str(), gate_name.c_str(), up_name.c_str()};
+                                check(queries < 3 && strcmp(weight->name, expected[queries]) == 0,
+                                                           "merged placement did not query both original sources");
+                                ++queries;
+                                return &packed;
+                            };
+                            auto context = [&](ggml_backend_buffer_type_t buft) {
+                                check(buft == &packed, "merged placement changed buffer type");
+                                return ctx.get();
+                            };
+                            check(!llama_kpack_create_merged_tensor(loader, hp, name, {1024, 512, experts}, 0, choose,
+                                                                    context),
+                                  "wrong merged dimensions accepted");
+                            ggml_tensor * tensor = nullptr;
+                            if (routed) {
+                                check(llama_kpack_create_ffn_tensor(loader, hp, name, {1024, 1024, experts}, 0, choose,
+                                                                    context, tensor),
+                                      "explicit merged request was not handled");
+                            } else {
+                                check(llama_kpack_create_ffn_tensor(loader, hp, gate_tn, {1024, 512}, 0, choose,
+                                                                    context, tensor) &&
+                                          !tensor,
+                                      "merged Gate request must be handled without a separate weight");
+                                check(llama_kpack_create_ffn_tensor(loader, hp, up_tn, {1024, 512}, 0, choose, context,
+                                                                    tensor),
+                                      "Up request did not reuse the merged weight");
+                                check(llama_kpack_is_merged_ffn_weight(tensor),
+                                      "merged weight not recognized by common FFN");
                             }
-                        }
-                        check(loader.load_all_data(ctx.get(), buffers, nullptr, nullptr, nullptr),
-                              "paired load failed");
-                        check(loader.size_done == loader.size_data, "paired load progress differs");
-                        std::vector<uint8_t> actual(ggml_nbytes(tensor));
-                        if (count > 1 && axis == GGML_BACKEND_SPLIT_AXIS_2) {
-                            size_t offset = 0;
-                            for (int rank = 0; rank < count; ++rank) {
-                                auto *       shard = ggml_backend_meta_tensor_shard(tensor, rank, nullptr);
-                                const size_t bytes = ggml_nbytes(shard);
-                                if (bytes) {
-                                    ggml_backend_tensor_get(shard, actual.data() + offset, 0, bytes);
+                            check(tensor && queries == 3 && loader.n_created == 2, "merged tensor creation changed");
+                            ggml_set_param(tensor);
+                            ggml_backend_meta_split_state split{};
+                            split.axis       = axis;
+                            split.n_segments = 1;
+                            split.nr[0]      = axis == GGML_BACKEND_SPLIT_AXIS_1 ? 2 : 1;
+                            if (axis < GGML_MAX_DIMS) {
+                                const int64_t extent = tensor->ne[axis] / split.nr[0];
+                                for (int rank = 0; rank < count; ++rank) {
+                                    split.ne[rank] = extent / count + (rank < extent % count);
                                 }
-                                offset += bytes;
                             }
-                            check(offset == actual.size(), "paired expert shard coverage differs");
-                        } else {
-                            ggml_backend_tensor_get(tensor, actual.data(), 0, actual.size());
-                        }
-                        const size_t width = tensor->nb[2] / 2;
-                        for (int e = 0; e < experts; ++e) {
-                            for (int side = 0; side < 2; ++side) {
-                                check(memcmp(actual.data() + (2 * e + side) * width,
-                                             source_data[side].data() + e * width, width) == 0,
-                                      "paired load bytes differ");
+                            auto *                          buft = ggml_backend_cpu_buffer_type();
+                            std::vector<ggml_backend_dev_t> devices(count, &host);
+                            if (count > 1) {
+                                auto * meta = ggml_backend_meta_device(
+                                    devices.data(), count,
+                                    [](const ggml_tensor *, void * data) {
+                                        return *static_cast<ggml_backend_meta_split_state *>(data);
+                                    },
+                                    &split);
+                                buft = ggml_backend_dev_buffer_type(meta);
                             }
-                        }
-                        if (!host_data.empty()) {
-                            check(host_data == actual, "paired legacy load differs from backend load");
-                        }
-                        if (count > 1 && axis == GGML_BACKEND_SPLIT_AXIS_1) {
-                            for (int rank = 0; rank < count; ++rank) {
-                                auto *       shard = ggml_backend_meta_tensor_shard(tensor, rank, nullptr);
-                                const size_t part  = width / count;
-                                actual.resize(ggml_nbytes(shard));
-                                ggml_backend_tensor_get(shard, actual.data(), 0, actual.size());
-                                for (int e = 0; e < experts; ++e) {
-                                    for (int side = 0; side < 2; ++side) {
-                                        check(memcmp(actual.data() + (2 * e + side) * part,
-                                                     source_data[side].data() + e * width + rank * part, part) == 0,
-                                              "paired shard mixed Gate/Up or expert slices");
+                            ggml_backend_buffer_ptr buffer(ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft));
+                            check(bool(buffer), "paired weight allocation failed");
+                            llama_buf_map buffers;
+                            loader.init_mappings(false, nullptr);
+                            check(loader.size_data == source_data[0].size() + source_data[1].size(),
+                                  "paired source bytes counted twice");
+                            if (mmap) {
+                                size_t first, last;
+                                void * address;
+                                loader.get_mapping_range(&first, &last, &address, 0, ctx.get());
+                                const auto & gate = loader.require_weight(gate_name.c_str());
+                                const auto & up   = loader.require_weight(up_name.c_str());
+                                check(address == loader.mappings[0]->addr() && first == std::min(gate.offs, up.offs) &&
+                                          last == std::max(gate.offs + source_data[0].size(),
+                                                           up.offs + source_data[1].size()),
+                                      "paired mmap range differs from its sources");
+                            }
+                            std::vector<uint8_t> host_data;
+                            if (count == 1) {
+                                // load_all_data releases offloaded mmap ranges when it completes.
+                                host_data.resize(ggml_nbytes(tensor));
+                                ggml_tensor host_tensor = *tensor;
+                                host_tensor.data        = host_data.data();
+                                loader.load_data_for(&host_tensor);
+                                std::vector<uint8_t> ordinary(source_data[0].size());
+                                for (int side = 0; side < 2; ++side) {
+                                    const auto & source =
+                                        loader.require_weight(side == 0 ? gate_name.c_str() : up_name.c_str());
+                                    host_tensor      = *source.tensor;
+                                    host_tensor.data = ordinary.data();
+                                    loader.load_data_for(&host_tensor);
+                                    check(ordinary == source_data[side], "ordinary source load changed");
+                                }
+                            }
+                            check(loader.load_all_data(ctx.get(), buffers, nullptr, nullptr, nullptr),
+                                  "paired load failed");
+                            check(loader.size_done == loader.size_data, "paired load progress differs");
+                            std::vector<uint8_t> actual(ggml_nbytes(tensor));
+                            if (count > 1 && axis == GGML_BACKEND_SPLIT_AXIS_2) {
+                                size_t offset = 0;
+                                for (int rank = 0; rank < count; ++rank) {
+                                    auto *       shard = ggml_backend_meta_tensor_shard(tensor, rank, nullptr);
+                                    const size_t bytes = ggml_nbytes(shard);
+                                    if (bytes) {
+                                        ggml_backend_tensor_get(shard, actual.data() + offset, 0, bytes);
+                                    }
+                                    offset += bytes;
+                                }
+                                check(offset == actual.size(), "paired expert shard coverage differs");
+                            } else {
+                                ggml_backend_tensor_get(tensor, actual.data(), 0, actual.size());
+                            }
+                            const size_t width = tensor->nb[2] / 2;
+                            for (int e = 0; e < experts; ++e) {
+                                for (int side = 0; side < 2; ++side) {
+                                    check(memcmp(actual.data() + (2 * e + side) * width,
+                                                 source_data[side].data() + e * width, width) == 0,
+                                          "paired load bytes differ");
+                                }
+                            }
+                            if (!host_data.empty()) {
+                                check(host_data == actual, "paired legacy load differs from backend load");
+                            }
+                            if (count > 1 && axis == GGML_BACKEND_SPLIT_AXIS_1) {
+                                for (int rank = 0; rank < count; ++rank) {
+                                    auto *       shard = ggml_backend_meta_tensor_shard(tensor, rank, nullptr);
+                                    const size_t part  = width / count;
+                                    actual.resize(ggml_nbytes(shard));
+                                    ggml_backend_tensor_get(shard, actual.data(), 0, actual.size());
+                                    for (int e = 0; e < experts; ++e) {
+                                        for (int side = 0; side < 2; ++side) {
+                                            check(memcmp(actual.data() + (2 * e + side) * part,
+                                                         source_data[side].data() + e * width + rank * part, part) == 0,
+                                                  "paired shard mixed Gate/Up or expert slices");
+                                        }
                                     }
                                 }
                             }
+                            ++cases;
                         }
-                        ++cases;
                     }
                 }
             }
@@ -567,6 +657,7 @@ int main() {
         test_split_metadata();
 #ifdef GGML_NCP_QUACTLIZE
         test_shared_ffn_split();
+        test_common_ffn_build();
         test_paired_loading();
 #endif
         return 0;

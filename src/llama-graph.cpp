@@ -5,6 +5,9 @@
 #include "llama-batch.h"
 #include "llama-cparams.h"
 #include "llama-sampler.h"
+#ifdef GGML_NCP_QUACTLIZE
+#    include "llama-kpack-merge.h"
+#endif
 
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-iswa.h"
@@ -1812,6 +1815,11 @@ ggml_tensor * llm_graph_context::build_ffn(
      llm_ffn_op_type   type_op,
    llm_ffn_gate_type   type_gate,
                  int   il) const {
+#ifdef GGML_NCP_QUACTLIZE
+    if (!gate && type_op == LLM_FFN_SILU && type_gate == LLM_FFN_PAR && llama_kpack_is_merged_ffn_weight(up)) {
+        type_op = LLM_FFN_SWIGLU;
+    }
+#endif
     // NVFP4 support is currently restricted to
     // 1) LORA absence (*_s would be applied after LORA residual, which is incorrect)
     // 2) bias absense (*_s would be applied after bias addition, which is incorrect)

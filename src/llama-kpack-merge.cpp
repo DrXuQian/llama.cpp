@@ -2,10 +2,81 @@
 
 #ifdef GGML_NCP_QUACTLIZE
 #    include "llama-kpack-cache.h"
-#    include "llama-model.h"
 
 #    include <algorithm>
 #    include <cinttypes>
+#    include <climits>
+
+bool llama_kpack_create_ffn_tensor(llama_model_loader &                                              loader,
+                                   const llama_hparams &                                             hparams,
+                                   const LLM_TN_IMPL &                                               tn,
+                                   const std::initializer_list<int64_t> &                            ne,
+                                   int                                                               flags,
+                                   const std::function<ggml_backend_buffer_type_t(ggml_tensor *)> &  buft_for_tensor,
+                                   const std::function<ggml_context *(ggml_backend_buffer_type_t)> & ctx_for_buft,
+                                   ggml_tensor *&                                                    tensor) {
+    tensor = nullptr;
+    if (loader.files.empty()) {
+        return false;
+    }
+    if (tn.tensor == LLM_TENSOR_FFN_GATE_UP_EXPS || tn.tensor == LLM_TENSOR_FFN_GATE_UP ||
+        tn.tensor == LLM_TENSOR_FFN_GATE_UP_SHEXP) {
+        tensor = llama_kpack_create_merged_tensor(loader, hparams, tn, ne, flags, buft_for_tensor, ctx_for_buft);
+        return tensor != nullptr;
+    }
+    // Preserve the architecture coverage of the original model-side merge.
+    const bool dense = (tn.arch == LLM_ARCH_QWEN3 || tn.arch == LLM_ARCH_QWEN35) &&
+                       (tn.tensor == LLM_TENSOR_FFN_GATE || tn.tensor == LLM_TENSOR_FFN_UP);
+    const bool shared = tn.arch == LLM_ARCH_QWEN35MOE &&
+                        (tn.tensor == LLM_TENSOR_FFN_GATE_SHEXP || tn.tensor == LLM_TENSOR_FFN_UP_SHEXP);
+    if ((!dense && !shared) || !tn.suffix || strcmp(tn.suffix, "weight") || ne.size() != 2 || ne.begin()[0] <= 0 ||
+        ne.begin()[1] <= 0 || ne.begin()[1] > INT64_MAX / 2 ||
+        (flags & (llama_model_loader::TENSOR_SKIP | llama_model_loader::TENSOR_DUPLICATED |
+                  llama_model_loader::TENSOR_ALLOW_RESHAPE))) {
+        return false;
+    }
+    const auto name =
+        LLM_TN_IMPL(tn.arch, shared ? LLM_TENSOR_FFN_GATE_UP_SHEXP : LLM_TENSOR_FFN_GATE_UP, "weight", tn.bid, tn.xid);
+    const std::initializer_list<int64_t> shape  = {ne.begin()[0], 2 * ne.begin()[1]};
+    ggml_tensor *                        merged = nullptr;
+    if (const auto * weight = loader.get_weight(name.str().c_str())) {
+        // Includes already merged GGUFs and the pair created by the earlier Gate request.
+        loader.check_tensor_dims(name.str(), shape, true, false);
+        if (!weight->paired_sources.empty()) {
+            merged = weight->tensor;
+        } else {
+            for (const auto & entry : loader.ctx_map) {
+                if ((merged = ggml_get_tensor(entry.second.get(), name.str().c_str()))) {
+                    break;
+                }
+            }
+            if (!merged) {
+                auto * buft = buft_for_tensor(weight->tensor);
+                if (!buft) {
+                    return false;
+                }
+                merged = ggml_dup_tensor(ctx_for_buft(buft), weight->tensor);
+                ggml_set_name(merged, name.str().c_str());
+                ++loader.n_created;
+            }
+        }
+    } else {
+        merged = llama_kpack_create_merged_tensor(loader, hparams, name, shape, flags, buft_for_tensor, ctx_for_buft);
+    }
+    if (!merged) {
+        return false;
+    }
+    tensor = (tn.tensor == LLM_TENSOR_FFN_UP || tn.tensor == LLM_TENSOR_FFN_UP_SHEXP) ? merged : nullptr;
+    return true;
+}
+
+bool llama_kpack_is_merged_ffn_weight(const ggml_tensor * tensor) {
+    if (!tensor || strncmp(tensor->name, "blk.", 4)) {
+        return false;
+    }
+    const char * suffix = strchr(tensor->name + 4, '.');
+    return suffix && (!strcmp(suffix, ".ffn_gate_up.weight") || !strcmp(suffix, ".ffn_gate_up_shexp.weight"));
+}
 
 ggml_tensor * llama_kpack_create_merged_tensor(
     llama_model_loader &                                              loader,
@@ -188,23 +259,4 @@ bool llama_kpack_load_tensor(llama_model_loader &                            loa
     return true;
 }
 
-void llama_model_base::create_tensor_gate_up(llama_layer & layer,
-                                             int           bid,
-                                             int64_t       n_embd_,
-                                             int64_t       n_ff_,
-                                             int           flags,
-                                             bool          shared) {
-    auto * merged = create_tensor(tn(shared ? LLM_TENSOR_FFN_GATE_UP_SHEXP : LLM_TENSOR_FFN_GATE_UP, "weight", bid),
-                                  {n_embd_, 2 * n_ff_}, flags | TENSOR_NOT_REQUIRED | TENSOR_SKIP_IF_VIRTUAL);
-    auto & gate   = shared ? layer.ffn_gate_shexp : layer.ffn_gate;
-    auto & up     = shared ? layer.ffn_up_shexp : layer.ffn_up;
-    if (merged) {
-        up = merged;
-    } else {
-        gate = create_tensor(tn(shared ? LLM_TENSOR_FFN_GATE_SHEXP : LLM_TENSOR_FFN_GATE, "weight", bid),
-                             {n_embd_, n_ff_}, flags);
-        up   = create_tensor(tn(shared ? LLM_TENSOR_FFN_UP_SHEXP : LLM_TENSOR_FFN_UP, "weight", bid), {n_embd_, n_ff_},
-                             flags);
-    }
-}
 #endif

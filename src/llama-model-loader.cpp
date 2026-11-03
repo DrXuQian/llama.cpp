@@ -1317,8 +1317,9 @@ struct ggml_tensor * llama_model_loader::create_tensor(
     }
 
 #ifdef GGML_NCP_QUACTLIZE
-    if (auto * tensor = llama_kpack_create_merged_tensor(*this, hparams, tn, ne, flags, buft_for_tensor, ctx_for_buft)) {
-        return tensor;
+    ggml_tensor * merged = nullptr;
+    if (llama_kpack_create_ffn_tensor(*this, hparams, tn, ne, flags, buft_for_tensor, ctx_for_buft, merged)) {
+        return merged;
     }
 #endif
     LLAMA_LOG_DEBUG("%s: loading tensor %s\n", __func__, tn.str().c_str());
