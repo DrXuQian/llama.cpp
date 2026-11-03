@@ -1,6 +1,7 @@
 #include "llama-model-loader.h"
 #ifdef GGML_NCP_QUACTLIZE
 #    include "llama-kpack-cache.h"
+#    include "llama-kpack-merge.h"
 #endif
 
 #include "ggml-alloc.h"
@@ -1201,7 +1202,10 @@ struct ggml_tensor * llama_model_loader::create_tensor(
 
         // check overrides
         if (tensor_buft_overrides) {
-            std::string tensor_name = t_meta->name;
+            std::string tensor_name = tn.str();
+#ifdef GGML_NCP_QUACTLIZE
+            tensor_name = t_meta->name;
+#endif
             for (const auto * overrides = tensor_buft_overrides; overrides->pattern != nullptr; ++overrides) {
                 std::regex pattern(overrides->pattern);
                 if (std::regex_search(tensor_name, pattern)) {
@@ -1313,71 +1317,8 @@ struct ggml_tensor * llama_model_loader::create_tensor(
     }
 
 #ifdef GGML_NCP_QUACTLIZE
-    if (!get_tensor_meta(tn.str().c_str()) && tn.suffix && !strcmp(tn.suffix, "weight") &&
-        !(flags & (TENSOR_SKIP | TENSOR_DUPLICATED)) &&
-        (tn.tensor == LLM_TENSOR_FFN_GATE_UP || tn.tensor == LLM_TENSOR_FFN_GATE_UP_SHEXP ||
-         tn.tensor == LLM_TENSOR_FFN_GATE_UP_EXPS) &&
-        tn.bid >= 0 && tn.bid < LLAMA_MAX_LAYERS &&
-        (tn.tensor == LLM_TENSOR_FFN_GATE_UP_EXPS || hparams.swiglu_clamp_shexp[tn.bid] <= 1e-6f)) {
-        const bool experts   = tn.tensor == LLM_TENSOR_FFN_GATE_UP_EXPS;
-        const bool shared    = tn.tensor == LLM_TENSOR_FFN_GATE_UP_SHEXP;
-        const auto gate_name = LLM_TN_IMPL(tn.arch,
-                                           experts ? LLM_TENSOR_FFN_GATE_EXPS :
-                                           shared  ? LLM_TENSOR_FFN_GATE_SHEXP :
-                                                     LLM_TENSOR_FFN_GATE,
-                                           "weight", tn.bid, tn.xid)
-                                   .str();
-        const auto up_name = LLM_TN_IMPL(tn.arch,
-                                         experts ? LLM_TENSOR_FFN_UP_EXPS :
-                                         shared  ? LLM_TENSOR_FFN_UP_SHEXP :
-                                                   LLM_TENSOR_FFN_UP,
-                                         "weight", tn.bid, tn.xid)
-                                 .str();
-        const auto * gate         = get_weight(gate_name.c_str());
-        const auto * up           = get_weight(up_name.c_str());
-        auto         plain_weight = [&](const std::string & name) {
-            const auto prefix = name.substr(0, name.size() - strlen("weight"));
-            for (auto it = weights_map.lower_bound(prefix);
-                 it != weights_map.end() && it->first.compare(0, prefix.size(), prefix) == 0; ++it) {
-                if (it->first != name) {
-                    return false;  // Bias, scales and embedded adapters keep their separate projections.
-                }
-            }
-            return true;
-        };
-        // Keep a merged cache record within one source file's stat identity.
-        if (gate && up && gate->idx == up->idx && gate->tensor->type == up->tensor->type &&
-            ggml_are_same_shape(gate->tensor, up->tensor) && ggml_are_same_stride(gate->tensor, up->tensor) &&
-            plain_weight(gate_name) && plain_weight(up_name) &&
-            (gate->tensor->type == GGML_TYPE_Q8_0 ||
-             (gate->tensor->type >= GGML_TYPE_Q2_K && gate->tensor->type <= GGML_TYPE_Q6_K))) {
-            ggml_tensor merged = *gate->tensor;
-            merged.ne[1] *= 2;
-            merged.nb[2] *= 2;
-            merged.nb[3] *= 2;
-            ggml_set_name(&merged, tn.str().c_str());
-            bool shape = ne.size() <= GGML_MAX_DIMS;
-            for (size_t d = 0; d < GGML_MAX_DIMS; ++d) {
-                shape &= merged.ne[d] == (d < ne.size() ? ne.begin()[d] : 1);
-            }
-            if (shape) {
-                auto * buft = buft_for_tensor(&merged);
-                if (buft && llama_kpack_buffer_type(buft) && buft_for_tensor(gate->tensor) == buft &&
-                    buft_for_tensor(up->tensor) == buft) {
-                    auto * tensor = ggml_dup_tensor(ctx_for_buft(buft), &merged);
-                    ggml_set_name(tensor, merged.name);
-                    auto weight           = *gate;
-                    weight.tensor         = tensor;
-                    weight.paired_sources = {gate_name, up_name};
-                    weights_map.emplace(tn.str(), std::move(weight));
-                    n_created += 2;
-                    LLAMA_LOG_INFO(
-                        "[quactlize-merge] tensor=%s sources=%s,%s n=%" PRId64 " k=%" PRId64 " experts=%" PRId64 "\n",
-                        tensor->name, gate_name.c_str(), up_name.c_str(), tensor->ne[1], tensor->ne[0], tensor->ne[2]);
-                    return tensor;
-                }
-            }
-        }
+    if (auto * tensor = llama_kpack_create_merged_tensor(*this, hparams, tn, ne, flags, buft_for_tensor, ctx_for_buft)) {
+        return tensor;
     }
 #endif
     LLAMA_LOG_DEBUG("%s: loading tensor %s\n", __func__, tn.str().c_str());
@@ -1478,9 +1419,12 @@ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps
 
     // compute the total size of all tensors for progress reporting
     for (const auto & it : weights_map) {
-        if (it.second.paired_sources.empty()) {
-            size_data += ggml_nbytes(it.second.tensor);
+#ifdef GGML_NCP_QUACTLIZE
+        if (!it.second.paired_sources.empty()) {
+            continue;
         }
+#endif
+        size_data += ggml_nbytes(it.second.tensor);
     }
 }
 
@@ -1496,14 +1440,11 @@ void llama_model_loader::get_mapping_range(size_t * first, size_t * last, void *
         if (!weight || weight->idx != idx) {
             continue;
         }
-        if (!weight->paired_sources.empty()) {
-            for (const auto & name : weight->paired_sources) {
-                const auto & source = require_weight(name.c_str());
-                *first              = std::min(*first, source.offs);
-                *last               = std::max(*last, source.offs + ggml_nbytes(source.tensor));
-            }
+#ifdef GGML_NCP_QUACTLIZE
+        if (llama_kpack_mapping_range(*this, *weight, first, last)) {
             continue;
         }
+#endif
         *first = std::min(*first, weight->offs);
         *last  = std::max(*last,  weight->offs + ggml_nbytes(tensor));
     }
@@ -1517,27 +1458,11 @@ void llama_model_loader::unmap_weight(const llama_tensor_weight & w) const {
 void llama_model_loader::load_data_for(struct ggml_tensor * cur) const {
     const auto & w = require_weight(ggml_get_name(cur));
 
-    if (!w.paired_sources.empty()) {
-        GGML_ASSERT(cur->data && w.paired_sources.size() == 2);
-        const size_t width = cur->nb[2] / 2;
-        for (size_t side = 0; side < 2; ++side) {
-            const auto & source = require_weight(w.paired_sources[side].c_str());
-            for (int64_t e = 0; e < cur->ne[2] * cur->ne[3]; ++e) {
-                auto * dst = static_cast<uint8_t *>(cur->data) + e * 2 * width + side * width;
-                if (use_mmap) {
-                    memcpy(dst, static_cast<const uint8_t *>(mappings.at(source.idx)->addr()) + source.offs + e * width,
-                           width);
-                } else {
-                    files.at(source.idx)->seek(source.offs + e * width, SEEK_SET);
-                    files.at(source.idx)->read_raw(dst, width);
-                }
-                if (check_tensors && !ggml_validate_row_data(cur->type, dst, width)) {
-                    throw std::runtime_error(format("tensor '%s' has invalid data", source.tensor->name));
-                }
-            }
-        }
+#ifdef GGML_NCP_QUACTLIZE
+    if (llama_kpack_load_data_for(*this, cur, w)) {
         return;
     }
+#endif
 
     if (use_mmap) {
         const auto & mapping = mappings.at(w.idx);
@@ -1695,61 +1620,12 @@ bool llama_model_loader::load_all_data(
         }
 #endif
 
-        if (!weight->paired_sources.empty()) {
-            GGML_ASSERT(weight->paired_sources.size() == 2);
-            const size_t                  width = cur->nb[2] / 2;
-            const size_t                  rows  = cur->ne[2] * cur->ne[3];
-            ggml_backend_meta_split_state split{};
-            if (ggml_backend_meta_tensor_split(ggml_backend_buffer_get_type(cur->buffer), cur, &split)) {
-                // Meta accepts complete split planes, not separate Gate/Up halves.
-                const size_t planes = split.axis == GGML_BACKEND_SPLIT_AXIS_2 ? cur->ne[2] : 1;
-                read_buf.resize(2 * width * planes);
-                for (size_t first = 0; first < rows; first += planes) {
-                    for (size_t side = 0; side < 2; ++side) {
-                        const auto & source = require_weight(weight->paired_sources[side].c_str());
-                        for (size_t plane = 0; plane < planes; ++plane) {
-                            auto *       dst    = read_buf.data() + (2 * plane + side) * width;
-                            const size_t offset = source.offs + (first + plane) * width;
-                            if (use_mmap) {
-                                memcpy(dst, static_cast<const uint8_t *>(mappings.at(source.idx)->addr()) + offset,
-                                       width);
-                            } else {
-                                files.at(source.idx)->seek(offset, SEEK_SET);
-                                files.at(source.idx)->read_raw(dst, width);
-                            }
-                            if (check_tensors && !ggml_validate_row_data(cur->type, dst, width)) {
-                                throw std::runtime_error(format("tensor '%s' has invalid data", source.tensor->name));
-                            }
-                        }
-                    }
-                    ggml_backend_tensor_set(cur, read_buf.data(), first * 2 * width, read_buf.size());
-                }
-            } else {
-                for (size_t side = 0; side < weight->paired_sources.size(); ++side) {
-                    const auto & source = require_weight(weight->paired_sources[side].c_str());
-                    const void * data;
-                    if (use_mmap) {
-                        data = static_cast<const uint8_t *>(mappings.at(source.idx)->addr()) + source.offs;
-                    } else {
-                        read_buf.resize(ggml_nbytes(source.tensor));
-                        files.at(source.idx)->seek(source.offs, SEEK_SET);
-                        files.at(source.idx)->read_raw(read_buf.data(), read_buf.size());
-                        data = read_buf.data();
-                    }
-                    if (check_tensors && !ggml_validate_row_data(cur->type, data, width * rows)) {
-                        throw std::runtime_error(format("tensor '%s' has invalid data", source.tensor->name));
-                    }
-                    ggml_backend_tensor_set_2d(cur, data, side * width, width, rows, 2 * width, width);
-                }
-            }
 #ifdef GGML_NCP_QUACTLIZE
-            if (kpack_cache) {
-                kpack_cache->capture(cur);
-            }
-#endif
+        if (llama_kpack_load_tensor(*this, cur, *weight, read_buf)) {
             size_done += n_size;
             continue;
         }
+#endif
 
         if (use_mmap) {
             const auto & mapping = mappings.at(weight->idx);

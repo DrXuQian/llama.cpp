@@ -406,7 +406,11 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     static const std::regex pattern_ffn_up_bias       ("blk\\.\\d*\\.ffn_up(_exps)?.bias");
     static const std::regex pattern_ffn_gate_weight   ("blk\\.\\d*\\.ffn_gate(_exps)?.weight");
     static const std::regex pattern_ffn_gate_bias     ("blk\\.\\d*\\.ffn_gate(_exps)?.bias");
+#ifdef GGML_NCP_QUACTLIZE
     static const std::regex pattern_ffn_gate_up_weight("blk\\.\\d*\\.ffn_gate_up(_exps|_shexp)?.weight");
+#else
+    static const std::regex pattern_ffn_gate_up_weight("blk\\.\\d*\\.ffn_gate_up(_exps)?.weight");
+#endif
     static const std::regex pattern_ffn_down_weight   ("blk\\.\\d*\\.ffn_down(_exps)?.weight");
     static const std::regex pattern_ffn_down_bias         ("blk\\.\\d*\\.ffn_down.bias");
     static const std::regex pattern_ffn_down_exps_bias    ("blk\\.\\d*\\.ffn_down_exps.bias");
@@ -559,6 +563,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0, "ffn_down.weight", "ffn_down_exps.weight");
         }
         if (std::regex_match(tensor_name, pattern_ffn_gate_up_weight)) {
+#ifdef GGML_NCP_QUACTLIZE
             if (tensor_name.find("_shexp.") != std::string::npos) {
                 // Preserve the placement of the separate shared-expert weights.
                 if (!is_dsv4) {
@@ -566,6 +571,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
                 }
                 return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "ffn_down_shexp.weight");
             }
+#endif
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "ffn_down.weight", "ffn_down_exps.weight");
         }
         if (std::regex_match(tensor_name, pattern_ffn_down_weight)) {
@@ -641,8 +647,14 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
 
             // the FFN is the same for Qwen 3 Next and Qwen 3.5:
             if (std::regex_match(tensor_name, pattern_ffn_gate_up_weight)) {
+#ifdef GGML_NCP_QUACTLIZE
                 GGML_ASSERT(axis == 1 && tensor->ne[axis] % 2 == 0);
                 return {{tensor->ne[axis] / 2, 2}};
+#else
+                const int64_t n_ff_exp = hparams.n_ff_exp;
+                GGML_ASSERT(tensor->ne[axis] == 2*n_ff_exp);
+                return {{n_ff_exp, 2}};
+#endif
             }
             return {{tensor->ne[axis], 1}};
         }
@@ -663,8 +675,14 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             return {{tensor->ne[axis], 1}};
         }
         if (std::regex_match(tensor_name, pattern_ffn_gate_up_weight)) {
+#ifdef GGML_NCP_QUACTLIZE
             GGML_ASSERT(axis == 1 && tensor->ne[axis] % 2 == 0);
             return {{tensor->ne[axis] / 2, 2}};
+#else
+            const int64_t n_ff_exp = hparams.n_ff_exp;
+            GGML_ASSERT(tensor->ne[axis] == 2*n_ff_exp);
+            return {{n_ff_exp, 2}};
+#endif
         }
         return {{tensor->ne[axis], 1}};
     };
@@ -3130,26 +3148,6 @@ void llama_model_base::create_tensor_gate_up_exps(llama_layer & layer, int bid, 
     if (layer.ffn_gate_up_exps == nullptr) {
         layer.ffn_gate_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", bid), {n_embd_, n_ff_, n_expert_}, flags);
         layer.ffn_up_exps   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", bid), {n_embd_, n_ff_, n_expert_}, flags);
-    }
-}
-
-void llama_model_base::create_tensor_gate_up(llama_layer & layer,
-                                             int           bid,
-                                             int64_t       n_embd_,
-                                             int64_t       n_ff_,
-                                             int           flags,
-                                             bool          shared) {
-    auto * merged = create_tensor(tn(shared ? LLM_TENSOR_FFN_GATE_UP_SHEXP : LLM_TENSOR_FFN_GATE_UP, "weight", bid),
-                                  {n_embd_, 2 * n_ff_}, flags | TENSOR_NOT_REQUIRED | TENSOR_SKIP_IF_VIRTUAL);
-    auto & gate   = shared ? layer.ffn_gate_shexp : layer.ffn_gate;
-    auto & up     = shared ? layer.ffn_up_shexp : layer.ffn_up;
-    if (merged) {
-        up = merged;
-    } else {
-        gate = create_tensor(tn(shared ? LLM_TENSOR_FFN_GATE_SHEXP : LLM_TENSOR_FFN_GATE, "weight", bid),
-                             {n_embd_, n_ff_}, flags);
-        up   = create_tensor(tn(shared ? LLM_TENSOR_FFN_UP_SHEXP : LLM_TENSOR_FFN_UP, "weight", bid), {n_embd_, n_ff_},
-                             flags);
     }
 }
 

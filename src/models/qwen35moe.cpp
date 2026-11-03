@@ -107,7 +107,12 @@ void llama_model_qwen35moe::load_arch_tensors(llama_model_loader & ml) {
 
         // Shared experts
         layer.ffn_gate_inp_shexp = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP_SHEXP, "weight", il), { n_embd }, flags);
+#ifdef GGML_NCP_QUACTLIZE
         create_tensor_gate_up(layer, il, n_embd, n_ff_shexp, flags, true);
+#else
+        layer.ffn_gate_shexp     = create_tensor(tn(LLM_TENSOR_FFN_GATE_SHEXP,     "weight", il), { n_embd, n_ff_shexp }, flags);
+        layer.ffn_up_shexp       = create_tensor(tn(LLM_TENSOR_FFN_UP_SHEXP,       "weight", il), { n_embd, n_ff_shexp }, flags);
+#endif
         layer.ffn_down_shexp     = create_tensor(tn(LLM_TENSOR_FFN_DOWN_SHEXP,     "weight", il), { n_ff_shexp, n_embd }, flags);
     };
 
@@ -133,7 +138,12 @@ void llama_model_qwen35moe::load_arch_tensors(llama_model_loader & ml) {
 
         // Shared experts
         layer.ffn_gate_inp_shexp = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP_SHEXP, "weight", il), { n_embd }, mtp_flags);
+#ifdef GGML_NCP_QUACTLIZE
         create_tensor_gate_up(layer, il, n_embd, n_ff_shexp, mtp_flags, true);
+#else
+        layer.ffn_gate_shexp     = create_tensor(tn(LLM_TENSOR_FFN_GATE_SHEXP,     "weight", il), { n_embd, n_ff_shexp }, mtp_flags);
+        layer.ffn_up_shexp       = create_tensor(tn(LLM_TENSOR_FFN_UP_SHEXP,       "weight", il), { n_embd, n_ff_shexp }, mtp_flags);
+#endif
         layer.ffn_down_shexp     = create_tensor(tn(LLM_TENSOR_FFN_DOWN_SHEXP,     "weight", il), { n_ff_shexp, n_embd }, mtp_flags);
 
         // NextN-specific tensors that define the MTP block.
@@ -521,10 +531,19 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_ffn(ggml_tensor * cur, c
     // Add shared experts if present - following Qwen3Next reference implementation
     if (model.layers[il].ffn_up_shexp != nullptr) {
         ggml_tensor * ffn_shexp =
+#ifdef GGML_NCP_QUACTLIZE
             build_ffn(cur, model.layers[il].ffn_up_shexp, NULL, model.layers[il].ffn_up_shexp_s,
                       model.layers[il].ffn_gate_shexp, NULL, model.layers[il].ffn_gate_shexp_s,
                       model.layers[il].ffn_down_shexp, NULL, model.layers[il].ffn_down_shexp_s, NULL,
                       model.layers[il].ffn_gate_shexp ? LLM_FFN_SILU : LLM_FFN_SWIGLU, LLM_FFN_PAR, il);
+#else
+            build_ffn(cur,
+                model.layers[il].ffn_up_shexp, NULL, model.layers[il].ffn_up_shexp_s,
+                model.layers[il].ffn_gate_shexp, NULL, model.layers[il].ffn_gate_shexp_s,
+                model.layers[il].ffn_down_shexp, NULL, model.layers[il].ffn_down_shexp_s,
+                NULL,
+                LLM_FFN_SILU, LLM_FFN_PAR, il);
+#endif
         cb(ffn_shexp, "ffn_shexp", il);
 
         // Apply shared expert gating as in the reference implementation
@@ -721,9 +740,18 @@ llama_model_qwen35moe::graph_mtp::graph_mtp(const llama_model & model, const llm
 
     if (layer.ffn_up_shexp != nullptr) {
         ggml_tensor * ffn_shexp =
+#ifdef GGML_NCP_QUACTLIZE
             build_ffn(cur, layer.ffn_up_shexp, nullptr, layer.ffn_up_shexp_s, layer.ffn_gate_shexp, nullptr,
                       layer.ffn_gate_shexp_s, layer.ffn_down_shexp, nullptr, layer.ffn_down_shexp_s, nullptr,
                       layer.ffn_gate_shexp ? LLM_FFN_SILU : LLM_FFN_SWIGLU, LLM_FFN_PAR, il);
+#else
+            build_ffn(cur,
+                layer.ffn_up_shexp,   nullptr, layer.ffn_up_shexp_s,
+                layer.ffn_gate_shexp, nullptr, layer.ffn_gate_shexp_s,
+                layer.ffn_down_shexp, nullptr, layer.ffn_down_shexp_s,
+                nullptr,
+                LLM_FFN_SILU, LLM_FFN_PAR, il);
+#endif
         cb(ffn_shexp, "mtp_ffn_shexp", il);
 
         ggml_tensor * shared_gate = build_lora_mm(layer.ffn_gate_inp_shexp, cur);

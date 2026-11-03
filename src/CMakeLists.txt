@@ -64,7 +64,7 @@ target_link_libraries(llama PUBLIC ggml)
 
 if (GGML_NCP_QUACTLIZE)
     find_package(Threads REQUIRED)
-    target_sources(llama PRIVATE llama-kpack-cache.cpp llama-kpack-sidecar.cpp)
+    target_sources(llama PRIVATE llama-kpack-cache.cpp llama-kpack-sidecar.cpp llama-kpack-merge.cpp)
     target_compile_definitions(llama PRIVATE GGML_NCP_QUACTLIZE)
     target_link_libraries(llama PRIVATE vendor::nlohmann Threads::Threads)
 endif()

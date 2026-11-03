@@ -5,6 +5,9 @@
 #include "../ggml/src/ggml-backend-impl.h"
 #include "../src/llama-model-loader.h"
 #include "../src/llama-model.h"
+#ifdef GGML_NCP_QUACTLIZE
+#    include "../src/llama-kpack-merge.h"
+#endif
 
 #include <cstdio>
 #include <cstring>
@@ -263,6 +266,7 @@ static void test_split_metadata() {
     puts("META_SPLIT_METADATA PASS early_late=IDENTICAL loader_lifetime=SCOPED");
 }
 
+#ifdef GGML_NCP_QUACTLIZE
 static void test_shared_ffn_split() {
     ggml_backend_device host{};
     host.iface.get_name = [](ggml_backend_dev_t) {
@@ -363,6 +367,19 @@ static void test_shared_ffn_split() {
 
 static void test_paired_loading() {
     ggml_backend_device host{};
+    ggml_backend_reg    reg{};
+    auto                packed = *ggml_backend_cpu_buffer_type();
+    packed.device = &host;
+    host.reg                   = &reg;
+    reg.iface.get_proc_address = [](ggml_backend_reg_t, const char * name) -> void * {
+        if (strcmp(name, "ggml_cuda_buft_is_quactlize") == 0) {
+            return reinterpret_cast<void *>(+[](ggml_backend_buffer_type_t) { return true; });
+        }
+        if (strcmp(name, "ggml_quactlize_tensor_is_kpack") == 0) {
+            return reinterpret_cast<void *>(+[](const ggml_tensor *) { return true; });
+        }
+        return nullptr;
+    };
     host.iface.get_name = [](ggml_backend_dev_t) {
         return "paired-host";
     };
@@ -412,13 +429,28 @@ static void test_paired_loading() {
                                                   mmap ? LLAMA_LOAD_MODE_MMAP : LLAMA_LOAD_MODE_NONE, true, true, false,
                                                         nullptr, nullptr);
                         ggml_context_ptr         ctx(ggml_init({ggml_tensor_overhead(), nullptr, true}));
-                        auto *                   tensor = ggml_new_tensor_3d(ctx.get(), type, 1024, 1024, experts);
-                        ggml_set_name(tensor, "blk.0.ffn_gate_up_exps.weight");
+                        llama_hparams            hp{};
+                        const auto name    = LLM_TN(LLM_ARCH_QWEN35MOE)(LLM_TENSOR_FFN_GATE_UP_EXPS, "weight", 0);
+                        size_t     queries = 0;
+                        auto       choose  = [&](ggml_tensor * weight) {
+                            const char * expected[] = {"blk.0.ffn_gate_up_exps.weight", "blk.0.ffn_gate_exps.weight",
+                                                       "blk.0.ffn_up_exps.weight"};
+                            check(queries < 3 && strcmp(weight->name, expected[queries]) == 0,
+                                         "merged placement did not query both original sources");
+                            ++queries;
+                            return &packed;
+                        };
+                        auto context = [&](ggml_backend_buffer_type_t buft) {
+                            check(buft == &packed, "merged placement changed buffer type");
+                            return ctx.get();
+                        };
+                        check(!llama_kpack_create_merged_tensor(loader, hp, name, {1024, 512, experts}, 0, choose,
+                                                                context),
+                              "wrong merged dimensions accepted");
+                        auto * tensor = llama_kpack_create_merged_tensor(loader, hp, name, {1024, 1024, experts}, 0,
+                                                                         choose, context);
+                        check(tensor && queries == 3 && loader.n_created == 2, "merged tensor creation changed");
                         ggml_set_param(tensor);
-                        auto weight           = loader.require_weight("blk.0.ffn_gate_exps.weight");
-                        weight.tensor         = tensor;
-                        weight.paired_sources = {"blk.0.ffn_gate_exps.weight", "blk.0.ffn_up_exps.weight"};
-                        loader.weights_map.emplace(tensor->name, std::move(weight));
                         ggml_backend_meta_split_state split{};
                         split.axis       = axis;
                         split.n_segments = 1;
@@ -444,6 +476,36 @@ static void test_paired_loading() {
                         check(bool(buffer), "paired weight allocation failed");
                         llama_buf_map buffers;
                         loader.init_mappings(false, nullptr);
+                        check(loader.size_data == source_data[0].size() + source_data[1].size(),
+                              "paired source bytes counted twice");
+                        if (mmap) {
+                            size_t first, last;
+                            void * address;
+                            loader.get_mapping_range(&first, &last, &address, 0, ctx.get());
+                            const auto & gate = loader.require_weight("blk.0.ffn_gate_exps.weight");
+                            const auto & up   = loader.require_weight("blk.0.ffn_up_exps.weight");
+                            check(address == loader.mappings[0]->addr() && first == std::min(gate.offs, up.offs) &&
+                                      last ==
+                                          std::max(gate.offs + source_data[0].size(), up.offs + source_data[1].size()),
+                                  "paired mmap range differs from its sources");
+                        }
+                        std::vector<uint8_t> host_data;
+                        if (count == 1) {
+                            // load_all_data releases offloaded mmap ranges when it completes.
+                            host_data.resize(ggml_nbytes(tensor));
+                            ggml_tensor host_tensor = *tensor;
+                            host_tensor.data        = host_data.data();
+                            loader.load_data_for(&host_tensor);
+                            std::vector<uint8_t> ordinary(source_data[0].size());
+                            for (int side = 0; side < 2; ++side) {
+                                const auto & source = loader.require_weight(side == 0 ? "blk.0.ffn_gate_exps.weight" :
+                                                                                        "blk.0.ffn_up_exps.weight");
+                                host_tensor         = *source.tensor;
+                                host_tensor.data    = ordinary.data();
+                                loader.load_data_for(&host_tensor);
+                                check(ordinary == source_data[side], "ordinary source load changed");
+                            }
+                        }
                         check(loader.load_all_data(ctx.get(), buffers, nullptr, nullptr, nullptr),
                               "paired load failed");
                         check(loader.size_done == loader.size_data, "paired load progress differs");
@@ -470,6 +532,9 @@ static void test_paired_loading() {
                                       "paired load bytes differ");
                             }
                         }
+                        if (!host_data.empty()) {
+                            check(host_data == actual, "paired legacy load differs from backend load");
+                        }
                         if (count > 1 && axis == GGML_BACKEND_SPLIT_AXIS_1) {
                             for (int rank = 0; rank < count; ++rank) {
                                 auto *       shard = ggml_backend_meta_tensor_shard(tensor, rank, nullptr);
@@ -494,12 +559,16 @@ static void test_paired_loading() {
     printf("META_PAIRED_LOAD PASS cases=%zu cold=BYTE_EXACT single_tp2_tp4=PASS\n", cases);
 }
 
+#endif
+
 int main() {
     try {
         test_weight_selection();
         test_split_metadata();
+#ifdef GGML_NCP_QUACTLIZE
         test_shared_ffn_split();
         test_paired_loading();
+#endif
         return 0;
     } catch (const std::exception & error) {
         fprintf(stderr, "META_WEIGHT_BUFT FAIL: %s\n", error.what());

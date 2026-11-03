@@ -40,8 +40,15 @@ void llama_model_qwen3::load_arch_tensors(llama_model_loader &) {
         layer.attn_q_norm = create_tensor(tn(LLM_TENSOR_ATTN_Q_NORM, "weight", i), {n_embd_head_k}, 0);
 
         layer.ffn_norm = create_tensor(tn(LLM_TENSOR_FFN_NORM, "weight", i), {n_embd}, 0);
+#ifdef GGML_NCP_QUACTLIZE
         create_tensor_gate_up(layer, i, n_embd, n_ff, 0);
+#else
+        layer.ffn_gate = create_tensor(tn(LLM_TENSOR_FFN_GATE, "weight", i), {n_embd,   n_ff}, 0);
+#endif
         layer.ffn_down = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight", i), {  n_ff, n_embd}, 0);
+#ifndef GGML_NCP_QUACTLIZE
+        layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", i), {n_embd,   n_ff}, 0);
+#endif
     }
 }
 
@@ -123,9 +130,18 @@ llama_model_qwen3::graph::graph(const llama_model & model, const llm_graph_param
                 LLM_NORM_RMS, il);
         cb(cur, "ffn_norm", il);
 
+#ifdef GGML_NCP_QUACTLIZE
         cur = build_ffn(cur, model.layers[il].ffn_up, NULL, model.layers[il].ffn_up_s, model.layers[il].ffn_gate, NULL,
                         model.layers[il].ffn_gate_s, model.layers[il].ffn_down, NULL, model.layers[il].ffn_down_s, NULL,
                         model.layers[il].ffn_gate ? LLM_FFN_SILU : LLM_FFN_SWIGLU, LLM_FFN_PAR, il);
+#else
+        cur = build_ffn(cur,
+                model.layers[il].ffn_up,   NULL, model.layers[il].ffn_up_s,
+                model.layers[il].ffn_gate, NULL, model.layers[il].ffn_gate_s,
+                model.layers[il].ffn_down, NULL, model.layers[il].ffn_down_s,
+                NULL,
+                LLM_FFN_SILU, LLM_FFN_PAR, il);
+#endif
         cb(cur, "ffn_out", il);
 
         cur = ggml_add(ctx0, cur, ffn_inp);
