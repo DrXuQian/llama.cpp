@@ -1696,23 +1696,51 @@ bool llama_model_loader::load_all_data(
 #endif
 
         if (!weight->paired_sources.empty()) {
-            const size_t width = cur->nb[2] / 2;
-            const size_t rows  = cur->ne[2] * cur->ne[3];
-            for (size_t side = 0; side < weight->paired_sources.size(); ++side) {
-                const auto & source = require_weight(weight->paired_sources[side].c_str());
-                const void * data;
-                if (use_mmap) {
-                    data = static_cast<const uint8_t *>(mappings.at(source.idx)->addr()) + source.offs;
-                } else {
-                    read_buf.resize(ggml_nbytes(source.tensor));
-                    files.at(source.idx)->seek(source.offs, SEEK_SET);
-                    files.at(source.idx)->read_raw(read_buf.data(), read_buf.size());
-                    data = read_buf.data();
+            GGML_ASSERT(weight->paired_sources.size() == 2);
+            const size_t                  width = cur->nb[2] / 2;
+            const size_t                  rows  = cur->ne[2] * cur->ne[3];
+            ggml_backend_meta_split_state split{};
+            if (ggml_backend_meta_tensor_split(ggml_backend_buffer_get_type(cur->buffer), cur, &split)) {
+                // Meta accepts complete split planes, not separate Gate/Up halves.
+                const size_t planes = split.axis == GGML_BACKEND_SPLIT_AXIS_2 ? cur->ne[2] : 1;
+                read_buf.resize(2 * width * planes);
+                for (size_t first = 0; first < rows; first += planes) {
+                    for (size_t side = 0; side < 2; ++side) {
+                        const auto & source = require_weight(weight->paired_sources[side].c_str());
+                        for (size_t plane = 0; plane < planes; ++plane) {
+                            auto *       dst    = read_buf.data() + (2 * plane + side) * width;
+                            const size_t offset = source.offs + (first + plane) * width;
+                            if (use_mmap) {
+                                memcpy(dst, static_cast<const uint8_t *>(mappings.at(source.idx)->addr()) + offset,
+                                       width);
+                            } else {
+                                files.at(source.idx)->seek(offset, SEEK_SET);
+                                files.at(source.idx)->read_raw(dst, width);
+                            }
+                            if (check_tensors && !ggml_validate_row_data(cur->type, dst, width)) {
+                                throw std::runtime_error(format("tensor '%s' has invalid data", source.tensor->name));
+                            }
+                        }
+                    }
+                    ggml_backend_tensor_set(cur, read_buf.data(), first * 2 * width, read_buf.size());
                 }
-                if (check_tensors && !ggml_validate_row_data(cur->type, data, width * rows)) {
-                    throw std::runtime_error(format("tensor '%s' has invalid data", source.tensor->name));
+            } else {
+                for (size_t side = 0; side < weight->paired_sources.size(); ++side) {
+                    const auto & source = require_weight(weight->paired_sources[side].c_str());
+                    const void * data;
+                    if (use_mmap) {
+                        data = static_cast<const uint8_t *>(mappings.at(source.idx)->addr()) + source.offs;
+                    } else {
+                        read_buf.resize(ggml_nbytes(source.tensor));
+                        files.at(source.idx)->seek(source.offs, SEEK_SET);
+                        files.at(source.idx)->read_raw(read_buf.data(), read_buf.size());
+                        data = read_buf.data();
+                    }
+                    if (check_tensors && !ggml_validate_row_data(cur->type, data, width * rows)) {
+                        throw std::runtime_error(format("tensor '%s' has invalid data", source.tensor->name));
+                    }
+                    ggml_backend_tensor_set_2d(cur, data, side * width, width, rows, 2 * width, width);
                 }
-                ggml_backend_tensor_set_2d(cur, data, side * width, width, rows, 2 * width, width);
             }
 #ifdef GGML_NCP_QUACTLIZE
             if (kpack_cache) {

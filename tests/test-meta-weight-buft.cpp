@@ -263,10 +263,144 @@ static void test_split_metadata() {
     puts("META_SPLIT_METADATA PASS early_late=IDENTICAL loader_lifetime=SCOPED");
 }
 
+static void test_paired_loading() {
+    ggml_backend_device host{};
+    host.iface.get_name = [](ggml_backend_dev_t) {
+        return "paired-host";
+    };
+    host.iface.get_description = host.iface.get_name;
+    host.iface.get_buffer_type = [](ggml_backend_dev_t) {
+        return ggml_backend_cpu_buffer_type();
+    };
+    size_t cases = 0;
+    for (auto type : {GGML_TYPE_Q8_0, GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K}) {
+        for (int experts : {1, 4}) {
+            ggml_context_ptr source_ctx(ggml_init({2 * ggml_tensor_overhead(), nullptr, true}));
+            gguf_context_ptr gguf(gguf_init_empty());
+            gguf_set_val_str(gguf.get(), "general.architecture", "qwen35moe");
+            std::vector<uint8_t> source_data[2];
+            for (int side = 0; side < 2; ++side) {
+                auto * tensor = ggml_new_tensor_3d(source_ctx.get(), type, 1024, 512, experts);
+                ggml_set_name(tensor, side == 0 ? "blk.0.ffn_gate_exps.weight" : "blk.0.ffn_up_exps.weight");
+                source_data[side].resize(ggml_nbytes(tensor));
+                for (size_t i = 0; i < source_data[side].size(); ++i) {
+                    // Distinct row/expert bytes, with finite scales in every quantized block.
+                    source_data[side][i] = (i % 251 + i / tensor->nb[1] + 17 * (i / tensor->nb[2]) + side * 13) % 64;
+                }
+                tensor->data = source_data[side].data();
+                gguf_add_tensor(gguf.get(), tensor);
+            }
+            const auto close_file = [](FILE * fp) {
+                if (fp) {
+                    fclose(fp);
+                }
+            };
+            std::unique_ptr<FILE, decltype(close_file)> file(tmpfile(), close_file);
+            check(file && gguf_write_to_file_ptr(gguf.get(), file.get(), false) && fflush(file.get()) == 0,
+                  "paired fixture write failed");
+            for (int count : {2, 4, 1}) {
+                for (auto axis : {GGML_BACKEND_SPLIT_AXIS_1, GGML_BACKEND_SPLIT_AXIS_0, GGML_BACKEND_SPLIT_AXIS_2,
+                                  GGML_BACKEND_SPLIT_AXIS_MIRRORED}) {
+                    if (count == 1 && axis != GGML_BACKEND_SPLIT_AXIS_1) {
+                        continue;
+                    }
+                    for (bool mmap : {false, true}) {
+                        if (mmap && !llama_mmap::SUPPORTED) {
+                            continue;
+                        }
+                        rewind(file.get());
+                        std::vector<std::string> splits;
+                        llama_model_loader       loader(nullptr, nullptr, nullptr, "", splits, file.get(),
+                                                  mmap ? LLAMA_LOAD_MODE_MMAP : LLAMA_LOAD_MODE_NONE, true, true, false,
+                                                        nullptr, nullptr);
+                        ggml_context_ptr         ctx(ggml_init({ggml_tensor_overhead(), nullptr, true}));
+                        auto *                   tensor = ggml_new_tensor_3d(ctx.get(), type, 1024, 1024, experts);
+                        ggml_set_name(tensor, "blk.0.ffn_gate_up_exps.weight");
+                        ggml_set_param(tensor);
+                        auto weight           = loader.require_weight("blk.0.ffn_gate_exps.weight");
+                        weight.tensor         = tensor;
+                        weight.paired_sources = {"blk.0.ffn_gate_exps.weight", "blk.0.ffn_up_exps.weight"};
+                        loader.weights_map.emplace(tensor->name, std::move(weight));
+                        ggml_backend_meta_split_state split{};
+                        split.axis       = axis;
+                        split.n_segments = 1;
+                        split.nr[0]      = axis == GGML_BACKEND_SPLIT_AXIS_1 ? 2 : 1;
+                        if (axis < GGML_MAX_DIMS) {
+                            const int64_t extent = tensor->ne[axis] / split.nr[0];
+                            for (int rank = 0; rank < count; ++rank) {
+                                split.ne[rank] = extent / count + (rank < extent % count);
+                            }
+                        }
+                        auto *                          buft = ggml_backend_cpu_buffer_type();
+                        std::vector<ggml_backend_dev_t> devices(count, &host);
+                        if (count > 1) {
+                            auto * meta = ggml_backend_meta_device(
+                                devices.data(), count,
+                                [](const ggml_tensor *, void * data) {
+                                    return *static_cast<ggml_backend_meta_split_state *>(data);
+                                },
+                                &split);
+                            buft = ggml_backend_dev_buffer_type(meta);
+                        }
+                        ggml_backend_buffer_ptr buffer(ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft));
+                        check(bool(buffer), "paired weight allocation failed");
+                        llama_buf_map buffers;
+                        loader.init_mappings(false, nullptr);
+                        check(loader.load_all_data(ctx.get(), buffers, nullptr, nullptr, nullptr),
+                              "paired load failed");
+                        check(loader.size_done == loader.size_data, "paired load progress differs");
+                        std::vector<uint8_t> actual(ggml_nbytes(tensor));
+                        if (count > 1 && axis == GGML_BACKEND_SPLIT_AXIS_2) {
+                            size_t offset = 0;
+                            for (int rank = 0; rank < count; ++rank) {
+                                auto *       shard = ggml_backend_meta_tensor_shard(tensor, rank, nullptr);
+                                const size_t bytes = ggml_nbytes(shard);
+                                if (bytes) {
+                                    ggml_backend_tensor_get(shard, actual.data() + offset, 0, bytes);
+                                }
+                                offset += bytes;
+                            }
+                            check(offset == actual.size(), "paired expert shard coverage differs");
+                        } else {
+                            ggml_backend_tensor_get(tensor, actual.data(), 0, actual.size());
+                        }
+                        const size_t width = tensor->nb[2] / 2;
+                        for (int e = 0; e < experts; ++e) {
+                            for (int side = 0; side < 2; ++side) {
+                                check(memcmp(actual.data() + (2 * e + side) * width,
+                                             source_data[side].data() + e * width, width) == 0,
+                                      "paired load bytes differ");
+                            }
+                        }
+                        if (count > 1 && axis == GGML_BACKEND_SPLIT_AXIS_1) {
+                            for (int rank = 0; rank < count; ++rank) {
+                                auto *       shard = ggml_backend_meta_tensor_shard(tensor, rank, nullptr);
+                                const size_t part  = width / count;
+                                actual.resize(ggml_nbytes(shard));
+                                ggml_backend_tensor_get(shard, actual.data(), 0, actual.size());
+                                for (int e = 0; e < experts; ++e) {
+                                    for (int side = 0; side < 2; ++side) {
+                                        check(memcmp(actual.data() + (2 * e + side) * part,
+                                                     source_data[side].data() + e * width + rank * part, part) == 0,
+                                              "paired shard mixed Gate/Up or expert slices");
+                                    }
+                                }
+                            }
+                        }
+                        ++cases;
+                    }
+                }
+            }
+        }
+    }
+    printf("META_PAIRED_LOAD PASS cases=%zu cold=BYTE_EXACT single_tp2_tp4=PASS\n", cases);
+}
+
 int main() {
     try {
         test_weight_selection();
         test_split_metadata();
+        test_paired_loading();
         return 0;
     } catch (const std::exception & error) {
         fprintf(stderr, "META_WEIGHT_BUFT FAIL: %s\n", error.what());
