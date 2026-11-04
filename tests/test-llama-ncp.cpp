@@ -9,6 +9,7 @@
 
 #include "../ggml/src/ggml-cuda/ncp-lib.h"
 #include "../ggml/src/ggml-cuda/mxfp4-ncp-layout.h"
+#include "../ggml/src/ggml-cuda/mxfp4-ncp.cuh"
 
 #include <algorithm>
 #include <cinttypes>
@@ -202,6 +203,24 @@ static std::vector<uint8_t> mxfp4_data(int N, int K, int E, bool arbitrary_scale
 }
 
 static void test_mxfp4_layout() {
+    for (int M : {1, 2, 8, 128, 5120}) {
+        ggml_init_params ip = {ggml_tensor_overhead() * 4, nullptr, true};
+        ggml_context_ptr ctx(ggml_init(ip));
+        auto *           logits = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, 256, M);
+        auto *           ids    = ggml_argsort_top_k(ctx.get(), logits, 6);
+        GGML_ASSERT(ids->view_src && ids->nb[1] == 256 * sizeof(int32_t));
+        GGML_ASSERT(ggml_is_contiguous(ids) == (M == 1));
+        GGML_ASSERT(ggml_ncp_mxfp4_ids_layout_supported(ids));
+        ggml_tensor bad = *ids;
+        bad.nb[0]       = 2 * sizeof(int32_t);
+        GGML_ASSERT(!ggml_ncp_mxfp4_ids_layout_supported(&bad));
+        bad = *ids;
+        ++bad.nb[1];
+        GGML_ASSERT(!ggml_ncp_mxfp4_ids_layout_supported(&bad));
+        bad.nb[1] = (size_t(INT_MAX) + 1) * sizeof(int32_t);
+        GGML_ASSERT(!ggml_ncp_mxfp4_ids_layout_supported(&bad));
+        printf("NCP_MXFP4_TOPK_LAYOUT PASS M=%d ids_stride=256 legacy_contiguous=%d\n", M, ggml_is_contiguous(ids));
+    }
     for (int N : {64, 128, 192}) {
         for (int K : {64, 128, 256}) {
             const int             E        = 3;
@@ -282,7 +301,7 @@ static void test_mxfp4_shards(ggml_backend_dev_t dev) {
     }
 }
 
-static void test_mxfp4_case(ggml_backend_t backend, int M, int E, int channels) {
+static void test_mxfp4_case(ggml_backend_t backend, int M, int E, int channels, bool topk_view = false) {
     constexpr int    N = 128, K = 256, topk = 6;
     ggml_init_params ip = {ggml_tensor_overhead() * 16 + ggml_graph_overhead(), nullptr, true};
     ggml_context_ptr weights(ggml_init(ip)), ctx(ggml_init(ip));
@@ -319,7 +338,9 @@ static void test_mxfp4_case(ggml_backend_t backend, int M, int E, int channels) 
     GGML_ASSERT(back == raw);
 
     auto * a      = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, K, channels, M);
-    auto * ids    = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_I32, topk, M);
+    auto * logits = topk_view ? ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, E, M) : nullptr;
+    auto * ids =
+        topk_view ? ggml_argsort_top_k(ctx.get(), logits, topk) : ggml_new_tensor_2d(ctx.get(), GGML_TYPE_I32, topk, M);
     auto * output = ggml_mul_mat_id(ctx.get(), w, a, ids);
     auto * graph  = ggml_new_graph(ctx.get());
     ggml_build_forward_expand(graph, output);
@@ -348,7 +369,21 @@ static void test_mxfp4_case(ggml_backend_t backend, int M, int E, int channels) 
             }
         }
         ggml_backend_tensor_set_async(backend, a, input.data(), 0, input.size() * sizeof(float));
-        ggml_backend_tensor_set_async(backend, ids, routes.data(), 0, routes.size() * sizeof(int32_t));
+        std::vector<float> scores;
+        if (topk_view) {
+            scores.resize(size_t(M) * E);
+            for (int t = 0; t < M; ++t) {
+                for (int e = 0; e < E; ++e) {
+                    scores[size_t(t) * E + e] = -e;
+                }
+                for (int j = 0; j < topk; ++j) {
+                    scores[size_t(t) * E + routes[t * topk + j]] = 2 * E - j;
+                }
+            }
+            ggml_backend_tensor_set_async(backend, logits, scores.data(), 0, scores.size() * sizeof(float));
+        } else {
+            ggml_backend_tensor_set_async(backend, ids, routes.data(), 0, routes.size() * sizeof(int32_t));
+        }
         GGML_ASSERT(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS);
         ggml_backend_synchronize(backend);
         ggml_backend_tensor_get(output, got.data(), 0, got.size() * sizeof(float));
@@ -379,8 +414,8 @@ static void test_mxfp4_case(ggml_backend_t backend, int M, int E, int channels) 
             }
         }
     }
-    printf("NCP_MXFP4 PASS M=%d E=%d topk=%d channels=%d replays=3 buffer=%s\n", M, E, topk, channels,
-           ggml_backend_buft_name(buft));
+    printf("NCP_MXFP4 PASS M=%d E=%d topk=%d channels=%d topk_view=%d replays=3 buffer=%s\n", M, E, topk, channels,
+           topk_view, ggml_backend_buft_name(buft));
     fflush(stdout);
 }
 
@@ -419,13 +454,17 @@ int main(int argc, char ** argv) {
             test_mxfp4_case(gpu.get(), M, 8, 1);
             test_mxfp4_case(gpu.get(), M, 8, 6);
         }
+        for (int M : {1, 8, 128, 5120}) {
+            test_mxfp4_case(gpu.get(), M, 256, 1, true);
+            test_mxfp4_case(gpu.get(), M, 256, 6, true);
+        }
         ggml_backend_ptr second(ggml_backend_dev_init(gpu_dev, nullptr));
         GGML_ASSERT(second);
         test_mxfp4_case(second.get(), 1, 256, 1);
         test_mxfp4_case(second.get(), 32, 256, 6);
         second.reset();
         test_mxfp4_case(gpu.get(), 1, 8, 1);
-        printf("NCP_MXFP4 DONE cases=35 graph_capture=UNSUPPORTED_BY_PROVIDER\n");
+        printf("NCP_MXFP4 DONE cases=43 graph_capture=UNSUPPORTED_BY_PROVIDER\n");
         return 0;
     }
 

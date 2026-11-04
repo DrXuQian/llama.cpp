@@ -4492,6 +4492,18 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
             }
             if (src && src->buffer && ggml_cuda_buft_is_ncp_mxfp4(src->buffer->buft) &&
                 !ggml_backend_dev_supports_op(backend->device, node)) {
+                GGML_LOG_ERROR("NCP MXFP4 rejected: device=%s weight_device=%s provider_available=%d\n",
+                               ggml_backend_dev_name(backend->device), ggml_backend_dev_name(src->buffer->buft->device),
+                               ggml_ncp_lib_moe_w4fa16_available());
+                for (const auto * t :
+                     std::array<const ggml_tensor *, 4>{node, node->src[0], node->src[1], node->src[2]}) {
+                    if (t) {
+                        GGML_LOG_ERROR("  %s type=%s ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64
+                                       "] nb=[%zu,%zu,%zu,%zu] contiguous=%d\n",
+                                       t->name, ggml_type_name(t->type), t->ne[0], t->ne[1], t->ne[2], t->ne[3],
+                                       t->nb[0], t->nb[1], t->nb[2], t->nb[3], ggml_is_contiguous(t));
+                    }
+                }
                 GGML_ABORT("NCP MXFP4: unsupported packed operation %s (%s reads %s)", ggml_op_name(node->op),
                            node->name, src->name);
             }

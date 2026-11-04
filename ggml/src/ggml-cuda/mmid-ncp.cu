@@ -238,9 +238,9 @@ bool ggml_cuda_mul_mat_id_ncp_mxfp4_supported(const ggml_tensor * dst) {
     const auto *  ids  = dst->src[2];
     const int64_t topk = ids->ne[0];
     return a->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 && ids->type == GGML_TYPE_I32 &&
-           ggml_is_contiguous(a) && ggml_is_contiguous(dst) && ggml_is_contiguous(ids) && a->ne[3] == 1 &&
-           ids->ne[2] == 1 && ids->ne[3] == 1 && dst->ne[3] == 1 && topk > 0 && topk <= w->ne[2] && topk < (1 << 10) &&
-           a->ne[1] > 0 && topk % a->ne[1] == 0 && a->ne[0] == w->ne[0] && dst->ne[0] == w->ne[1] &&
+           ggml_is_contiguous(a) && ggml_is_contiguous(dst) && ggml_ncp_mxfp4_ids_layout_supported(ids) &&
+           a->ne[3] == 1 && ids->ne[2] == 1 && ids->ne[3] == 1 && dst->ne[3] == 1 && topk > 0 && topk <= w->ne[2] &&
+           topk < (1 << 10) && a->ne[1] > 0 && topk % a->ne[1] == 0 && a->ne[0] == w->ne[0] && dst->ne[0] == w->ne[1] &&
            dst->ne[1] == topk && ids->ne[1] == a->ne[2] && dst->ne[2] == a->ne[2];
 }
 
@@ -259,9 +259,10 @@ void ggml_cuda_mul_mat_id_ncp_mxfp4(ggml_backend_cuda_context & ctx, ggml_tensor
     });
     // Bound helper shared memory, provider int32 indices and BF16 scratch for arbitrary token counts.
     const int64_t topk  = ids->ne[0];
-    const int64_t limit = std::min({int64_t(ggml_cuda_info().devices[ctx.device].smpbo / sizeof(int32_t)),
-                                    int64_t((1 << 22) - 1), INT_MAX / (topk * std::max(w->ne[0], w->ne[1])),
-                                    int64_t(1024 * 1024 * 1024) / (topk * (w->ne[0] + w->ne[1]) * 2)});
+    const int64_t limit =
+        std::min({int64_t(ggml_cuda_info().devices[ctx.device].smpbo / sizeof(int32_t)), int64_t((1 << 22) - 1),
+                  INT_MAX / (topk * std::max(w->ne[0], w->ne[1])), INT_MAX / int64_t(ids->nb[1] / sizeof(int32_t)),
+                  int64_t(1024 * 1024 * 1024) / (topk * (w->ne[0] + w->ne[1]) * 2)});
     GGML_ASSERT(limit > 0);
     for (int64_t first = 0; first < a->ne[2]; first += limit) {
         const int64_t count = std::min(limit, a->ne[2] - first);
