@@ -115,6 +115,8 @@ const char * kquant_type_name(int32_t t) {
             return "Q5_K";
         case GGML_TYPE_Q6_K:
             return "Q6_K";
+        case GGML_TYPE_MXFP4:
+            return "MXFP4";
         default:
             return nullptr;
     }
@@ -122,10 +124,16 @@ const char * kquant_type_name(int32_t t) {
 
 // Names and IDs from the existing runtime cache schema.
 const char * layout_name_for(int32_t t) {
+    if (t == GGML_TYPE_MXFP4) {
+        return "mxfp4-w4fa16";
+    }
     return t == GGML_TYPE_Q8_0 ? "q8-kpack2" : t == GGML_TYPE_Q4_K ? "q4-kpack4" : "kquant-kpack";
 }
 
 int32_t layout_id_for(int32_t t) {
+    if (t == GGML_TYPE_MXFP4) {
+        return 5;
+    }
     return t == GGML_TYPE_Q8_0 ? 4 : t == GGML_TYPE_Q4_K ? 1 : 2;
 }
 
@@ -353,6 +361,7 @@ bool derive_geometry(int64_t       n,
                      int64_t       k,
                      int64_t       experts,
                      bool          grouped,
+                     int32_t       qtype,
                      int32_t       bits,
                      int32_t       high_bits,
                      int64_t       units_bytes_total,
@@ -367,6 +376,18 @@ bool derive_geometry(int64_t       n,
     g.low_bytes   = g.e1 * n * k * bits / 8;
     g.high_bytes  = high_bits ? g.e1 * n * k * high_bits / 8 : 0;
     g.units_bytes = units_bytes_total;
+    if (qtype == GGML_TYPE_MXFP4) {
+        if (bits != 4 || high_bits || units_bytes_total != g.e1 * n * k / 32) {
+            error = "MXFP4 requires four-bit codes and one E8M0 scale per 32 codes";
+            return false;
+        }
+        g.spu         = 1;
+        g.ub          = 8;
+        g.low_shape   = {g.e1, k / 16, n * 2, 4};
+        g.high_shape  = {0};
+        g.units_shape = grouped ? std::vector<int64_t>{g.e1, k / 32, n} : std::vector<int64_t>{k / 32, n};
+        return true;
+    }
     if (bits == 8) {
         if (high_bits || units_bytes_total != g.e1 * n * k / 16) {
             error = "Q8_0 requires only one FP16 scale per 32 codes";
@@ -869,7 +890,8 @@ bool llama_kpack_sidecar_reader::open(const std::string & dir, std::string & err
         if (!keys_exactly(pp, {"low", "high"}, "plane_packs", error)) {
             return false;
         }
-        if (pp["low"] != 16 / pl.bits || pp["high"] != (pl.high_bits ? 16 / pl.high_bits : 0)) {
+        if (pp["low"] != (rec.ggml_type == GGML_TYPE_MXFP4 ? 32 : 16) / pl.bits ||
+            pp["high"] != (pl.high_bits ? 16 / pl.high_bits : 0)) {
             error = pre + "plane_packs disagree with the arrangement";
             return false;
         }
@@ -1040,8 +1062,8 @@ bool llama_kpack_sidecar_reader::open(const std::string & dir, std::string & err
             spans[j]->size   = (uint64_t) z;
         }
         geometry g;
-        if (!derive_geometry(rec.n, rec.k, rec.experts, grouped, pl.bits, pl.high_bits, (int64_t) rec.units.size, g,
-                             error)) {
+        if (!derive_geometry(rec.n, rec.k, rec.experts, grouped, rec.ggml_type, pl.bits, pl.high_bits,
+                             (int64_t) rec.units.size, g, error)) {
             error = pre + error;
             return false;
         }
@@ -1440,7 +1462,7 @@ bool llama_kpack_sidecar_writer::add_record(const llama_kpack_source_tensor & sr
     }
 
     geometry g;
-    if (!derive_geometry(local.n, local.k, experts, grouped, planes.bits, planes.high_bits,
+    if (!derive_geometry(local.n, local.k, experts, grouped, src.ggml_type, planes.bits, planes.high_bits,
                          (int64_t) planes.units_bytes, g, error)) {
         error = pre + error;
         return false;
@@ -1519,7 +1541,8 @@ bool llama_kpack_sidecar_writer::add_record(const llama_kpack_source_tensor & sr
         {"type_name", tname},
         {"route_class", grouped ? "grouped" : "dense"},
         {"layout_name", layout_name_for(src.ggml_type)},
-        {"plane_packs", ojson{{"low", 16 / planes.bits}, {"high", planes.high_bits ? 16 / planes.high_bits : 0}}},
+        {"plane_packs", ojson{{"low", (src.ggml_type == GGML_TYPE_MXFP4 ? 32 : 16) / planes.bits},
+                              {"high", planes.high_bits ? 16 / planes.high_bits : 0}}},
         {"rank", grouped ? 3 : 2},
         {"n", local.n},
         {"k", local.k},
