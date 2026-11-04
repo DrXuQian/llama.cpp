@@ -8,11 +8,13 @@
 #include "ggml-cpp.h"
 
 #include "../ggml/src/ggml-cuda/ncp-lib.h"
+#include "../ggml/src/ggml-cuda/mxfp4-ncp-layout.h"
 
 #include <algorithm>
 #include <cinttypes>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <numeric>
 #include <random>
 #include <vector>
@@ -148,16 +150,284 @@ static case_result run_moe_case(ggml_backend_t backend, const moe_case & c) {
     return bad ? CASE_FAIL : CASE_PASS;
 }
 
+// Independent Sail permutation oracle; do not use code_index() to generate expected packed words.
+static std::vector<uint8_t> mxfp4_oracle(const std::vector<uint8_t> & raw, int N, int K, int E) {
+    std::vector<uint8_t> packed(raw.size());
+    const int            interleave[] = {0, 2, 4, 6, 1, 3, 5, 7};
+    const int            scale_swap[] = {0, 2, 1, 3};
+    uint64_t             output       = 0;
+    for (int e = 0; e < E; ++e) {
+        for (int kt = 0; kt < K; kt += 16) {
+            for (int nt = 0; nt < N; nt += 64) {
+                for (int lane = 0; lane < 32; ++lane) {
+                    const int rows[] = {2 * (lane % 4), 2 * (lane % 4) + 1, 2 * (lane % 4) + 8, 2 * (lane % 4) + 9};
+                    for (int tile = 0; tile < 4; ++tile) {
+                        for (int s : interleave) {
+                            const int      k = kt + rows[s % 4], n = nt + tile * 16 + lane / 4 + 8 * (s / 4);
+                            const size_t   block = (size_t(e) * N + n) * (K / 32) + k / 32;
+                            const unsigned code  = (raw[block * 17 + 1 + k % 16] >> (k % 32 >= 16 ? 4 : 0)) & 15;
+                            packed[output / 2] |= code << (4 * (output % 2));
+                            GGML_ASSERT(ggml_ncp_mxfp4::code_index(N, K, e, n, k) == output);
+                            ++output;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    size_t scale_out = 0;
+    for (int e = 0; e < E; ++e) {
+        for (int kb = 0; kb < K / 32; ++kb) {
+            for (int base = 0; base < N; base += 64) {
+                for (int group = 0; group < 16; ++group) {
+                    for (int sw : scale_swap) {
+                        const int i = 4 * group + sw, n = base + i / 8 + (i % 8) * 8;
+                        packed[output / 2 + scale_out] = raw[((size_t(e) * N + n) * (K / 32) + kb) * 17];
+                        GGML_ASSERT(ggml_ncp_mxfp4::scale_index(N, K, e, n, kb) == scale_out++);
+                    }
+                }
+            }
+        }
+    }
+    return packed;
+}
+
+static std::vector<uint8_t> mxfp4_data(int N, int K, int E, bool arbitrary_scales) {
+    std::mt19937         rng(314159 + N + K + E);
+    std::vector<uint8_t> raw(size_t(E) * N * (K / 32) * 17);
+    for (size_t i = 0; i < raw.size(); ++i) {
+        raw[i] = i % 17 ? rng() & 255 : arbitrary_scales ? (i / 17) & 255 : 121 + rng() % 7;
+    }
+    return raw;
+}
+
+static void test_mxfp4_layout() {
+    for (int N : {64, 128, 192}) {
+        for (int K : {64, 128, 256}) {
+            const int             E        = 3;
+            const auto            raw      = mxfp4_data(N, K, E, true);
+            auto                  expected = mxfp4_oracle(raw, N, K, E);
+            // Align word access independently of the byte-vector allocator.
+            std::vector<uint32_t> words((expected.size() + 3) / 4);
+            memcpy(words.data(), expected.data(), expected.size());
+            for (size_t i = 0; i < raw.size(); ++i) {
+                GGML_ASSERT(ggml_ncp_mxfp4::raw_byte(reinterpret_cast<const uint8_t *>(words.data()), N, K, E, i) ==
+                            raw[i]);
+            }
+            for (int e = 0; e < E; ++e) {
+                for (int n = 0; n < N; n += 64) {
+                    const auto * tile = raw.data() + (size_t(e) * N + n) * (K / 32) * 17;
+                    for (int j = 0; j < 64 * K / 8; ++j) {
+                        const size_t dst = (size_t(e) * K / 16 + j / 128) * 2 * N + 2 * n + j % 128;
+                        GGML_ASSERT(ggml_ncp_mxfp4::tile_word(tile, K, j) == words[dst]);
+                    }
+                }
+            }
+            words[7] ^= 1;
+            bool rejected = false;
+            for (size_t i = 0; i < raw.size(); ++i) {
+                rejected |=
+                    ggml_ncp_mxfp4::raw_byte(reinterpret_cast<const uint8_t *>(words.data()), N, K, E, i) != raw[i];
+            }
+            GGML_ASSERT(rejected);
+        }
+    }
+    GGML_ASSERT(!ggml_ncp_mxfp4::shape(63, 64, 8));
+    GGML_ASSERT(!ggml_ncp_mxfp4::shape(64, 96, 8));
+    GGML_ASSERT(!ggml_ncp_mxfp4::shape(64, 64, 1025));
+    GGML_ASSERT(!ggml_ncp_mxfp4::shape(65536, 65536, 1));
+    printf("NCP_MXFP4_LAYOUT PASS shapes=9 bit_exact=1 planted_fault=DETECTED\n");
+}
+
+static void test_mxfp4_shards(ggml_backend_dev_t dev) {
+    // Exercise Meta's real split/upload path on one physical GPU; no collectives are needed for loading.
+    ggml_backend_dev_t                   devices[] = {dev, dev};
+    static ggml_backend_meta_split_state states[3]{};
+    for (int axis = 0; axis < 3; ++axis) {
+        ggml_init_params ip = {ggml_tensor_overhead() * 4, nullptr, true};
+        ggml_context_ptr ctx(ggml_init(ip));
+        auto *           w     = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_MXFP4, 256, 256, 8);
+        auto &           split = states[axis];
+        split.axis             = static_cast<ggml_backend_meta_split_axis>(axis);
+        split.ne[0] = split.ne[1] = w->ne[axis] / 2;
+        split.nr[0] = split.n_segments = 1;
+        auto * meta                    = ggml_backend_meta_device(
+            devices, 2,
+            [](const ggml_tensor *, void * data) { return *static_cast<ggml_backend_meta_split_state *>(data); },
+            &split);
+        auto * buft = ggml_backend_meta_device_get_weight_buft(meta, w, GGML_OP_MUL_MAT_ID);
+        GGML_ASSERT(buft && ggml_backend_meta_buffer_type_count(buft) == 2);
+        ggml_backend_buffer_ptr buffer(ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft));
+        GGML_ASSERT(buffer);
+        const auto raw = mxfp4_data(256, 256, 8, true);
+        ggml_backend_tensor_set(w, raw.data(), 0, raw.size());
+        for (int rank = 0; rank < 2; ++rank) {
+            auto * local = ggml_backend_meta_tensor_shard(w, rank, nullptr);
+            GGML_ASSERT(local);
+            std::vector<uint8_t> got(ggml_nbytes(local));
+            ggml_backend_tensor_get(local, got.data(), 0, got.size());
+            size_t offset = 0;
+            for (int e = 0; e < local->ne[2]; ++e) {
+                for (int n = 0; n < local->ne[1]; ++n) {
+                    const int    ge     = e + (axis == 2 ? rank * local->ne[2] : 0);
+                    const int    gn     = n + (axis == 1 ? rank * local->ne[1] : 0);
+                    const int    kb     = axis == 0 ? rank * local->ne[0] / 32 : 0;
+                    const auto * source = raw.data() + ((size_t(ge) * 256 + gn) * 8 + kb) * 17;
+                    GGML_ASSERT(memcmp(got.data() + offset, source, local->nb[1]) == 0);
+                    offset += local->nb[1];
+                }
+            }
+        }
+        printf("NCP_MXFP4_SHARD PASS axis=%d ranks=2 physical_devices=1\n", axis);
+    }
+}
+
+static void test_mxfp4_case(ggml_backend_t backend, int M, int E, int channels) {
+    constexpr int    N = 128, K = 256, topk = 6;
+    ggml_init_params ip = {ggml_tensor_overhead() * 16 + ggml_graph_overhead(), nullptr, true};
+    ggml_context_ptr weights(ggml_init(ip)), ctx(ggml_init(ip));
+    GGML_ASSERT(weights && ctx);
+    auto * w = ggml_new_tensor_3d(weights.get(), GGML_TYPE_MXFP4, K, N, E);
+    ggml_set_name(w, "ncp-mxfp4-test");
+    const auto dev = ggml_backend_get_device(backend);
+    const auto reg = ggml_backend_dev_backend_reg(dev);
+    const auto preferred =
+        (ggml_backend_dev_get_weight_buft_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_dev_get_weight_buft");
+    GGML_ASSERT(preferred);
+    auto buft = preferred(dev, w, GGML_OP_MUL_MAT_ID);
+    GGML_ASSERT(buft && "libncp_moe.so must export W4FA16 and release_workspace v1");
+    GGML_ASSERT(!preferred(dev, w, GGML_OP_MUL_MAT));
+    ggml_backend_buffer_ptr wb(ggml_backend_alloc_ctx_tensors_from_buft(weights.get(), buft));
+    GGML_ASSERT(wb);
+    ggml_backend_buffer_set_usage(wb.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    auto raw = mxfp4_data(N, K, E, false);
+    ggml_backend_tensor_set(w, raw.data(), 0, raw.size());
+    // Partial byte updates cross metadata, block and word boundaries.
+    raw[15] ^= 0x91;
+    ggml_backend_tensor_set(w, raw.data() + 15, 15, 19);
+    std::vector<uint8_t> back(raw.size());
+    ggml_backend_tensor_get(w, back.data(), 0, back.size());
+    GGML_ASSERT(back == raw);
+    // A K-shard-style upload with gaps in the source, contiguous destination rows.
+    const size_t         row = K / 32 * 17;
+    std::vector<uint8_t> strided(2 * raw.size(), 0x95);
+    for (int r = 0; r < N * E; ++r) {
+        memcpy(strided.data() + r * 2 * row, raw.data() + r * row, row);
+    }
+    ggml_backend_tensor_set_2d(w, strided.data(), 0, row, N * E, row, 2 * row);
+    ggml_backend_tensor_get(w, back.data(), 0, back.size());
+    GGML_ASSERT(back == raw);
+
+    auto * a      = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, K, channels, M);
+    auto * ids    = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_I32, topk, M);
+    auto * output = ggml_mul_mat_id(ctx.get(), w, a, ids);
+    auto * graph  = ggml_new_graph(ctx.get());
+    ggml_build_forward_expand(graph, output);
+    ggml_backend_buffer_ptr buf(ggml_backend_alloc_ctx_tensors(ctx.get(), backend));
+    GGML_ASSERT(buf && ggml_backend_supports_op(backend, output));
+    auto * bad = ggml_view_3d(ctx.get(), w, K, N / 2, E, w->nb[1], w->nb[2], 0);
+    GGML_ASSERT(!ggml_backend_supports_op(backend, bad));
+    auto * alias = ggml_view_tensor(ctx.get(), w);
+    GGML_ASSERT(ggml_backend_supports_op(backend, alias));
+    const float fp4[] = {0, .5f, 1, 1.5f, 2, 3, 4, 6, 0, -.5f, -1, -1.5f, -2, -3, -4, -6};
+    for (int replay = 0; replay < 3; ++replay) {
+        std::vector<float>   input(size_t(M) * channels * K, 0), got(size_t(M) * topk * N);
+        std::vector<int32_t> routes(size_t(M) * topk);
+        for (int t = 0; t < M; ++t) {
+            for (int c = 0; c < channels; ++c) {
+                if (M == 9) {
+                    for (int k = 0; k < K; ++k) {
+                        input[(size_t(t) * channels + c) * K + k] = ((k + t + c + replay) % 17 - 8) / 8.0f;
+                    }
+                } else {
+                    input[(size_t(t) * channels + c) * K + (t * 7 + c * 13 + replay) % K] = 1;
+                }
+            }
+            for (int j = 0; j < topk; ++j) {
+                routes[t * topk + j] = replay == 1 ? j : (t * 11 + j + replay) % E;
+            }
+        }
+        ggml_backend_tensor_set_async(backend, a, input.data(), 0, input.size() * sizeof(float));
+        ggml_backend_tensor_set_async(backend, ids, routes.data(), 0, routes.size() * sizeof(int32_t));
+        GGML_ASSERT(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS);
+        ggml_backend_synchronize(backend);
+        ggml_backend_tensor_get(output, got.data(), 0, got.size() * sizeof(float));
+        for (int t = 0; t < M; ++t) {
+            for (int j = 0; j < topk; ++j) {
+                const int k = (t * 7 + (j % channels) * 13 + replay) % K, e = routes[t * topk + j];
+                for (int n = 0; n < N; ++n) {
+                    const size_t b        = (size_t(e) * N + n) * (K / 32) + k / 32;
+                    const int    code     = (raw[b * 17 + 1 + k % 16] >> (k % 32 >= 16 ? 4 : 0)) & 15;
+                    float        expected = std::ldexp(fp4[code], int(raw[b * 17]) - 127);
+                    if (M == 9) {
+                        float sum = 0;
+                        for (int col = 0; col < K; ++col) {
+                            const size_t block = (size_t(e) * N + n) * (K / 32) + col / 32;
+                            const int    value = (raw[block * 17 + 1 + col % 16] >> (col % 32 >= 16 ? 4 : 0)) & 15;
+                            sum += input[(size_t(t) * channels + j % channels) * K + col] *
+                                   std::ldexp(fp4[value], int(raw[block * 17]) - 127);
+                        }
+                        expected = ggml_bf16_to_fp32(ggml_fp32_to_bf16(sum));
+                    }
+                    const float actual = got[(size_t(t) * topk + j) * N + n];
+                    if (actual != expected) {
+                        GGML_ABORT(
+                            "W4FA16 mismatch M=%d E=%d channels=%d replay=%d t=%d j=%d n=%d actual=%g expected=%g", M,
+                            E, channels, replay, t, j, n, actual, expected);
+                    }
+                }
+            }
+        }
+    }
+    printf("NCP_MXFP4 PASS M=%d E=%d topk=%d channels=%d replays=3 buffer=%s\n", M, E, topk, channels,
+           ggml_backend_buft_name(buft));
+    fflush(stdout);
+}
+
 // ---- main ----
 
-int main(void) {
+int main(int argc, char ** argv) {
+    const bool layout = argc == 2 && strcmp(argv[1], "--mxfp4-layout") == 0;
+    const bool mxfp4  = argc == 2 && strcmp(argv[1], "--mxfp4") == 0;
+    if (argc != 1 && !layout && !mxfp4) {
+        fprintf(stderr, "usage: %s [--mxfp4-layout|--mxfp4]\n", argv[0]);
+        return 1;
+    }
+    if (layout || mxfp4) {
+        test_mxfp4_layout();
+        if (layout) {
+            return 0;
+        }
+    }
     ggml_backend_load_all();
 
     ggml_backend_dev_t gpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
-    if (!gpu_dev) { printf("[SKIP] no GPU device\n"); return 0; }
+    if (!gpu_dev) {
+        printf("[SKIP] no GPU device\n");
+        return mxfp4 ? 1 : 0;
+    }
     ggml_backend_ptr gpu(ggml_backend_dev_init(gpu_dev, nullptr));
-    if (!gpu) { printf("[SKIP] GPU init failed\n"); return 0; }
+    if (!gpu) {
+        printf("[SKIP] GPU init failed\n");
+        return mxfp4 ? 1 : 0;
+    }
     printf("gpu: %s\n\n", ggml_backend_dev_description(gpu_dev));
+
+    if (mxfp4) {
+        test_mxfp4_shards(gpu_dev);
+        for (int M : {1, 2, 3, 4, 5, 6, 7, 8, 9, 128, 512, 1024, 2048, 4096, 5120, 32769}) {
+            test_mxfp4_case(gpu.get(), M, 8, 1);
+            test_mxfp4_case(gpu.get(), M, 8, 6);
+        }
+        ggml_backend_ptr second(ggml_backend_dev_init(gpu_dev, nullptr));
+        GGML_ASSERT(second);
+        test_mxfp4_case(second.get(), 1, 256, 1);
+        test_mxfp4_case(second.get(), 32, 256, 6);
+        second.reset();
+        test_mxfp4_case(gpu.get(), 1, 8, 1);
+        printf("NCP_MXFP4 DONE cases=35 graph_capture=UNSUPPORTED_BY_PROVIDER\n");
+        return 0;
+    }
 
     printf("--- MoE (DeepGemm GroupedNoPad, BF16) ---\n");
     int n_pass = 0, n_fail = 0, n_skip = 0;

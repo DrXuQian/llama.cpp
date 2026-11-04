@@ -107,6 +107,8 @@ static ncp_moe_fn        g_moe_fn        = NULL;
 static ncp_moe_masked_fn g_moe_masked_fn = NULL;
 static ncp_moe_nopad_fn  g_moe_nopad_fn  = NULL;
 static ncp_moe_align_fn  g_moe_align_fn  = NULL;
+static decltype(&ncp_m_grouped_gemm_w4fa16_bf16_nt_nopad_v1) g_moe_w4fa16_fn         = nullptr;
+static decltype(&ncp_moe_w4fa16_release_workspace_v1)        g_moe_w4fa16_release_fn = nullptr;
 
 static void ncp_moe_init(void) {
     void * moe = open_lib("libncp_moe.so");
@@ -115,12 +117,20 @@ static void ncp_moe_init(void) {
         g_moe_masked_fn     = (ncp_moe_masked_fn)     dlsym(moe, "ncp_m_grouped_gemm_bf16_bf16_bf16_nt_masked");
         g_moe_nopad_fn = (ncp_moe_nopad_fn) dlsym(moe, "ncp_m_grouped_gemm_bf16_bf16_bf16_nt_nopad");
         g_moe_align_fn      = (ncp_moe_align_fn)      dlsym(moe, "ncp_get_m_alignment_for_contiguous_layout");
+        g_moe_w4fa16_fn =
+            reinterpret_cast<decltype(g_moe_w4fa16_fn)>(dlsym(moe, "ncp_m_grouped_gemm_w4fa16_bf16_nt_nopad_v1"));
+        g_moe_w4fa16_release_fn =
+            reinterpret_cast<decltype(g_moe_w4fa16_release_fn)>(dlsym(moe, "ncp_moe_w4fa16_release_workspace_v1"));
+        if (!g_moe_w4fa16_fn || !g_moe_w4fa16_release_fn) {
+            GGML_LOG_INFO("[ncp-lib] W4FA16 v1 ABI unavailable; MXFP4 weights keep GGUF storage\n");
+        }
         // Say so when the library loaded but has no NoPad entry: the hook is gated on that symbol alone, so this is
         // the difference between "the .so is doing the MoE" and "the .so loaded and changed nothing", which are
         // otherwise indistinguishable -- the model produces correct output either way.
         if (!g_moe_nopad_fn) {
-            GGML_LOG_WARN("[ncp-lib] libncp_moe.so loaded but exports no "
-                          "ncp_m_grouped_gemm_bf16_bf16_bf16_nt_nopad -> MoE routing OFF, inline path\n");
+            GGML_LOG_WARN(
+                "[ncp-lib] libncp_moe.so loaded but exports no "
+                "ncp_m_grouped_gemm_bf16_bf16_bf16_nt_nopad -> BF16 MoE uses the inline path\n");
         }
     }
 }
@@ -129,6 +139,33 @@ static pthread_once_t g_moe_once = PTHREAD_ONCE_INIT;
 static void ensure_moe_init(void) { pthread_once(&g_moe_once, ncp_moe_init); }
 
 extern "C" bool ggml_ncp_lib_moe_nopad_available(void) { ensure_moe_init(); return g_moe_nopad_fn != NULL; }
+
+extern "C" bool ggml_ncp_lib_moe_w4fa16_available(void) {
+    ensure_moe_init();
+    return g_moe_w4fa16_fn && g_moe_w4fa16_release_fn;
+}
+
+extern "C" int ggml_ncp_lib_m_grouped_gemm_w4fa16_bf16_nt_nopad_v1(const void * A,
+                                                                   const void * B,
+                                                                   const void * scales,
+                                                                   void *       out,
+                                                                   const int *  m_rows,
+                                                                   int          total_rows,
+                                                                   int          N,
+                                                                   int          K,
+                                                                   int          n_experts,
+                                                                   int          scale_type,
+                                                                   void *       stream) {
+    if (!ggml_ncp_lib_moe_w4fa16_available()) {
+        return -1;
+    }
+    return g_moe_w4fa16_fn(A, B, scales, out, m_rows, total_rows, N, K, n_experts, scale_type, stream);
+}
+
+extern "C" int ggml_ncp_lib_moe_w4fa16_release_workspace_v1(void * stream) {
+    ensure_moe_init();
+    return g_moe_w4fa16_release_fn ? g_moe_w4fa16_release_fn(stream) : 0;
+}
 
 extern "C" int ggml_ncp_lib_get_m_alignment_for_contiguous_layout(void) {
     ensure_moe_init();
@@ -161,7 +198,31 @@ extern "C" int ggml_ncp_lib_m_grouped_gemm_bf16_bf16_bf16_nt_nopad(
 
 #else  // MoE off: inert stubs
 
-extern "C" bool ggml_ncp_lib_moe_nopad_available(void) { return false; }
+extern "C" bool ggml_ncp_lib_moe_nopad_available(void) {
+    return false;
+}
+
+extern "C" bool ggml_ncp_lib_moe_w4fa16_available(void) {
+    return false;
+}
+
+extern "C" int ggml_ncp_lib_m_grouped_gemm_w4fa16_bf16_nt_nopad_v1(const void *,
+                                                                   const void *,
+                                                                   const void *,
+                                                                   void *,
+                                                                   const int *,
+                                                                   int,
+                                                                   int,
+                                                                   int,
+                                                                   int,
+                                                                   int,
+                                                                   void *) {
+    return -1;
+}
+
+extern "C" int ggml_ncp_lib_moe_w4fa16_release_workspace_v1(void *) {
+    return 0;
+}
 extern "C" int  ggml_ncp_lib_get_m_alignment_for_contiguous_layout(void) { return 0; }
 extern "C" int  ggml_ncp_lib_m_grouped_gemm_bf16_bf16_bf16_nt_contiguous(
         const void *, const void *, void *, const int *,

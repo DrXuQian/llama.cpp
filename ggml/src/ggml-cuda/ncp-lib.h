@@ -6,6 +6,7 @@
 // repo into standalone .so files that hide their internals; only the .so binaries (+ ABI headers) are shipped
 // to users, never the kernel source. At runtime we dlopen the .so and dlsym the C ABI; if the .so is absent or
 // has no kernel for the requested shape, the caller transparently falls back to the inline ggml path.
+// Exception: resident W4FA16-packed weights must fail, not fall back to a native GGUF reader.
 //
 // WHICH libraries are loaded is a BUILD decision, one flag per library:
 //   cmake -DGGML_NCP_FA=ON   -> libncp_fa.so   (FlashAttention-3)
@@ -80,6 +81,21 @@ int  ggml_ncp_lib_m_grouped_gemm_bf16_bf16_bf16_nt_masked(
 int  ggml_ncp_lib_m_grouped_gemm_bf16_bf16_bf16_nt_nopad(
     const void * A, const void * B, void * out, const int * m_indices, const int * m_rows,
     int total_rows, int N, int K, int n_experts, int expected_m, void * stream);
+
+// Requires both the W4FA16 entry and its stream-workspace destructor.
+bool ggml_ncp_lib_moe_w4fa16_available(void);
+int  ggml_ncp_lib_m_grouped_gemm_w4fa16_bf16_nt_nopad_v1(const void * A,
+                                                         const void * B,
+                                                         const void * scales,
+                                                         void *       out,
+                                                         const int *  m_rows,
+                                                         int          total_rows,
+                                                         int          N,
+                                                         int          K,
+                                                         int          n_experts,
+                                                         int          scale_type,
+                                                         void *       stream);
+int  ggml_ncp_lib_moe_w4fa16_release_workspace_v1(void * stream);
 
 // ---- GDN (mirror of ncp-gdn-lib.h) ----
 // One actlizeLA PPU1.0 residual/full-chunk entry serves prefill and decode. q/k/v/beta/o are BF16; the raw

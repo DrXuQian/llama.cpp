@@ -3,7 +3,7 @@
 // only these declarations -- the cuBLAS model). Mirrored by ncp-lib.h, which is what ggml code actually calls,
 // exactly as ncp-fa-lib.h is mirrored there. libncp_moe.so is built in the ncp_flash_lib repo.
 //
-// EVERY NAME BELOW IS DeepGemm's OWN, PREFIXED WITH ncp_ AND OTHERWISE UNCHANGED. Strip the prefix and you have the
+// The BF16 entries use DeepGemm's names prefixed with ncp_. Strip the prefix and you have the
 // upstream entry this re-implements: ncp_m_grouped_gemm_bf16_bf16_bf16_nt_nopad <-> DeepGemm's
 // m_grouped_gemm_bf16_bf16_bf16_nt_nopad. The trailing word is the scheduler (GroupedContiguous / GroupedMasked /
 // GroupedNoPad) and carries no other meaning: what actually separates the three -- padding, whether shape_m must be
@@ -53,6 +53,27 @@ int ncp_m_grouped_gemm_bf16_bf16_bf16_nt_masked(
 int ncp_m_grouped_gemm_bf16_bf16_bf16_nt_nopad(
     const void * A, const void * B, void * out, const int * m_indices, const int * m_rows,
     int total_rows, int N, int K, int n_experts, int expected_m, void * stream);
+
+enum ncp_moe_w4fa16_scale_type { NCP_MOE_W4FA16_SCALE_E8M0 = 0, NCP_MOE_W4FA16_SCALE_BF16 = 1 };
+
+// Group size 32. A/out: BF16 [total_rows,K/N]. B: packed int32 [E,K/16,2N].
+// Scales: permuted uint8/BF16 [E,K/32,N]. m_rows: device int32 [E].
+// N/K multiples of 64, E in [1,1024]; row/weight indexing must fit int32.
+// PPU1.0/1.5, HGCC JIT (DG_JIT_USE_HGRTC=0). Nonzero calls are not capture-safe, even after warmup.
+// First use and workspace growth can synchronize. Later calls only submit work.
+// Keep buffers alive until completion; release workspace before destroying its stream.
+int ncp_m_grouped_gemm_w4fa16_bf16_nt_nopad_v1(const void * A,
+                                               const void * B,
+                                               const void * scales,
+                                               void *       out,
+                                               const int *  m_rows,
+                                               int          total_rows,
+                                               int          N,
+                                               int          K,
+                                               int          n_experts,
+                                               int          scale_type,
+                                               void *       stream);
+int ncp_moe_w4fa16_release_workspace_v1(void * stream);
 
 #ifdef __cplusplus
 }

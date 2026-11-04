@@ -17,3 +17,7 @@ bool ggml_cuda_mul_mat_id_ncp_lib(ggml_backend_cuda_context & ctx,
 // without this two thirds of a MoE layer's matmuls never see the .so. Lives next to the hook so the two conditions
 // cannot drift apart unnoticed.
 bool ggml_cuda_mul_mat_id_ncp_lib_supported(const ggml_tensor * tensor);
+
+// Packed MXFP4 cannot fall through to a native GGUF reader.
+bool ggml_cuda_mul_mat_id_ncp_mxfp4_supported(const ggml_tensor * tensor);
+void ggml_cuda_mul_mat_id_ncp_mxfp4(ggml_backend_cuda_context & ctx, ggml_tensor * dst);

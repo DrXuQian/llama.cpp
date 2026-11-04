@@ -337,6 +337,7 @@ endif()
 # about not building a binary that can do nothing at all.
 if (GGML_NCP_FA OR GGML_NCP_MOE OR GGML_NCP_GDN)
     llama_build_and_test(test-llama-ncp.cpp)
+    llama_test(test-llama-ncp NAME test-ncp-mxfp4-layout ARGS --mxfp4-layout LABEL "main")
 endif()
 
 # The FA .so kernel against a CPU reference, plus the KV-layout precondition the hook checks before it will use it.

@@ -5,6 +5,8 @@
 #include "mmid.cuh"
 #include "ncp-lib.h"
 #include "ncp-route.cuh"
+#    include "ncp-moe-lib.h"
+#    include "mxfp4-ncp.cuh"
 
 // NOT reached through common.cuh -- ggml-cuda.cu only had nv_bfloat16 because mmvf-ppu.cuh pulls this in for it.
 #include <cuda_bf16.h>
@@ -91,11 +93,12 @@ static __global__ void ncp_moe_bounds_to_m_indices(
 // wasted flops. Returns false (-> inline fallback) if the .so exports no NoPad kernel or the shape is unsupported.
 static bool ggml_cuda_mul_mat_id_ncp_lib_impl(ggml_backend_cuda_context & ctx,
         const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst) {
-    if (!ggml_ncp_lib_moe_nopad_available()) {
+    const bool mxfp4 = ggml_cuda_ncp_mxfp4_tensor(src0);
+    if (!(mxfp4 ? ggml_ncp_lib_moe_w4fa16_available() : ggml_ncp_lib_moe_nopad_available())) {
         return false;
     }
-    // DeepGemm entry is bf16 A x bf16 B -> bf16 out. Require bf16 expert weights, F32 activations/out.
-    if (src0->type != GGML_TYPE_BF16 || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
+    // Both providers use BF16 A/out. MXFP4 weights are already in the private Sail layout.
+    if ((!mxfp4 && src0->type != GGML_TYPE_BF16) || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
         return false;
     }
     if (!ggml_is_contiguous(src0) || !ggml_is_contiguous(src1) || !ggml_is_contiguous(dst)) {
@@ -140,7 +143,10 @@ static bool ggml_cuda_mul_mat_id_ncp_lib_impl(ggml_backend_cuda_context & ctx,
     ggml_cuda_pool_alloc<int32_t> ids_dst (ctx.pool(), total_rows);
     ggml_cuda_pool_alloc<int32_t> bounds  (ctx.pool(), n_experts + 1);
     ggml_cuda_pool_alloc<int32_t> m_rows  (ctx.pool(), n_experts);
-    ggml_cuda_pool_alloc<int32_t> m_indices(ctx.pool(), total_rows);
+    ggml_cuda_pool_alloc<int32_t> m_indices(ctx.pool());
+    if (!mxfp4) {
+        m_indices.alloc(total_rows);
+    }
 
     const int si1  = (int) (ids->nb[1] / sizeof(int32_t));   // per-token slot stride in ids
     const int sis1 = (int) (src1->nb[2] / src1->nb[1]);      // per-token row stride in src1 (== ne11 when contiguous)
@@ -162,9 +168,11 @@ static bool ggml_cuda_mul_mat_id_ncp_lib_impl(ggml_backend_cuda_context & ctx,
         bounds.ptr, m_rows.ptr, (int) n_experts);
     CUDA_CHECK(cudaGetLastError());
 
-    ncp_moe_bounds_to_m_indices<<<(total_rows + block_dim - 1)/block_dim, block_dim, 0, stream>>>(
-        bounds.ptr, m_indices.ptr, (int) total_rows, (int) n_experts);
-    CUDA_CHECK(cudaGetLastError());
+    if (!mxfp4) {
+        ncp_moe_bounds_to_m_indices<<<(total_rows + block_dim - 1) / block_dim, block_dim, 0, stream>>>(
+            bounds.ptr, m_indices.ptr, (int) total_rows, (int) n_experts);
+        CUDA_CHECK(cudaGetLastError());
+    }
 
     ggml_cuda_pool_alloc<char> A_bf16(ctx.pool(), total_rows*K*ts);
     ncp_moe_gather_f32_to_bf16_dense<<<total_rows, block_dim, 0, stream>>>(
@@ -172,9 +180,24 @@ static bool ggml_cuda_mul_mat_id_ncp_lib_impl(ggml_backend_cuda_context & ctx,
     CUDA_CHECK(cudaGetLastError());
 
     ggml_cuda_pool_alloc<char> out_bf16(ctx.pool(), total_rows*N*ts);
-    const int rc = ggml_ncp_lib_m_grouped_gemm_bf16_bf16_bf16_nt_nopad(
-        A_bf16.ptr, src0->data, out_bf16.ptr, m_indices.ptr, m_rows.ptr,
-        (int) total_rows, (int) N, (int) K, (int) n_experts, (int) (total_rows / n_experts), stream);
+    int                        rc;
+    if (mxfp4) {
+        const auto * scales = static_cast<const uint8_t *>(src0->data) + n_experts * N * K / 2;
+        ctx.ncp_w4fa16_used[ctx.device][ctx.curr_stream_no] = true;
+        rc = ggml_ncp_lib_m_grouped_gemm_w4fa16_bf16_nt_nopad_v1(A_bf16.ptr, src0->data, scales, out_bf16.ptr,
+                                                                 m_rows.ptr, total_rows, N, K, n_experts,
+                                                                 NCP_MOE_W4FA16_SCALE_E8M0, stream);
+        if (rc != 0) {
+            GGML_ABORT(
+                "NCP W4FA16 failed: rc=%d tensor=%s M=%d rows=%d N=%d K=%d E=%d device=%d; packed weights cannot use "
+                "native GGUF kernels",
+                rc, src0->name, (int) n_tokens, (int) total_rows, (int) N, (int) K, (int) n_experts, ctx.device);
+        }
+    } else {
+        rc = ggml_ncp_lib_m_grouped_gemm_bf16_bf16_bf16_nt_nopad(
+            A_bf16.ptr, src0->data, out_bf16.ptr, m_indices.ptr, m_rows.ptr, (int) total_rows, (int) N, (int) K,
+            (int) n_experts, (int) (total_rows / n_experts), stream);
+    }
     if (rc != 0) {
         GGML_LOG_WARN("[ncp-moe] NoPad miss -> inline: N=%d K=%d total_rows=%d n_exp=%d expected_m=%d\n",
                       (int) N, (int) K, (int) total_rows, (int) n_experts, (int) (total_rows / n_experts));
@@ -188,6 +211,9 @@ static bool ggml_cuda_mul_mat_id_ncp_lib_impl(ggml_backend_cuda_context & ctx,
 }
 
 bool ggml_cuda_mul_mat_id_ncp_lib_supported(const ggml_tensor * tensor) {
+    if (ggml_cuda_mul_mat_id_ncp_mxfp4_supported(tensor)) {
+        return true;
+    }
     // Mirrors the gates ggml_cuda_mul_mat_id_ncp_lib_impl applies before it commits to anything, minus the scratch
     // and shared-memory limits: a caller asking this only needs to know whether the route is plausible, and
     // answering "yes" when the hook later declines costs one dropped fusion, not correctness. The N alignment is
@@ -200,6 +226,59 @@ bool ggml_cuda_mul_mat_id_ncp_lib_supported(const ggml_tensor * tensor) {
            tensor->type == GGML_TYPE_F32 &&
            tensor->src[0]->ne[1] % NCP_MOE_N_ALIGN == 0 &&
            tensor->src[2] && tensor->src[2]->type == GGML_TYPE_I32;
+}
+
+bool ggml_cuda_mul_mat_id_ncp_mxfp4_supported(const ggml_tensor * dst) {
+    if (!dst || dst->op != GGML_OP_MUL_MAT_ID || !ggml_cuda_ncp_mxfp4_tensor(dst->src[0]) || !dst->src[1] ||
+        !dst->src[2] || !ggml_ncp_lib_moe_w4fa16_available()) {
+        return false;
+    }
+    const auto *  w    = dst->src[0];
+    const auto *  a    = dst->src[1];
+    const auto *  ids  = dst->src[2];
+    const int64_t topk = ids->ne[0];
+    return a->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 && ids->type == GGML_TYPE_I32 &&
+           ggml_is_contiguous(a) && ggml_is_contiguous(dst) && ggml_is_contiguous(ids) && a->ne[3] == 1 &&
+           ids->ne[2] == 1 && ids->ne[3] == 1 && dst->ne[3] == 1 && topk > 0 && topk <= w->ne[2] && topk < (1 << 10) &&
+           a->ne[1] > 0 && topk % a->ne[1] == 0 && a->ne[0] == w->ne[0] && dst->ne[0] == w->ne[1] &&
+           dst->ne[1] == topk && ids->ne[1] == a->ne[2] && dst->ne[2] == a->ne[2];
+}
+
+void ggml_cuda_mul_mat_id_ncp_mxfp4(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    GGML_ASSERT(ggml_cuda_mul_mat_id_ncp_mxfp4_supported(dst));
+    const auto * w   = dst->src[0];
+    const auto * a   = dst->src[1];
+    const auto * ids = dst->src[2];
+    if (a->ne[2] == 0) {
+        return;
+    }
+    static std::once_flag logged;
+    std::call_once(logged, [] {
+        GGML_LOG_INFO(
+            "[ncp-lib] using W4FA16 v1 for MXFP4 MoE, all token counts; CUDA Graph disabled for these graphs\n");
+    });
+    // Bound helper shared memory, provider int32 indices and BF16 scratch for arbitrary token counts.
+    const int64_t topk  = ids->ne[0];
+    const int64_t limit = std::min({int64_t(ggml_cuda_info().devices[ctx.device].smpbo / sizeof(int32_t)),
+                                    int64_t((1 << 22) - 1), INT_MAX / (topk * std::max(w->ne[0], w->ne[1])),
+                                    int64_t(1024 * 1024 * 1024) / (topk * (w->ne[0] + w->ne[1]) * 2)});
+    GGML_ASSERT(limit > 0);
+    for (int64_t first = 0; first < a->ne[2]; first += limit) {
+        const int64_t count = std::min(limit, a->ne[2] - first);
+        ggml_tensor   input = *a, routes = *ids, output = *dst;
+        input.ne[2] = routes.ne[1] = output.ne[2] = count;
+        input.nb[3]                               = input.nb[2] * count;
+        routes.nb[2] = routes.nb[3] = routes.nb[1] * count;
+        output.nb[3]                = output.nb[2] * count;
+        input.data                  = static_cast<char *>(a->data) + first * a->nb[2];
+        routes.data                 = static_cast<char *>(ids->data) + first * ids->nb[1];
+        output.data                 = static_cast<char *>(dst->data) + first * dst->nb[2];
+        if (!ggml_cuda_mul_mat_id_ncp_lib_impl(ctx, w, &input, &routes, &output)) {
+            GGML_ABORT("NCP W4FA16 declined packed tensor %s: M=%d N=%d K=%d E=%d", w->name, (int) count,
+                       (int) w->ne[1], (int) w->ne[0], (int) w->ne[2]);
+        }
+    }
+    ggml_ncp_route_log(dst, "so-deepgemm-w4fa16-nopad", nullptr);
 }
 
 bool ggml_cuda_mul_mat_id_ncp_lib(ggml_backend_cuda_context & ctx,

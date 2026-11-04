@@ -30,6 +30,9 @@
 #include "ggml-cuda/im2col.cuh"
 #include "ggml-cuda/mmf.cuh"
 #include "ggml-cuda/mmid-ncp.cuh"
+#ifdef GGML_NCP_MOE
+#    include "ggml-cuda/mxfp4-ncp.cuh"
+#endif
 #include "ggml-cuda/mmq.cuh"
 #include "ggml-cuda/mmvf.cuh"
 #if defined(GGML_USE_PPU)
@@ -718,6 +721,16 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     for (int i = 0; i < GGML_CUDA_MAX_DEVICES; ++i) {
         for (int j = 0; j < GGML_CUDA_MAX_STREAMS; ++j) {
             if (streams[i][j] != nullptr) {
+#ifdef GGML_NCP_MOE
+                if (ncp_w4fa16_used[i][j]) {
+                    ggml_cuda_set_device(i);
+                    CUDA_CHECK(cudaStreamSynchronize(streams[i][j]));
+                    const int rc = ggml_ncp_lib_moe_w4fa16_release_workspace_v1(streams[i][j]);
+                    if (rc != 0) {
+                        GGML_ABORT("NCP W4FA16 workspace release failed: rc=%d device=%d stream=%d", rc, i, j);
+                    }
+                }
+#endif
                 CUDA_CHECK(cudaStreamDestroy(streams[i][j]));
             }
             if (cublas_handles[i][j] != nullptr) {
@@ -1697,6 +1710,11 @@ static bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
                                           const ggml_tensor * ffn_gate_bias = nullptr,
                                           const ggml_tensor * ffn_up_scale = nullptr,
                                           const ggml_tensor * ffn_gate_scale = nullptr) {
+#ifdef GGML_NCP_MOE
+    if (ggml_cuda_ncp_mxfp4_tensor(ffn_up->src[0]) || ggml_cuda_ncp_mxfp4_tensor(ffn_gate->src[0])) {
+        return false;
+    }
+#endif
 #ifdef GGML_NCP_QUACTLIZE
     if (ggml_quactlize_tensor_is_kpack(ffn_up->src[0]) || ggml_quactlize_is_alias(ffn_up->src[0]) ||
         ggml_quactlize_tensor_is_kpack(ffn_gate->src[0]) || ggml_quactlize_is_alias(ffn_gate->src[0])) {
@@ -1837,6 +1855,11 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_f(const ggml_tensor * tensor) {
 }
 
 static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
+#ifdef GGML_NCP_MOE
+    if (ggml_cuda_ncp_mxfp4_tensor(tensor->src[0])) {
+        return false;
+    }
+#endif
 #ifdef GGML_NCP_QUACTLIZE
     if (ggml_quactlize_tensor_is_kpack(tensor->src[0]) || ggml_quactlize_is_alias(tensor->src[0])) {
         return false;
@@ -1946,6 +1969,12 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
 static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int cc) {
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
+#ifdef GGML_NCP_MOE
+    if (ggml_cuda_ncp_mxfp4_tensor(src0)) {
+        // W4FA16 v1 does not support capture. The BF16 provider is unchanged.
+        return !ggml_is_empty(dst);
+    }
+#endif
 #ifdef GGML_NCP_QUACTLIZE
     if (ggml_quactlize_tensor_is_kpack(src0) || ggml_quactlize_is_alias(src0)) {
         return false;
@@ -1982,6 +2011,12 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
     const ggml_tensor * ids  = dst->src[2];
+#ifdef GGML_NCP_MOE
+    if (ggml_cuda_ncp_mxfp4_tensor(src0)) {
+        ggml_cuda_mul_mat_id_ncp_mxfp4(ctx, dst);
+        return;
+    }
+#endif
 #ifdef GGML_NCP_QUACTLIZE
     if (ggml_quactlize_tensor_is_kpack(src0) || ggml_quactlize_is_alias(src0)) {
         ggml_quactlize_mul_mat_id(ctx, dst);
@@ -2599,6 +2634,13 @@ static void ggml_backend_cuda_free(ggml_backend_t backend) {
 static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
     ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
+#ifdef GGML_NCP_MOE
+    if (ggml_cuda_buft_is_ncp_mxfp4(buf->buft)) {
+        CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
+        ggml_backend_tensor_set(tensor, data, offset, size);
+        return;
+    }
+#endif
 
     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
 
@@ -2608,6 +2650,13 @@ static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tens
 static void ggml_backend_cuda_get_tensor_async(ggml_backend_t backend, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
     ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
+#ifdef GGML_NCP_MOE
+    if (ggml_cuda_buft_is_ncp_mxfp4(buf->buft)) {
+        CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
+        ggml_backend_tensor_get(tensor, data, offset, size);
+        return;
+    }
+#endif
 
     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
 
@@ -2618,6 +2667,13 @@ static void ggml_backend_cuda_set_tensor_2d_async(ggml_backend_t backend, struct
         size_t offset, size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
     ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
+#ifdef GGML_NCP_MOE
+    if (ggml_cuda_buft_is_ncp_mxfp4(buf->buft)) {
+        CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
+        ggml_backend_tensor_set_2d(tensor, data, offset, size, n_copies, stride_tensor, stride_data);
+        return;
+    }
+#endif
 
     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
 
@@ -2629,6 +2685,13 @@ static void ggml_backend_cuda_get_tensor_2d_async(ggml_backend_t backend, const 
         size_t offset, size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
     ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
+#ifdef GGML_NCP_MOE
+    if (ggml_cuda_buft_is_ncp_mxfp4(buf->buft)) {
+        CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
+        ggml_backend_tensor_get_2d(tensor, data, offset, size, n_copies, stride_tensor, stride_data);
+        return;
+    }
+#endif
 
     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
 
@@ -4419,6 +4482,22 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 
     ggml_cuda_set_device(cuda_ctx->device);
 
+#ifdef GGML_NCP_MOE
+    // Reject foreign readers before fusion or capture can bypass operator dispatch.
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        const auto * node = cgraph->nodes[i];
+        for (const auto * src : node->src) {
+            while (src && src->view_src) {
+                src = src->view_src;
+            }
+            if (src && src->buffer && ggml_cuda_buft_is_ncp_mxfp4(src->buffer->buft) &&
+                !ggml_backend_dev_supports_op(backend->device, node)) {
+                GGML_ABORT("NCP MXFP4: unsupported packed operation %s (%s reads %s)", ggml_op_name(node->op),
+                           node->name, src->name);
+            }
+        }
+    }
+#endif
 #ifdef GGML_NCP_QUACTLIZE
     // Admit packed operations and prepare plans before fusion or capture.
     ggml_quactlize_prepare_graph(*cuda_ctx, cgraph);
@@ -5041,6 +5120,18 @@ static ggml_backend_buffer_type_t ggml_backend_cuda_device_get_host_buffer_type(
 // TODO: move these functions here
 static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
     ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *) dev->context;
+#ifdef GGML_NCP_MOE
+    for (const ggml_tensor * src : op->src) {
+        const ggml_tensor * weight = src;
+        while (weight && weight->view_src) {
+            weight = weight->view_src;
+        }
+        if (weight && weight->buffer && ggml_cuda_buft_is_ncp_mxfp4(weight->buffer->buft)) {
+            return src == op->src[0] && weight->buffer->buft->device == dev &&
+                   (ggml_cuda_ncp_mxfp4_alias(op) || ggml_cuda_mul_mat_id_ncp_mxfp4_supported(op));
+        }
+    }
+#endif
 
 #ifdef GGML_NCP_QUACTLIZE
     for (const ggml_tensor * src : op->src) {
@@ -5511,6 +5602,11 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
 
 static bool ggml_backend_cuda_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
     ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *) dev->context;
+#ifdef GGML_NCP_MOE
+    if (ggml_cuda_buft_is_ncp_mxfp4(buft)) {
+        return buft->device == dev;
+    }
+#endif
 #ifdef GGML_NCP_QUACTLIZE
     if (ggml_cuda_buft_is_quactlize(buft)) {
         return buft->device == dev;
@@ -5676,16 +5772,58 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t 
     GGML_UNUSED(reg);
 }
 
+#if defined(GGML_NCP_MOE) || defined(GGML_NCP_QUACTLIZE)
+static ggml_backend_buffer_type_t * ggml_cuda_get_override_bufts(ggml_backend_dev_t dev) {
+    // Stable slots let Meta resolve the same buffer family on every rank.
+    static std::mutex                                                            mutex;
+    static std::map<ggml_backend_dev_t, std::vector<ggml_backend_buffer_type_t>> types;
+    std::lock_guard<std::mutex>                                                  lock(mutex);
+    auto &                                                                       values = types[dev];
+    if (values.empty()) {
+#    ifdef GGML_NCP_QUACTLIZE
+        auto ** extra = ggml_cuda_quactlize_extra_bufts(dev);
+        for (size_t i = 0; extra && extra[i]; ++i) {
+            values.push_back(extra[i]);
+        }
+#    endif
+#    ifdef GGML_NCP_MOE
+        if (auto buft = ggml_cuda_ncp_mxfp4_buffer_type(dev)) {
+            values.push_back(buft);
+        }
+#    endif
+        values.push_back(nullptr);
+    }
+    return values.data();
+}
+
+static ggml_backend_buffer_type_t ggml_cuda_get_weight_buft(ggml_backend_dev_t  dev,
+                                                            const ggml_tensor * weight,
+                                                            ggml_op             op) {
+#    ifdef GGML_NCP_MOE
+    if (auto buft = ggml_cuda_ncp_mxfp4_weight_buft(dev, weight, op)) {
+        return buft;
+    }
+#    endif
+#    ifdef GGML_NCP_QUACTLIZE
+    return ggml_cuda_quactlize_weight_buft(dev, weight, op);
+#    else
+    return nullptr;
+#    endif
+}
+#endif
+
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
-#ifdef GGML_NCP_QUACTLIZE
+#if defined(GGML_NCP_MOE) || defined(GGML_NCP_QUACTLIZE)
     if (strcmp(name, "ggml_backend_dev_get_weight_buft") == 0) {
-        return (void *) ggml_cuda_quactlize_weight_buft;
+        return (void *) ggml_cuda_get_weight_buft;
     }
     // Explicit overrides remain available for load-only tests when dense is disabled.
     if (strcmp(name, "ggml_backend_dev_get_override_bufts") == 0) {
-        return (void *) ggml_cuda_quactlize_extra_bufts;
+        return (void *) ggml_cuda_get_override_bufts;
     }
+#endif
+#ifdef GGML_NCP_QUACTLIZE
     if (strcmp(name, "ggml_quactlize_can_load") == 0) {
         return (void *) ggml_quactlize_can_load;
     }
