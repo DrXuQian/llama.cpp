@@ -654,22 +654,16 @@ static bool test_kpack_moe(ggml_backend_t backend, const std::string & suite, in
         dense_require(second != nullptr, "second MoE backend allocation failed");
         ggml_backend_t backends[] = {backend, second.get()};
         int            cases      = 0;
-        for (auto type : {GGML_TYPE_Q8_0, GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K,
-                          GGML_TYPE_Q6_K, GGML_TYPE_MXFP4}) {
-            // MXFP4 additionally requires an installed Sail W4FA16 provider.
-            if ((type == GGML_TYPE_MXFP4 && qtype == -1) || (qtype != -1 && type != qtype)) {
+        for (auto type :
+             {GGML_TYPE_Q8_0, GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K}) {
+            if (qtype != -1 && type != qtype) {
                 continue;
             }
-            constexpr int    n = 256, k = 512;
-            const int        experts = type == GGML_TYPE_MXFP4 ? 8 : 4;
-            const int        topk    = type == GGML_TYPE_MXFP4 ? 6 : 2;
+            constexpr int    n = 256, k = 512, experts = 4, topk = 2;
             ggml_context_ptr wc(ggml_init({ggml_tensor_overhead(), nullptr, true}));
             auto *           weight = ggml_new_tensor_3d(wc.get(), type, k, n, experts);
             ggml_set_name(weight, "moe-online");
             auto * buft = preferred(dev, weight, GGML_OP_MUL_MAT_ID);
-            if (type == GGML_TYPE_MXFP4) {
-                dense_require(!preferred(dev, weight, GGML_OP_MUL_MAT), "MXFP4 dense must keep native placement");
-            }
             dense_require(buft && std::string(ggml_backend_buft_name(buft)).find("KPACK") != std::string::npos,
                           "MoE automatic packed placement failed");
             ggml_backend_buffer_ptr weights(ggml_backend_alloc_ctx_tensors_from_buft(wc.get(), buft));
@@ -1132,10 +1126,8 @@ static bool test_ffn_allocator() {
 static void usage(char ** argv) {
     printf("Usage: %s -b <backend> [--reject-forward] <reference.gguf>\n", argv[0]);
     printf("    --reject-forward additionally expects a load-only inference abort\n");
-    printf(
-        "       %s -b <backend> --dense|--moe|--ffn [--suite gemv|gemm|contract] [--qtype 8|10|11|12|13|14|39(MoE "
-        "only)]\n",
-        argv[0]);
+    printf("       %s -b <backend> --dense|--moe|--ffn [--suite gemv|gemm|contract] [--qtype 8|10|11|12|13|14]\n",
+           argv[0]);
 }
 
 int main(int argc, char ** argv) {
@@ -1169,8 +1161,7 @@ int main(int argc, char ** argv) {
             suite = argv[++i];
         } else if (strcmp(argv[i], "--qtype") == 0 && i + 1 < argc) {
             const std::string value = argv[++i];
-            if (value != "8" && value != "10" && value != "11" && value != "12" && value != "13" && value != "14" &&
-                value != "39") {
+            if (value != "8" && value != "10" && value != "11" && value != "12" && value != "13" && value != "14") {
                 usage(argv);
                 return 1;
             }
@@ -1182,7 +1173,7 @@ int main(int argc, char ** argv) {
             return 1;
         }
     }
-    if (!backend_name || int(dense) + int(moe) + int(ffn) > 1 || (ffn && suite != "all") || (qtype == 39 && !moe) ||
+    if (!backend_name || int(dense) + int(moe) + int(ffn) > 1 || (ffn && suite != "all") ||
         (moe && suite != "gemv" && suite != "gemm") ||
         ((dense || moe || ffn) ? fixture || reject_forward : !fixture || suite != "all" || qtype != -1) ||
         (suite != "all" && suite != "gemv" && suite != "gemm" && suite != "contract")) {

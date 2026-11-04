@@ -64,7 +64,7 @@ struct fixture {
         check(fs::create_directory(root), "create test directory");
         source          = root / "source.gguf";
         uint64_t offset = 128;
-        for (int q : {8, 10, 11, 12, 13, 14, 39}) {
+        for (int q : {8, 10, 11, 12, 13, 14}) {
             for (int experts : {0, 3}) {
                 const int                 bits     = q == 8 ? 8 : q <= 11 ? 2 : 4;
                 const int                 high     = q == 11 || q == 13 ? 1 : q == 14 ? 2 : 0;
@@ -81,19 +81,17 @@ struct fixture {
                 src.size_bytes  = ggml_row_size((ggml_type) q, 512) * 256 * (experts ? experts : 1);
                 offset += src.size_bytes;
                 llama_kpack_planes planes;
-                planes.bits             = bits;
-                planes.high_bits        = high;
-                planes.layout           = q == 8 ? 4 : q == 12 ? 1 : q == 39 ? 5 : 2;
-                planes.transport_tile_k = q == 39 ? 16 : 0;
-                planes.group_size       = q == 10 || q == 11 || q == 14 ? 16 : 32;
-                planes.mapping_id       = q == 8  ? QUACTLIZE_PPU_Q8_KPACK2_MAPPING_ID :
-                                          q == 12 ? QUACTLIZE_PPU_Q4_KPACK4_MAPPING_ID :
-                                          q == 39 ? QUACTLIZE_PPU_MXFP4_W4FA16_MAPPING_ID :
-                                                    QUACTLIZE_PPU_KQUANT_KPACK_MAPPING_ID;
-                planes.low_bytes        = elements * bits / 8;
-                planes.high_bytes       = elements * high / 8;
-                planes.units_bytes      = src.size_bytes - planes.low_bytes - planes.high_bytes;
-                auto data               = std::make_shared<std::vector<uint8_t>>(src.size_bytes);
+                planes.bits        = bits;
+                planes.high_bits   = high;
+                planes.layout      = q == 8 ? 4 : q == 12 ? 1 : 2;
+                planes.group_size  = q == 10 || q == 11 || q == 14 ? 16 : 32;
+                planes.mapping_id  = q == 8  ? QUACTLIZE_PPU_Q8_KPACK2_MAPPING_ID :
+                                     q == 12 ? QUACTLIZE_PPU_Q4_KPACK4_MAPPING_ID :
+                                               QUACTLIZE_PPU_KQUANT_KPACK_MAPPING_ID;
+                planes.low_bytes   = elements * bits / 8;
+                planes.high_bytes  = elements * high / 8;
+                planes.units_bytes = src.size_bytes - planes.low_bytes - planes.high_bytes;
+                auto data          = std::make_shared<std::vector<uint8_t>>(src.size_bytes);
                 for (size_t i = 0; i < data->size(); ++i) {
                     (*data)[i] = (i * 17 + q) % 256;
                 }
@@ -322,7 +320,7 @@ static void test_tp_raw_splits() {
         simple.push_back(&device);
     }
     size_t cases = 0;
-    for (int q : {0, 1, 8, 10, 11, 12, 13, 14, 39}) {
+    for (int q : {0, 1, 8, 10, 11, 12, 13, 14}) {
         for (int count : {2, 3, 4, 8, 16}) {
             auto * device = ggml_backend_meta_device(
                 simple.data(), count,
@@ -416,12 +414,12 @@ static void test_tp_raw_splits() {
         cases);
 }
 
-static void test_tp_sidecars(fixture & f, size_t fixture_index) {
+static void test_tp_sidecars(fixture & f) {
     std::string error;
     size_t      cases = 0;
     for (int count : {2, 3, 4, 8}) {
         for (int axis : {0, 1, 2, 3, 10}) {
-            auto src        = f.inventory[fixture_index];  // Q4 or MXFP4 grouped
+            auto src        = f.inventory[7];  // Q4 grouped
             src.gguf_index  = 0;
             src.data_offset = 0;
             src.k           = 512;
@@ -449,8 +447,8 @@ static void test_tp_sidecars(fixture & f, size_t fixture_index) {
                     src.batches = unit * count;
                 }
             }
-            src.size_bytes    = ggml_row_size((ggml_type) src.ggml_type, src.k) * src.n * src.experts * src.batches;
-            const auto source = f.root / ("tp-source-" + std::to_string(fixture_index) + "-" + std::to_string(cases));
+            src.size_bytes    = ggml_row_size(GGML_TYPE_Q4_K, src.k) * src.n * src.experts * src.batches;
+            const auto source = f.root / ("tp-source-" + std::to_string(cases));
             {
                 std::ofstream out(source, std::ios::binary);
                 out.seekp(src.size_bytes - 1);
@@ -462,7 +460,7 @@ static void test_tp_sidecars(fixture & f, size_t fixture_index) {
                 p.index = d;
                 llama_kpack_source_tensor local;
                 check(llama_kpack_shard_source(src, p, local, error), error);
-                auto planes        = f.jobs[fixture_index].planes;
+                auto planes        = f.jobs[7].planes;
                 planes.low_bytes   = uint64_t(local.k) * local.n * local.experts * local.batches / 2;
                 planes.high_bytes  = 0;
                 planes.units_bytes = local.size_bytes - planes.low_bytes;
@@ -470,7 +468,7 @@ static void test_tp_sidecars(fixture & f, size_t fixture_index) {
                 jobs.push_back(
                     {src, planes, [bytes](size_t off, size_t, std::string &) { return bytes->data() + off; }, p});
             }
-            const auto dir = f.root / ("tp-cache-" + std::to_string(fixture_index) + "-" + std::to_string(cases));
+            const auto                    dir = f.root / ("tp-cache-" + std::to_string(cases));
             llama_kpack_background_writer writer;
             check(writer.prepare(dir.u8string(), source.u8string(), error), error);
             check(writer.start(jobs, {src}, 4096, error) && writer.wait(error), error);
@@ -508,8 +506,7 @@ static void test_tp_sidecars(fixture & f, size_t fixture_index) {
                 auto invalid = jobs;
                 ++invalid[1].partition.count;
                 llama_kpack_background_writer bad;
-                const auto                    bad_dir =
-                    f.root / ("mixed-tp-" + std::to_string(fixture_index) + "-" + std::to_string(count));
+                const auto                    bad_dir = f.root / ("mixed-tp-" + std::to_string(count));
                 check(bad.prepare(bad_dir.u8string(), source.u8string(), error), error);
                 check(bad.start(invalid, {src}, 4096, error) && !bad.wait(error), "mixed split maps published");
                 check(!fs::exists(bad_dir), "invalid TP cache published");
@@ -588,8 +585,7 @@ int main() try {
     std::string error;
     test_cache_directory(f);
     test_tp_raw_splits();
-    test_tp_sidecars(f, 7);   // Q4_K grouped
-    test_tp_sidecars(f, 13);  // MXFP4 grouped
+    test_tp_sidecars(f);
     test_paired_sidecar(f);
     test_prefetch_coverage();
 #ifdef LLAMA_KPACK_TEST_FSYNC

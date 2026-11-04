@@ -626,8 +626,7 @@ bool ggml_quactlize_can_load(const ggml_tensor * tensor, ggml_quactlize_packed_l
     if (!tensor || tensor->view_src || !ggml_is_contiguous(tensor) || !library().handle) {
         return false;
     }
-    if (tensor->type != GGML_TYPE_Q8_0 && tensor->type != GGML_TYPE_MXFP4 &&
-        (tensor->type < GGML_TYPE_Q2_K || tensor->type > GGML_TYPE_Q6_K)) {
+    if (tensor->type != GGML_TYPE_Q8_0 && (tensor->type < GGML_TYPE_Q2_K || tensor->type > GGML_TYPE_Q6_K)) {
         return false;
     }
     for (int d = 0; d < GGML_MAX_DIMS; ++d) {
@@ -642,7 +641,6 @@ bool ggml_quactlize_can_load(const ggml_tensor * tensor, ggml_quactlize_packed_l
     auto &                       a  = layout.arrangement;
     const uint64_t expected_mapping = tensor->type == GGML_TYPE_Q4_K ? QUACTLIZE_PPU_Q4_KPACK4_MAPPING_ID :
                                       tensor->type == GGML_TYPE_Q8_0 ? QUACTLIZE_PPU_Q8_KPACK2_MAPPING_ID :
-                                      tensor->type == GGML_TYPE_MXFP4 ? QUACTLIZE_PPU_MXFP4_W4FA16_MAPPING_ID :
                                                                        QUACTLIZE_PPU_KQUANT_KPACK_MAPPING_ID;
     if (library().arrangement(tensor->type, &a) || a.version != 2 || a.artifact_tile_k || a.reserved ||
         a.mapping_id != expected_mapping ||
@@ -829,8 +827,7 @@ ggml_backend_buffer_type_t ggml_cuda_quactlize_weight_buft(ggml_backend_dev_t  d
                                                            ggml_op             op) {
     if (!ggml_quactlize_enabled() || (op != GGML_OP_MUL_MAT && op != GGML_OP_MUL_MAT_ID) || !weight ||
         (op == GGML_OP_MUL_MAT && weight->ne[2] != 1) || weight->ne[3] != 1 ||
-        (weight->type != GGML_TYPE_Q8_0 && weight->type != GGML_TYPE_MXFP4 &&
-         (weight->type < GGML_TYPE_Q2_K || weight->type > GGML_TYPE_Q6_K))) {
+        (weight->type != GGML_TYPE_Q8_0 && (weight->type < GGML_TYPE_Q2_K || weight->type > GGML_TYPE_Q6_K))) {
         return nullptr;
     }
     if (!library().handle) {
